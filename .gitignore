@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Test, coverage and type-checker caches
+.pytest_cache/
+pytest-cache-files*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+*.tar.gz
+*.msi
+*.exe
+*.dll
+*.pyd
+*.so
+*.dylib
+.build-*/
+release/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs, temporary files and backups
+*.log
+*.tmp
+*.temp
+*.bak*
+*.swp
+*.swo
+*.orig
+*.rej
+logs/
+tmp/
+temp/
+backups/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local/private data
+*.local
+*.secret
+*.pem
+*.key
+
+# Keep repository assets and legal documents if a broad rule is added later.
+!NetVision.ico
+!EULA.txt
+!LICENSE
+!NOTICE.txt
+!fonts/
+!fonts/**
