@@ -59,6 +59,21 @@ def test_packet_loss_analyzer_emits_event_and_keeps_bounded_window() -> None:
     assert [item.kind for item in analyzer.events] == ["drop", "burst"]
 
 
+def test_packet_loss_analyzer_closes_burst_after_three_successes() -> None:
+    analyzer = PacketLossAnalyzer()
+
+    analyzer.observe(False)
+    analyzer.observe(False)
+    analyzer.observe(True, 10.0)
+    analyzer.observe(True, 10.0)
+    _, event = analyzer.observe(True, 10.0)
+
+    assert event is not None
+    assert event.kind == "burst_end"
+    assert event.lost == 2
+    assert [item.kind for item in analyzer.events] == ["drop", "burst", "burst_end"]
+
+
 def test_hop_breakdown_preserves_order_and_marks_first_loss() -> None:
     hops = (HopResult(1, "192.0.2.1", 5.0), HopResult(2, "198.51.100.1", 20.0))
 

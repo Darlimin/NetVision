@@ -1,4 +1,6 @@
 """NetVision visual network diagnostics."""
 
-__version__ = "0.8.0"
+from netvision.version import __version__
+
+__all__ = ("__version__",)
 

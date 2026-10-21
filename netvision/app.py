@@ -7,8 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication
 
-from netvision.ui.main_window import MainWindow
-from netvision.ui.theme import APP_STYLE
+from netvision.core.crash_handler import setup_crash_handler
 
 
 def _load_inter_fonts() -> str:
@@ -31,7 +30,13 @@ def _load_inter_fonts() -> str:
 
 
 def main() -> None:
+    setup_crash_handler()
+    from netvision.ui.main_window import MainWindow
+    from netvision.ui.theme import APP_STYLE
+
     app = QApplication(sys.argv)
+    setup_crash_handler()
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("NetVision")
     app.setApplicationDisplayName("NetVision")
     app.setOrganizationName("NetVision")

@@ -15,11 +15,16 @@ class FakeConnection:
 
 
 class FakeProcess:
-    def __init__(self, name: str):
+    def __init__(self, name: str, connections=()):
         self._name = name
+        self._connections = connections
 
     def name(self) -> str:
         return self._name
+
+    def net_connections(self, kind: str):
+        assert kind == "inet"
+        return self._connections
 
 
 class ProcessInspectorTests(unittest.TestCase):
@@ -66,6 +71,33 @@ class ProcessInspectorTests(unittest.TestCase):
 
         self.assertEqual(result.processes, ())
         self.assertIn("не разрешила", result.warning or "")
+
+    @patch.object(process_inspector.psutil, "Process")
+    @patch.object(process_inspector.psutil, "net_connections")
+    def test_scans_one_process_without_global_socket_enumeration(
+        self,
+        global_connections_mock,
+        process_mock,
+    ) -> None:
+        process_mock.return_value = FakeProcess(
+            "huntgame.exe",
+            [
+                FakeConnection(
+                    777,
+                    ("192.168.1.4", 52100),
+                    ("203.0.113.42", 27015),
+                    "ESTABLISHED",
+                )
+            ],
+        )
+
+        result = process_inspector.scan_process(777)
+
+        global_connections_mock.assert_not_called()
+        self.assertIsNone(result.warning)
+        self.assertEqual(len(result.processes), 1)
+        self.assertEqual(result.processes[0].pid, 777)
+        self.assertEqual(result.processes[0].connections[0].remote_endpoint, "203.0.113.42:27015")
 
 
 if __name__ == "__main__":

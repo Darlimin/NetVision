@@ -6,6 +6,7 @@ import os
 import subprocess
 
 from netvision.core.probes import _oem_encoding, parse_ping_samples, probe_ping
+from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 from netvision.models import PingResult, ProbeStatus
 
 
@@ -115,6 +116,7 @@ def latency_statistics(
     samples: tuple[float, ...] | list[float],
     *,
     sent: int | None = None,
+    th: Thresholds = DEFAULT_THRESHOLDS,
 ) -> LatencyStatistics:
     values = tuple(float(value) for value in samples)
     total = sent if sent is not None else len(values)
@@ -128,7 +130,7 @@ def latency_statistics(
         if len(values) > 1
         else 0.0
     )
-    stability = _stability_label(average, jitter, loss_percent)
+    stability = _stability_label(average, jitter, loss_percent, th)
     return LatencyStatistics(min(values), max(values), average, jitter, loss_percent, stability)
 
 
@@ -176,10 +178,15 @@ def _failed_ping(host: str, sent: int, error: str) -> PingResult:
     return PingResult(host, sent, 0, 100.0, None, None, None, None, (), ProbeStatus.ERROR, error)
 
 
-def _stability_label(average_ms: float, jitter_ms: float, loss_percent: float) -> str:
+def _stability_label(
+    average_ms: float,
+    jitter_ms: float,
+    loss_percent: float,
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> str:
     if loss_percent > 0:
         return "Есть потери"
-    if average_ms > 100 or jitter_ms > 25:
+    if average_ms > th.rtt_high_ms or jitter_ms > th.jitter_critical_ms:
         return "Нестабильно"
     if average_ms > 50 or jitter_ms > 12:
         return "Есть колебания"

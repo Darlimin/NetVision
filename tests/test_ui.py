@@ -2,6 +2,8 @@ import json
 import unittest
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from PySide6.QtCore import QEventLoop, QPoint, QRect, QTimer, Qt, qInstallMessageHandler
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from netvision.core.target import parse_target
+from netvision.core.game_monitor import GameMonitorEvent, GameSessionSummary
 from netvision.core.dns_benchmark import DnsBenchmarkResult, DnsResolverProfile
 from netvision.core.ping_benchmark import MtuProbeResult, RegionalPingResult, RegionalPingTarget
 from netvision.core.packet_loss import HopLossResult, StressTestResult
@@ -31,10 +34,24 @@ from netvision.core.internet_quality import (
     PublicNetworkInfo,
     SpeedtestResult,
 )
-from netvision.ui.main_window import InternetQualityWorker, NetworkBoostDialog
+from netvision.ui.main_window import (
+    EndpointChoice,
+    GameAutoCheckWorker,
+    InternetQualityWorker,
+    NetworkBoostDialog,
+    PendingAction,
+    RollbackConfirmDialog,
+    _game_connection_key,
+)
 from netvision.core.network_boost import BackgroundTrafficCandidate, ProcessTerminationResult
-from netvision.core.system_actions import SystemActionResult, open_network_adapters
-from netvision.core.process_inspector import ProcessConnection, ProcessNetworkInfo, ProcessScanResult
+from netvision.core.system_actions import SystemActionResult, SystemChange, open_network_adapters
+from netvision.core.process_inspector import (
+    ProcessConnection,
+    ProcessListResult,
+    ProcessNetworkInfo,
+    ProcessScanResult,
+    RunningProcess,
+)
 from netvision.core.udp_monitor import UdpPortActivity, UdpPortAnomaly, UdpPortSnapshot
 from netvision.ui.main_window import METRIC_TOOLTIPS
 from netvision.ui.widgets import JitterChart, LatencyChart, MetricTile, TopologyWidget
@@ -53,6 +70,7 @@ from netvision.models import (
 )
 from netvision.ui.main_window import MainWindow
 from netvision.ui.theme import APP_STYLE, LIGHT_STYLE
+from netvision.ui.main_window import GameAutoCheckResult
 
 
 class MainWindowReportTests(unittest.TestCase):
@@ -66,6 +84,241 @@ class MainWindowReportTests(unittest.TestCase):
         monitor_patch = patch.object(MainWindow, "_start_latency_monitor")
         monitor_patch.start()
         self.addCleanup(monitor_patch.stop)
+        self._journal_directory = TemporaryDirectory()
+        self.addCleanup(self._journal_directory.cleanup)
+        journal_patch = patch(
+            "netvision.core.session_journal.default_journal_path",
+            return_value=Path(self._journal_directory.name) / "event_journal.jsonl",
+        )
+        journal_patch.start()
+        self.addCleanup(journal_patch.stop)
+
+    def test_background_close_hides_window_without_stopping_monitor(self) -> None:
+        window = MainWindow()
+        window.show()
+        monitor = type("Monitor", (), {"isRunning": lambda self: True})()
+        window._latency_thread = monitor
+        window._background_enabled = True
+        with patch("PySide6.QtWidgets.QSystemTrayIcon.isSystemTrayAvailable", return_value=True):
+            window.close()
+
+        self.assertFalse(window.isVisible())
+        self.assertTrue(monitor.isRunning())
+        window._quit_requested = True
+        window.close()
+
+    def test_tray_exit_stops_monitors_and_quits_application(self) -> None:
+        window = MainWindow()
+        monitor = type("Monitor", (), {"isRunning": lambda self: True})()
+        window._latency_thread = monitor
+        with patch.object(QApplication, "quit") as quit_application:
+            window._exit_from_tray()
+
+        self.assertIsNone(window._latency_thread)
+        quit_application.assert_called_once()
+
+    def test_close_without_tray_does_not_enter_background_mode(self) -> None:
+        window = MainWindow()
+        window.show()
+        monitor = type("Monitor", (), {"isRunning": lambda self: True})()
+        window._latency_thread = monitor
+        window._background_enabled = True
+        with patch("PySide6.QtWidgets.QSystemTrayIcon.isSystemTrayAvailable", return_value=False):
+            window.close()
+
+        self.assertFalse(window.isVisible())
+        self.assertIsNone(window._latency_thread)
+
+    def test_game_session_auto_monitor_starts_and_stops_once(self) -> None:
+        window = MainWindow()
+        window._background_auto_monitor = True
+        started = GameMonitorEvent(
+            "started", datetime.now(), "HuntGame.exe", 123, baseline_latency_ms=20.0
+        )
+        with patch.object(window, "_start_auto_monitor_probe") as start_probe:
+            window._on_game_monitor_event(started)
+            start_probe.assert_called_once_with("HuntGame.exe", 123)
+
+        connection = ProcessConnection("UDP", "NONE", "192.168.1.2", 40000, "8.8.8.8", 27015)
+        with patch.object(window, "_start_latency_monitor") as start_latency, patch.object(
+            window, "_start_udp_port_monitor"
+        ) as start_udp:
+            window._on_auto_monitor_probe_completed(
+                GameAutoCheckResult(
+                    ProcessNetworkInfo(123, "HuntGame.exe", (connection,)),
+                    (connection,),
+                    None,
+                    selected_connection=connection,
+                ),
+                123,
+            )
+        start_latency.assert_called_once_with("8.8.8.8", 27015)
+        start_udp.assert_called_once_with(123)
+        summary = GameSessionSummary(
+            "HuntGame.exe", 123, datetime.now(), datetime.now(), 20.0, 2, 1, 1
+        )
+        with patch.object(window, "_stop_latency_monitor") as stop_latency, patch.object(
+            window, "_stop_udp_port_monitor"
+        ) as stop_udp:
+            window._on_game_monitor_event(
+                GameMonitorEvent("ended", datetime.now(), "HuntGame.exe", 123, summary=summary)
+            )
+
+        stop_latency.assert_called_once()
+        stop_udp.assert_called_once()
+        self.assertFalse(window._auto_monitor_active)
+        window.close()
+
+    def test_session_journal_filters_events_by_layer(self) -> None:
+        window = MainWindow()
+        window._record_journal_event(
+            "udp.port_opened",
+            subject="UDP:27015",
+            template="UDP-порт {port}",
+            values={"port": 27015},
+        )
+        window._record_journal_event(
+            "header.anomaly",
+            severity="warning",
+            subject="network-health",
+            template="Высокий пинг: {latency:.0f} мс",
+            values={"latency": 140.0},
+        )
+
+        self.assertEqual(window.journal_table.rowCount(), 2)
+        measurement_index = window.journal_layer_filter.findData("measurement")
+        window.journal_layer_filter.setCurrentIndex(measurement_index)
+
+        self.assertEqual(window.journal_table.rowCount(), 1)
+        self.assertEqual(window.journal_table.item(0, 2).text(), "udp.port_opened")
+        window.close()
+
+    def test_game_auto_check_does_not_fall_back_or_run_global_socket_scan(self) -> None:
+        worker = GameAutoCheckWorker("OtherGame.exe")
+        results = []
+        worker.completed.connect(results.append)
+        processes = ProcessListResult((RunningProcess(700, "HuntGame.exe"),))
+
+        with (
+            patch("netvision.ui.main_window.list_running_processes", return_value=processes),
+            patch("netvision.ui.main_window.scan_process") as scoped_scan,
+            patch("netvision.ui.main_window.scan_processes") as global_scan,
+        ):
+            worker.run()
+
+        global_scan.assert_not_called()
+        scoped_scan.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0].process)
+        self.assertIn("OtherGame.exe", results[0].warning or "")
+
+    def test_game_auto_check_exposes_the_rule_for_its_selected_endpoint(self) -> None:
+        worker = GameAutoCheckWorker()
+        results = []
+        worker.completed.connect(results.append)
+        process = RunningProcess(700, "HuntGame.exe")
+        game_connection = ProcessConnection(
+            "UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015
+        )
+
+        with (
+            patch(
+                "netvision.ui.main_window.list_running_processes",
+                return_value=ProcessListResult((process,)),
+            ),
+            patch(
+                "netvision.ui.main_window.scan_process",
+                return_value=ProcessScanResult(
+                    (ProcessNetworkInfo(process.pid, process.name, (game_connection,)),)
+                ),
+            ),
+            patch("netvision.ui.main_window.probe_ping", return_value=object()),
+        ):
+            worker.run()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].selected_connection, game_connection)
+        self.assertEqual(results[0].selection_reason, "UDP + игровой порт")
+
+    def test_game_connection_key_keeps_existing_rule_order(self) -> None:
+        cases = (
+            (
+                ProcessConnection("UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015),
+                (0, 0, 0, 0, 0, "8.8.8.8"),
+            ),
+            (
+                ProcessConnection("UDP", "ESTABLISHED", "192.168.1.2", 40001, "8.8.4.4", 443),
+                (1, 0, 1, 0, 0, "8.8.4.4"),
+            ),
+            (
+                ProcessConnection("TCP", "ESTABLISHED", "192.168.1.2", 40002, "1.1.1.1", 27015),
+                (1, 1, 0, 0, 0, "1.1.1.1"),
+            ),
+            (
+                ProcessConnection("TCP", "ESTABLISHED", "192.168.1.2", 40003, "9.9.9.9", 443),
+                (1, 1, 1, 0, 0, "9.9.9.9"),
+            ),
+            (
+                ProcessConnection("TCP", "CLOSE_WAIT", "192.168.1.2", 40004, "4.4.4.4", 0),
+                (1, 1, 1, 1, 1, "4.4.4.4"),
+            ),
+        )
+
+        for connection, expected_key in cases:
+            with self.subTest(connection=connection):
+                self.assertEqual(_game_connection_key(connection), expected_key)
+
+    def test_endpoint_choice_is_recorded_only_when_state_changes(self) -> None:
+        window = MainWindow()
+        connection = ProcessConnection(
+            "UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015
+        )
+        choice = EndpointChoice(connection, "UDP + игровой порт", 1, 0)
+
+        window._on_endpoint_chosen(choice)
+        window._on_endpoint_chosen(choice)
+
+        events = [
+            event for event in window._journal.events()
+            if event.kind == "endpoint.choice"
+        ]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].values["rule"], "UDP + игровой порт")
+        window.close()
+
+    def test_rollback_confirmation_dialog_rejects_when_countdown_expires(self) -> None:
+        dialog = RollbackConfirmDialog(
+            SystemChange("mtu", "Wi-Fi", 1472, 1500),
+            lambda text: text,
+            seconds=1,
+        )
+
+        dialog._tick()
+
+        self.assertEqual(dialog.result(), dialog.DialogCode.Rejected)
+        self.assertEqual(dialog.countdown_label.text(), "Осталось 1 с")
+
+    def test_pending_mtu_action_timeout_rolls_back_without_persisting(self) -> None:
+        persisted: list[bool] = []
+        restored: list[bool] = []
+        pending = PendingAction(
+            apply=lambda: persisted.append(True),
+            rollback=lambda: restored.append(True) or SystemActionResult(True, "restored"),
+            timeout_s=0.05,
+        )
+        dialog = RollbackConfirmDialog(
+            SystemChange("mtu", "Wi-Fi", 1500, 1492),
+            lambda text: text,
+            seconds=pending.timeout_s,
+        )
+        loop = QEventLoop()
+        QTimer.singleShot(150, loop.quit)
+        loop.exec()
+        if dialog.result() != dialog.DialogCode.Accepted:
+            pending.rollback()
+
+        self.assertFalse(persisted)
+        self.assertEqual(restored, [True])
 
     def test_displays_new_results_and_exports_json(self) -> None:
         target = parse_target("example.test", 443)
@@ -199,7 +452,7 @@ class MainWindowReportTests(unittest.TestCase):
 
         self.assertEqual(window.loss_network_boost_button.objectName(), "NetworkBoostButton")
         self.assertEqual(window.jitter_network_boost_button.objectName(), "NetworkBoostButton")
-        self.assertEqual(len(window._network_boost_buttons), 2)
+        self.assertEqual(len(window._network_boost_buttons), 3)
         self.assertTrue(window.loss_network_boost_button.isEnabled())
         self.assertTrue(window.jitter_network_boost_button.isEnabled())
         window.close()
@@ -310,7 +563,7 @@ class MainWindowReportTests(unittest.TestCase):
 
         self.assertIs(window.mode_stack.currentWidget(), window.ping_view)
         self.assertEqual(window.ping_matrix_table.rowCount(), 5)
-        self.assertEqual(window.ping_mtu_table.rowCount(), 3)
+        self.assertEqual(window.ping_mtu_table.rowCount(), 0)
         window.ping_back_button.click()
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
         window.close()
@@ -376,6 +629,16 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(window.jitter_impact_values["voice"].text(), "N/A")
         self.assertEqual(window.jitter_impact_values["stability"].text(), "Нестабильно")
         self.assertEqual(window.jitter_events_table.item(0, 1).text(), "timeout")
+        window.close()
+
+    def test_jitter_workspace_groups_repeated_spikes_into_one_log_row(self) -> None:
+        window = MainWindow()
+        window._open_jitter_workspace()
+        for value in (0.0, 20.0, 40.0, 60.0, 65.0, 70.0, 75.0):
+            window._on_latency_sample(value, True)
+
+        self.assertEqual(window.jitter_events_table.rowCount(), 1)
+        self.assertIn("отсчётов: 3", window.jitter_events_table.item(0, 3).text())
         window.close()
 
     def test_loss_workspace_renders_hops_and_stress_results(self) -> None:
@@ -1317,7 +1580,7 @@ class MainWindowReportTests(unittest.TestCase):
         window._on_quality_completed(report)
 
         self.assertEqual(window.quality_metrics["download"].value.text(), "120.0 Мбит/с")
-        self.assertEqual(window.quality_metrics["loaded_ping"].value.text(), "N/A")
+        self.assertEqual(window.quality_metrics["loaded_ping"].value.text(), "Не измерен")
         self.assertEqual(window.quality_details["isp"].text(), "Example ISP")
         self.assertEqual(window.quality_details["local_ip"].text(), "192.168.1.20, 172.19.0.1")
         self.assertIn("fe80::1", window.quality_details["local_ip"].toolTip())

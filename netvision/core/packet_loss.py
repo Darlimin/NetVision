@@ -7,6 +7,8 @@ import socket
 from time import perf_counter
 
 from netvision.core.probes import probe_ping
+from netvision.core.episodes import Episode, EpisodeTracker
+from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 from netvision.models import HopResult, PingResult
 
 
@@ -35,6 +37,8 @@ class LossEvent:
     kind: str
     message: str
     snapshot: PacketLossSnapshot
+    started_at: datetime | None = None
+    lost: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +69,21 @@ class StressTestResult:
 class PacketLossAnalyzer:
     """Keep a bounded live window and classify loss bursts without GUI state."""
 
-    def __init__(self, max_samples: int = 60, jitter_threshold_ms: float = 25.0) -> None:
+    def __init__(
+        self,
+        max_samples: int = 60,
+        jitter_threshold_ms: float | None = None,
+        th: Thresholds = DEFAULT_THRESHOLDS,
+    ) -> None:
+        jitter_threshold_ms = th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
         if max_samples < 1 or jitter_threshold_ms < 0:
             raise ValueError("Параметры анализатора потерь некорректны")
         self._max_samples = max_samples
+        self._thresholds = th
         self._jitter_threshold_ms = jitter_threshold_ms
         self._samples: list[LossSample] = []
         self._events: list[LossEvent] = []
+        self._loss_episode_tracker = self._new_loss_episode_tracker()
 
     @property
     def samples(self) -> tuple[LossSample, ...]:
@@ -84,6 +96,7 @@ class PacketLossAnalyzer:
     def reset(self) -> None:
         self._samples.clear()
         self._events.clear()
+        self._loss_episode_tracker = self._new_loss_episode_tracker()
 
     def observe(self, success: bool, latency_ms: float | None = None) -> tuple[PacketLossSnapshot, LossEvent | None]:
         sample = LossSample(success, float(latency_ms) if latency_ms is not None else None)
@@ -91,21 +104,43 @@ class PacketLossAnalyzer:
         if len(self._samples) > self._max_samples:
             del self._samples[:-self._max_samples]
 
-        snapshot = summarize_loss(self._samples, jitter_threshold_ms=self._jitter_threshold_ms)
+        snapshot = summarize_loss(
+            self._samples,
+            jitter_threshold_ms=self._jitter_threshold_ms,
+            th=self._thresholds,
+        )
+        observed_at = datetime.now()
+        step, episode = self._loss_episode_tracker.update(0.0 if success else 1.0, observed_at)
         event: LossEvent | None = None
-        if not success:
-            kind = "burst" if snapshot.current_burst >= 2 else "drop"
-            message = (
-                f"Потеря пакета · подряд: {snapshot.current_burst}"
-                if kind == "burst"
-                else "Одиночная потеря пакета"
+        if step == "opened" and episode is not None:
+            event = self._loss_event(
+                observed_at,
+                "drop",
+                "Одиночная потеря пакета",
+                snapshot,
+                episode,
             )
-            event = LossEvent(datetime.now(), kind, message, snapshot)
+        elif not success and episode is not None and snapshot.current_burst == 2:
+            event = self._loss_event(
+                observed_at,
+                "burst",
+                f"Потеря пакета · подряд: {snapshot.current_burst}",
+                snapshot,
+                episode,
+            )
+        elif step == "closed" and episode is not None:
+            event = self._loss_event(
+                observed_at,
+                "burst_end",
+                f"Серия потерь завершена · потеряно: {episode.samples_over}",
+                snapshot,
+                episode,
+            )
         elif snapshot.jitter_drops > 0 and len(self._samples) >= 2:
             previous = self._samples[-2].latency_ms
             if previous is not None and latency_ms is not None and abs(latency_ms - previous) >= self._jitter_threshold_ms:
                 event = LossEvent(
-                    datetime.now(),
+                    observed_at,
                     "jitter",
                     f"Резкое изменение RTT: {previous:.1f} → {latency_ms:.1f} ms",
                     snapshot,
@@ -115,12 +150,35 @@ class PacketLossAnalyzer:
             self._events = self._events[-100:]
         return snapshot, event
 
+    @staticmethod
+    def _new_loss_episode_tracker() -> EpisodeTracker:
+        return EpisodeTracker(0.0, 0.0, 3)
+
+    @staticmethod
+    def _loss_event(
+        observed_at: datetime,
+        kind: str,
+        message: str,
+        snapshot: PacketLossSnapshot,
+        episode: Episode,
+    ) -> LossEvent:
+        return LossEvent(
+            observed_at,
+            kind,
+            message,
+            snapshot,
+            started_at=episode.started_at,
+            lost=episode.samples_over,
+        )
+
 
 def summarize_loss(
     samples: tuple[LossSample, ...] | list[LossSample],
     *,
-    jitter_threshold_ms: float = 25.0,
+    jitter_threshold_ms: float | None = None,
+    th: Thresholds = DEFAULT_THRESHOLDS,
 ) -> PacketLossSnapshot:
+    jitter_threshold_ms = th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
     if jitter_threshold_ms < 0:
         raise ValueError("Порог jitter не может быть отрицательным")
     values = tuple(samples)

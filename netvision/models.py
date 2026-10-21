@@ -30,6 +30,16 @@ class Target:
 
 
 @dataclass(frozen=True, slots=True)
+class MonitorScope:
+    """The process and remote endpoint allowed for live monitoring."""
+
+    pid: int | None
+    process_name: str | None
+    host: str
+    port: int
+
+
+@dataclass(frozen=True, slots=True)
 class NetworkInterface:
     name: str
     kind: str
@@ -55,6 +65,20 @@ class DefaultRoute:
     metric: int
     is_vpn: bool
     on_link: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WifiSnapshot:
+    interface_name: str
+    ssid: str | None
+    bssid: str | None
+    radio_type: str | None
+    band: str | None
+    channel: str | None
+    signal_pct: int | None
+    rx_mbps: float | None
+    tx_mbps: float | None
+    gateway_rtt_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

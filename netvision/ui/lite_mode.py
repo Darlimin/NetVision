@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from netvision.models import DiagnosticReport, ProbeStatus
+from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 
 
 class LiteStatus(StrEnum):
@@ -20,14 +21,17 @@ class LiteSummary:
     lines: tuple[str, ...]
 
 
-def summarize_report(report: DiagnosticReport) -> LiteSummary:
+def summarize_report(
+    report: DiagnosticReport,
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> LiteSummary:
     """Turn the detailed report into a short, user-oriented result."""
     if report.dns.status == ProbeStatus.ERROR or report.tcp.status != ProbeStatus.SUCCESS:
         return LiteSummary(
             status=LiteStatus.ERROR,
             title="Нет связи с узлом",
             message="Проверьте DNS и доступность порта.",
-            lines=_summary_lines(report),
+            lines=_summary_lines(report, th),
         )
 
     has_warning = (
@@ -36,7 +40,7 @@ def summarize_report(report: DiagnosticReport) -> LiteSummary:
         report.ping.status != ProbeStatus.SUCCESS
         or report.ping.loss_percent > 0
         or report.ping.jitter_ms is None
-        or report.ping.jitter_ms > 20
+        or report.ping.jitter_ms > th.jitter_critical_ms
         or (report.tls is not None and report.tls.status != ProbeStatus.SUCCESS)
     )
     if has_warning:
@@ -44,24 +48,27 @@ def summarize_report(report: DiagnosticReport) -> LiteSummary:
             status=LiteStatus.WARNING,
             title="Сайт доступен, но есть предупреждения",
             message="Проверьте ICMP/Ping и стабильность задержки.",
-            lines=_summary_lines(report),
+            lines=_summary_lines(report, th),
         )
 
     return LiteSummary(
         status=LiteStatus.SUCCESS,
         title="Сайт полностью доступен",
         message="Соединение стабильное.",
-        lines=_summary_lines(report),
+        lines=_summary_lines(report, th),
     )
 
 
-def _summary_lines(report: DiagnosticReport) -> tuple[str, ...]:
+def _summary_lines(
+    report: DiagnosticReport,
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> tuple[str, ...]:
     latency = report.ping.average_ms
     if latency is None:
         latency_text = "Задержка не измерена"
     elif latency <= 50:
         latency_text = f"Задержка низкая: {latency:.1f} мс"
-    elif latency <= 100:
+    elif latency <= th.rtt_high_ms:
         latency_text = f"Задержка средняя: {latency:.1f} мс"
     else:
         latency_text = f"Задержка высокая: {latency:.1f} мс"

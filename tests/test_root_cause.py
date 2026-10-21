@@ -2,17 +2,20 @@ import unittest
 from datetime import datetime
 
 from netvision.core.process_inspector import ProcessConnection, ProcessNetworkInfo
-from netvision.core.root_cause import CauseSeverity, analyze_report
+from netvision.core.root_cause import CauseSeverity, analyze_report, vpn_bypass_connections
+from netvision.core.traceroute import MtrHopStats, MtrSnapshot
 from netvision.models import (
     DefaultRoute,
     DiagnosticReport,
     DnsResult,
     HopResult,
+    NetworkInterface,
     PingResult,
     ProbeStatus,
     SystemSnapshot,
     Target,
     TcpResult,
+    WifiSnapshot,
 )
 
 
@@ -36,6 +39,18 @@ def make_report(**changes: object) -> DiagnosticReport:
 
 
 class RootCauseTests(unittest.TestCase):
+    def test_low_wifi_signal_is_in_latency_evidence(self) -> None:
+        report = make_report(
+            ping=PingResult("game.example", 5, 5, 0.0, 140.0, 130.0, 150.0, 35.0, (130, 150, 140, 140), ProbeStatus.WARNING),
+        )
+        analysis = analyze_report(
+            report,
+            wifi=WifiSnapshot("Wi-Fi", "Home", "aa", "802.11ac", "5 GHz", "36", 35, 300.0, 200.0),
+        )
+
+        finding = next(item for item in analysis.findings if item.title == "Высокая задержка или Jitter")
+        self.assertIn("сигнал Wi-Fi 35%", finding.evidence)
+
     def test_high_latency_and_vpn_loss_produce_specific_findings(self) -> None:
         report = make_report(
             system=SystemSnapshot(
@@ -72,6 +87,27 @@ class RootCauseTests(unittest.TestCase):
 
         self.assertTrue(any("магистрального провайдера" in item.explanation for item in analysis.findings))
 
+    def test_mtr_clean_destination_suppresses_timeout_based_route_warning(self) -> None:
+        report = make_report(
+            hops=(HopResult(1, "192.0.2.1", 10.0), HopResult(3, None, None, True)),
+        )
+        mtr = MtrSnapshot(
+            "8.8.8.8",
+            datetime.now().astimezone(),
+            (
+                MtrHopStats(1, ("192.0.2.1",), 10, 10, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0),
+                MtrHopStats(3, (), 10, 5, 50.0, None, None, None, None, None, icmp_limited=True),
+                MtrHopStats(4, ("8.8.8.8",), 10, 10, 0.0, 12.0, 12.0, 12.0, 12.0, 0.0),
+            ),
+            True,
+            False,
+        )
+
+        analysis = analyze_report(report, mtr=mtr)
+
+        self.assertFalse(any(item.title == "Потери на промежуточном узле" for item in analysis.findings))
+        self.assertFalse(any(item.title == "Сквозные потери по маршруту" for item in analysis.findings))
+
     def test_udp_target_does_not_mislabel_tcp_as_firewall_failure(self) -> None:
         report = make_report(
             tcp=TcpResult("game.example", 27015, None, 900.0, ProbeStatus.ERROR, "TCP is not the game protocol"),
@@ -83,6 +119,64 @@ class RootCauseTests(unittest.TestCase):
 
         self.assertIn("Выбран UDP-endpoint", titles)
         self.assertNotIn("Порт недоступен", titles)
+
+    def test_global_process_socket_on_physical_interface_warns_about_vpn_bypass(self) -> None:
+        report = make_report(
+            system=SystemSnapshot(
+                "pc",
+                (
+                    NetworkInterface("WireGuard", "VPN", True, 1000, ipv4=("10.8.0.2",)),
+                    NetworkInterface("Ethernet", "Ethernet", True, 1000, ipv4=("192.168.1.25",)),
+                ),
+                None,
+                (),
+                None,
+                (),
+                default_routes=(DefaultRoute("10.8.0.1", "WireGuard", "10.8.0.2", 1, True),),
+            ),
+        )
+        process = ProcessNetworkInfo(
+            99,
+            "HuntGame.exe",
+            (ProcessConnection("UDP", "ESTABLISHED", "192.168.1.25", 50000, "8.8.8.8", 27015),),
+        )
+
+        finding = vpn_bypass_connections(report, process)
+        analysis = analyze_report(report, process)
+
+        self.assertIsNotNone(finding)
+        self.assertEqual(finding.severity, CauseSeverity.WARNING)
+        self.assertIn("192.168.1.25 -> 8.8.8.8 (Ethernet)", finding.evidence)
+        self.assertEqual(analysis.headline, "Возможный обход VPN")
+
+    def test_vpn_client_and_vpn_bound_socket_do_not_report_bypass(self) -> None:
+        report = make_report(
+            system=SystemSnapshot(
+                "pc",
+                (
+                    NetworkInterface("WireGuard", "VPN", True, 1000, ipv4=("10.8.0.2",)),
+                    NetworkInterface("Ethernet", "Ethernet", True, 1000, ipv4=("192.168.1.25",)),
+                ),
+                None,
+                (),
+                None,
+                (),
+                default_routes=(DefaultRoute("10.8.0.1", "WireGuard", "10.8.0.2", 1, True),),
+            ),
+        )
+        vpn_client = ProcessNetworkInfo(
+            100,
+            "openvpn.exe",
+            (ProcessConnection("UDP", "ESTABLISHED", "10.8.0.2", 50000, "8.8.8.8", 1194),),
+        )
+        game_on_vpn = ProcessNetworkInfo(
+            99,
+            "HuntGame.exe",
+            (ProcessConnection("UDP", "ESTABLISHED", "10.8.0.2", 50000, "8.8.8.8", 27015),),
+        )
+
+        self.assertIsNone(vpn_bypass_connections(report, vpn_client))
+        self.assertIsNone(vpn_bypass_connections(report, game_on_vpn))
 
 
 if __name__ == "__main__":

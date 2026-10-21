@@ -98,25 +98,82 @@ class SystemActionTests(unittest.TestCase):
         )
 
     @patch.object(system_actions.os, "name", "nt")
+    @patch.object(system_actions, "capture_mtu_state", return_value=1500)
     @patch.object(system_actions.subprocess, "run")
-    def test_mtu_and_adapter_restart_use_selected_interface(self, run_mock) -> None:
+    def test_mtu_and_adapter_restart_use_selected_interface(self, run_mock, _capture_mtu) -> None:
         run_mock.side_effect = [
             CompletedProcess(["netsh"], 0, stdout=b""),
             CompletedProcess(["netsh"], 0, stdout=b""),
             CompletedProcess(["netsh"], 0, stdout=b""),
         ]
 
-        mtu_result = system_actions.optimize_mtu("Wi-Fi")
+        mtu_result = system_actions.optimize_mtu("Wi-Fi", 1500)
         restart_result = system_actions.restart_network_adapter("Wi-Fi")
 
         self.assertTrue(mtu_result.success)
         self.assertTrue(restart_result.success)
         self.assertEqual(
             run_mock.call_args_list[0].args[0],
-            ["netsh", "interface", "ipv4", "set", "subinterface", "Wi-Fi", "mtu=1500", "store=persistent"],
+            ["netsh", "interface", "ipv4", "set", "subinterface", "Wi-Fi", "mtu=1500", "store=active"],
         )
         self.assertEqual(run_mock.call_args_list[1].args[0][-1], "admin=disabled")
         self.assertEqual(run_mock.call_args_list[2].args[0][-1], "admin=enabled")
+
+    @patch.object(system_actions.os, "name", "nt")
+    @patch.object(system_actions, "capture_dns_state")
+    @patch.object(system_actions.subprocess, "run")
+    def test_dns_change_captures_state_and_can_be_rolled_back(
+        self,
+        run_mock,
+        capture_mock,
+    ) -> None:
+        snapshot = system_actions.DnsAdapterState(
+            "Ethernet", "{guid}", True, "", "192.168.1.1"
+        )
+        capture_mock.return_value = snapshot
+        run_mock.return_value = CompletedProcess(["netsh"], 0, stdout=b"")
+
+        result = system_actions.apply_dns_servers("Ethernet", ("1.1.1.1", "8.8.8.8"))
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.change)
+        self.assertEqual(result.change.kind, "dns")
+        self.assertIs(result.change.before, snapshot)
+        with patch.object(
+            system_actions,
+            "restore_dns_state",
+            return_value=system_actions.SystemActionResult(True, "DNS восстановлен"),
+        ) as restore_mock:
+            rollback = system_actions.rollback_change(result.change)
+        self.assertTrue(rollback.success)
+        restore_mock.assert_called_once_with(snapshot)
+
+    @patch.object(system_actions.os, "name", "nt")
+    @patch.object(system_actions, "capture_mtu_state", return_value=1472)
+    @patch.object(
+        system_actions,
+        "_run_hidden_command",
+        return_value=system_actions.SystemActionResult(True, "Команда выполнена"),
+    )
+    def test_mtu_change_captures_state_and_can_be_rolled_back(
+        self,
+        _command_mock,
+        _capture_mock,
+    ) -> None:
+        result = system_actions.optimize_mtu("Wi-Fi", 1500)
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.change)
+        self.assertEqual(result.change.kind, "mtu")
+        self.assertEqual(result.change.before, 1472)
+        with patch.object(
+            system_actions,
+            "restore_mtu_state",
+            return_value=system_actions.SystemActionResult(True, "MTU восстановлен"),
+        ) as restore_mock:
+            rollback = system_actions.rollback_change(result.change)
+        self.assertTrue(rollback.success)
+        restore_mock.assert_called_once_with("Wi-Fi", 1472)
 
 
 if __name__ == "__main__":

@@ -207,6 +207,12 @@ QLabel#GameAutoCheckTitle {
     font-weight: 700;
 }
 
+QLabel#GameAutoCheckVersion {
+    color: #8A99AD;
+    font-size: 11px;
+    font-weight: 600;
+}
+
 QLabel#GameAutoCheckValue {
     color: #00E5A3;
     font-size: 13px;
@@ -222,6 +228,13 @@ QLabel#GameAutoCheckStatus {
 QLabel#GameAutoCheckStatus[alertState="good"] { color: #00E5A3; background-color: #12352D; }
 QLabel#GameAutoCheckStatus[alertState="warning"] { color: #FFB800; background-color: #382E18; }
 QLabel#GameAutoCheckStatus[alertState="error"] { color: #FF6B78; background-color: #3A2027; }
+
+QTableWidget#GameAutoCheckHistoryTable {
+    background-color: #111722;
+    border: 1px solid #1E2638;
+    border-radius: 5px;
+    alternate-background-color: #161E2B;
+}
 
 QPushButton#ConnectionSortButton {
     min-width: 154px;
@@ -566,6 +579,35 @@ QProgressBar#QualityProgress {
 }
 
 QProgressBar#QualityProgress::chunk {
+    border-radius: 3px;
+    background-color: #00E5A3;
+}
+
+QFrame#BufferbloatPhaseCard, QFrame#BufferbloatGrade {
+    background-color: #171D27;
+    border: 1px solid #263244;
+    border-radius: 8px;
+}
+
+QLabel#BufferbloatValue {
+    color: #00E5A3;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+QLabel#BufferbloatGradeValue {
+    color: #00E5A3;
+    font-size: 30px;
+    font-weight: 700;
+}
+
+QProgressBar#BufferbloatProgress {
+    border: 0;
+    border-radius: 3px;
+    background-color: #18202E;
+}
+
+QProgressBar#BufferbloatProgress::chunk {
     border-radius: 3px;
     background-color: #00E5A3;
 }
@@ -1609,6 +1651,23 @@ QProgressBar#QualityProgress, QToolButton#MetricHelpButton {
     border-color: #D9E2E5;
 }
 
+QFrame#BufferbloatPhaseCard, QFrame#BufferbloatGrade {
+    background-color: #FFFFFF;
+    border-color: #D9E2E5;
+}
+
+QLabel#BufferbloatValue, QLabel#BufferbloatGradeValue {
+    color: #008A68;
+}
+
+QProgressBar#BufferbloatProgress {
+    background-color: #E8F0F0;
+}
+
+QProgressBar#BufferbloatProgress::chunk {
+    background-color: #00A77B;
+}
+
 QToolTip {
     color: #17212B;
     background-color: #FFFFFF;
@@ -1665,6 +1724,10 @@ QLabel#GameAutoCheckTitle {
     color: #25313B;
 }
 
+QLabel#GameAutoCheckVersion {
+    color: #667784;
+}
+
 QLabel#GameAutoCheckValue {
     color: #008E65;
 }
@@ -1676,6 +1739,12 @@ QLabel#GameAutoCheckStatus {
 QLabel#GameAutoCheckStatus[alertState="good"] { color: #008E65; background-color: #EAF8F3; }
 QLabel#GameAutoCheckStatus[alertState="warning"] { color: #9A6500; background-color: #FFF5D8; }
 QLabel#GameAutoCheckStatus[alertState="error"] { color: #C53B49; background-color: #FDECEE; }
+
+QTableWidget#GameAutoCheckHistoryTable {
+    background-color: #FFFFFF;
+    border-color: #D9E2E5;
+    alternate-background-color: #F7FAFA;
+}
 
 QMenu#SessionAnomalyMenu {
     background-color: #FFFFFF;

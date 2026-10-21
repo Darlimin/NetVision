@@ -7,6 +7,11 @@ import socket
 import ssl
 from time import perf_counter
 
+try:
+    from cryptography import x509
+except ImportError:  # Keep TLS diagnostics usable in minimal environments.
+    x509 = None
+
 
 @dataclass(frozen=True, slots=True)
 class CertificateRecord:
@@ -132,6 +137,8 @@ def _certificate_record(
     position: int,
     forced_status: str | None = None,
 ) -> CertificateRecord:
+    if not certificate and certificate_der:
+        certificate = _certificate_from_der(certificate_der)
     valid_from = _parse_cert_datetime(certificate.get("notBefore"))
     valid_to = _parse_cert_datetime(certificate.get("notAfter"))
     days_remaining = None
@@ -163,6 +170,8 @@ def _certificate_record(
 
 
 def _parse_cert_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -170,6 +179,37 @@ def _parse_cert_datetime(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+
+def _certificate_from_der(certificate_der: bytes) -> dict[str, object]:
+    """Convert a DER leaf certificate to the metadata shape used by ssl."""
+    if x509 is None:
+        return {}
+    try:
+        certificate = x509.load_der_x509_certificate(certificate_der)
+    except (ValueError, TypeError):
+        return {}
+
+    def name_attributes(name: object) -> tuple[tuple[tuple[str, str], ...], ...]:
+        values: list[tuple[tuple[str, str], ...]] = []
+        for attribute in name:
+            label = getattr(attribute.oid, "_name", None) or attribute.oid.dotted_string
+            values.append(((str(label), str(attribute.value)),))
+        return tuple(values)
+
+    valid_from = getattr(certificate, "not_valid_before_utc", None)
+    valid_to = getattr(certificate, "not_valid_after_utc", None)
+    if valid_from is None:
+        valid_from = certificate.not_valid_before.replace(tzinfo=timezone.utc)
+    if valid_to is None:
+        valid_to = certificate.not_valid_after.replace(tzinfo=timezone.utc)
+    return {
+        "subject": name_attributes(certificate.subject),
+        "issuer": name_attributes(certificate.issuer),
+        "serialNumber": format(certificate.serial_number, "X"),
+        "notBefore": valid_from,
+        "notAfter": valid_to,
+    }
 
 
 def _certificate_name(value: object) -> str:

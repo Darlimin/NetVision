@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import html
 import ipaddress
 import re
@@ -12,15 +12,27 @@ from urllib.request import Request, urlopen
 
 GEOHIDE_URL = "https://geohide.ru/"
 _IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
-_BLOCK_RE = re.compile(r"<(?:li|p|tr|td|code|pre)[^>]*>(.*?)</(?:li|p|tr|td|code|pre)>", re.I | re.S)
+_BLOCK_RE = re.compile(
+    r"<(?:li|p|tr|td|code|pre)\b[^>]{0,1024}>(.{0,4096}?)</(?:li|p|tr|td|code|pre)\s*>",
+    re.I | re.S,
+)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _DNS_TERMS = re.compile(r"dns|udp|порт|port|сервер|server", re.I)
+_BLOCK_DNS_TERMS = re.compile(
+    r"\b(?:dns|udp|dns[- ]?over[- ]?(?:udp|tcp)|nameserver|порт|сервер)\b",
+    re.I,
+)
 _SERVER_TERMS = re.compile(r"dns[- ]?over[- ]?(?:udp|tcp)|dns[- ]?сервер|nameserver", re.I)
 _REGION_TERMS = (
     ("RU", re.compile(r"\b(?:ru|russia|россия|российск)\b", re.I)),
     ("EU", re.compile(r"\b(?:eu|europe|европа|европейск)\b", re.I)),
     ("US", re.compile(r"\b(?:us|usa|united states|сша|америк)\b", re.I)),
 )
+MAX_PAYLOAD_CHARS = 2_000_000
+MAX_BLOCKS = 5_000
+MAX_IP_MATCHES = 5_000
+MAX_BLOCK_TEXT_CHARS = 4_096
+MAX_CONTEXT_CHARS = 240
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +58,8 @@ class GeoHideResult:
     parameters: tuple[str, ...]
     source: str = GEOHIDE_URL
     used_fallback: bool = False
+    confirmed: bool = False
+    truncated: bool = False
 
     @property
     def addresses(self) -> tuple[str, ...]:
@@ -66,7 +80,7 @@ def _is_public_ipv4(value: str) -> bool:
         address = ipaddress.ip_address(value)
     except ValueError:
         return False
-    return address.version == 4 and not address.is_private and not address.is_loopback
+    return address.version == 4 and address.is_global
 
 
 def _region_for_text(value: str) -> str:
@@ -90,19 +104,27 @@ def _server_type_for_text(value: str) -> str:
     return "DNS-over-UDP"
 
 
-def _fallback_result() -> GeoHideResult:
+def _fallback_result(*, truncated: bool = False) -> GeoHideResult:
     return GeoHideResult(
         servers=GEOHIDE_FALLBACK_SERVERS,
         parameters=("DNS-over-UDP · резервный список GeoHide",),
         used_fallback=True,
+        confirmed=False,
+        truncated=truncated,
     )
 
 
 def parse_geohide_page(payload: str) -> GeoHideResult:
     """Extract public IPv4 addresses and DNS/UDP-related text from the page."""
+    payload_truncated = len(payload) > MAX_PAYLOAD_CHARS
+    payload = payload[:MAX_PAYLOAD_CHARS]
     blocks: list[str] = []
-    for match in _BLOCK_RE.finditer(payload):
-        text = html.unescape(_HTML_TAG_RE.sub(" ", match.group(1)))
+    block_limit_reached = False
+    for block_index, match in enumerate(_BLOCK_RE.finditer(payload)):
+        if block_index >= MAX_BLOCKS:
+            block_limit_reached = True
+            break
+        text = html.unescape(_HTML_TAG_RE.sub(" ", match.group(1)[:MAX_BLOCK_TEXT_CHARS]))
         text = " ".join(text.split())
         if text:
             blocks.append(text)
@@ -110,10 +132,12 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
     servers: list[GeoHideServer] = []
     seen_addresses: set[str] = set()
     parameters: list[str] = []
+    confirmed = False
     for block in blocks:
         found = _public_addresses(block)
-        if not found or not _DNS_TERMS.search(block):
+        if not found or not _BLOCK_DNS_TERMS.search(block):
             continue
+        confirmed = True
         region = _region_for_text(block)
         server_type = _server_type_for_text(block)
         for address in found:
@@ -128,11 +152,23 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
     # Some versions of the page render the server list in scripts or cards
     # that are not covered by the block expression. Scan the complete text
     # and keep every public address, using nearby RU/EU/US context.
-    for match in _IPV4_RE.finditer(payload):
+    ip_limit_reached = False
+    for ip_index, match in enumerate(_IPV4_RE.finditer(payload)):
+        if ip_index >= MAX_IP_MATCHES:
+            ip_limit_reached = True
+            break
         address = match.group(0)
         if address in seen_addresses or not _is_public_ipv4(address):
             continue
-        context = html.unescape(_HTML_TAG_RE.sub(" ", payload[max(0, match.start() - 240):match.end() + 240]))
+        context = html.unescape(
+            _HTML_TAG_RE.sub(
+                " ",
+                payload[
+                    max(0, match.start() - MAX_CONTEXT_CHARS):
+                    match.end() + MAX_CONTEXT_CHARS
+                ],
+            )
+        )
         if not (
             _DNS_TERMS.search(context)
             or _SERVER_TERMS.search(context)
@@ -146,6 +182,7 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
         )
         servers.append(server)
         seen_addresses.add(address)
+        confirmed = confirmed or bool(_BLOCK_DNS_TERMS.search(context))
 
     if not servers:
         for address in _public_addresses(payload):
@@ -158,6 +195,8 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
     return GeoHideResult(
         servers=tuple(servers),
         parameters=tuple(parameters[:30]),
+        confirmed=confirmed,
+        truncated=payload_truncated or block_limit_reached or ip_limit_reached,
     )
 
 
@@ -171,8 +210,12 @@ def fetch_geohide_dns(timeout: float = 12.0) -> GeoHideResult:
     )
     try:
         with urlopen(request, timeout=timeout) as response:
-            payload = response.read(2_000_000).decode("utf-8", errors="replace")
+            raw_payload = response.read(MAX_PAYLOAD_CHARS + 1)
+            response_truncated = len(raw_payload) > MAX_PAYLOAD_CHARS
+            payload = raw_payload[:MAX_PAYLOAD_CHARS].decode("utf-8", errors="replace")
     except (HTTPError, URLError, OSError):
         return _fallback_result()
     result = parse_geohide_page(payload)
-    return result if result.servers else _fallback_result()
+    if response_truncated and not result.truncated:
+        result = replace(result, truncated=True)
+    return result if result.servers else _fallback_result(truncated=result.truncated)

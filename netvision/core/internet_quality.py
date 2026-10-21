@@ -4,7 +4,9 @@ import ipaddress
 import json
 import socket
 import time
+from urllib.error import URLError
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -24,6 +26,11 @@ PUBLIC_IP_URLS = (
 )
 DOWNLOAD_BYTES = 10_000_000
 DOWNLOAD_TIMEOUT = 60
+UPLOAD_URLS = ("https://speed.cloudflare.com/__up",)
+UPLOAD_BYTES = 5_000_000
+UPLOAD_TIMEOUT = 45
+LOADED_PING_TIMEOUT = 1.5
+LOADED_PING_INTERVAL = 0.25
 TCP_TIMEOUT = 3
 TCP_TARGETS = (
     ("Cloudflare DNS", "1.1.1.1", 53),
@@ -58,7 +65,9 @@ class SpeedtestResult:
     @property
     def is_success(self) -> bool:
         return self.error is None and (
-            self.download_mbps is not None or self.ping_ms is not None
+            self.download_mbps is not None
+            or self.upload_mbps is not None
+            or self.ping_ms is not None
         )
 
 
@@ -172,6 +181,89 @@ def measure_tcp_latency(
                 tool="Python TCP connect",
             )
     return SpeedtestResult(tool="Python TCP connect", error="Не удалось измерить TCP-пинг: " + " | ".join(errors))
+
+
+def measure_upload_and_loaded_ping(
+    progress: Callable[[str], None] | None = None,
+    urls: Sequence[str] = UPLOAD_URLS,
+    targets: Sequence[tuple[str, str, int]] = TCP_TARGETS,
+    payload_bytes: int = UPLOAD_BYTES,
+    timeout: int = UPLOAD_TIMEOUT,
+) -> SpeedtestResult:
+    """Measure upload throughput while probing RTT in parallel.
+
+    The upload request runs in a small helper thread so the caller can keep
+    sampling TCP connect latency while the outbound link is busy. The payload
+    and timeout are bounded because this is an interactive diagnostic action.
+    """
+    if payload_bytes <= 0 or not urls:
+        return SpeedtestResult(tool="HTTP POST upload", error="Параметры upload-теста некорректны")
+
+    errors: list[str] = []
+    for url in urls:
+        _emit(progress, f"Тест отдачи: {_host(url)}")
+        payload = b"0" * payload_bytes
+        samples: list[float] = []
+        loaded_target: str | None = None
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="netvision-upload") as executor:
+            future = executor.submit(_post_upload, url, payload, timeout)
+            while not future.done():
+                for target_name, host, port in targets:
+                    sample = _tcp_connect_sample(host, port, LOADED_PING_TIMEOUT)
+                    if sample is None:
+                        continue
+                    samples.append(sample)
+                    loaded_target = target_name
+                    _emit(progress, f"Пинг под нагрузкой: {target_name}")
+                    break
+                if not future.done():
+                    time.sleep(LOADED_PING_INTERVAL)
+            try:
+                sent_bytes, elapsed = future.result()
+            except (OSError, TimeoutError, UnicodeError, URLError) as exc:
+                errors.append(f"{_host(url)}: {exc}")
+                continue
+
+        if sent_bytes <= 0 or elapsed <= 0:
+            errors.append(f"{_host(url)}: сервер не принял тестовый пакет")
+            continue
+        return SpeedtestResult(
+            upload_mbps=sent_bytes * 8 / elapsed / 1_000_000,
+            loaded_ping_ms=(sum(samples) / len(samples)) if samples else None,
+            server_name=loaded_target,
+            tool=f"HTTP POST upload ({_host(url)})",
+        )
+
+    return SpeedtestResult(
+        tool="HTTP POST upload",
+        error="Не удалось выполнить тест отдачи: " + " | ".join(errors),
+    )
+
+
+def _post_upload(url: str, payload: bytes, timeout: int) -> tuple[int, float]:
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            **REQUEST_HEADERS,
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(payload)),
+        },
+        method="POST",
+    )
+    started = time.perf_counter()
+    with _open_request(request, timeout) as response:
+        response.read(1024)
+    return len(payload), time.perf_counter() - started
+
+
+def _tcp_connect_sample(host: str, port: int, timeout: float) -> float | None:
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return (time.perf_counter() - started) * 1000
+    except (OSError, TimeoutError):
+        return None
 
 
 def fetch_public_network_info(
@@ -314,41 +406,75 @@ def run_internet_quality_check(
     download = measure_download(progress)
     _emit(progress, "Измеряем задержку TCP")
     latency = measure_tcp_latency(progress)
+    _emit(progress, "Запускаем тест отдачи и пинг под нагрузкой")
+    upload = measure_upload_and_loaded_ping(progress)
     _emit(progress, "Получаем внешний IP и данные провайдера")
     network = fetch_public_network_info(progress)
     speedtest = SpeedtestResult(
         download_mbps=download.download_mbps,
+        upload_mbps=upload.upload_mbps,
         ping_ms=latency.ping_ms,
-        server_name=latency.server_name,
-        tool=f"{download.tool}; {latency.tool}",
-        error=" | ".join(error for error in (download.error, latency.error) if error) or None,
+        loaded_ping_ms=upload.loaded_ping_ms,
+        server_name=latency.server_name or upload.server_name,
+        tool=f"{download.tool}; {latency.tool}; {upload.tool}",
+        error=" | ".join(
+            error for error in (download.error, latency.error, upload.error) if error
+        ) or None,
     )
     errors = tuple(error for error in (speedtest.error, network.error) if error)
     return InternetQualityReport(speedtest=speedtest, network=network, local=local, errors=errors)
 
 
-def build_smart_report(report: InternetQualityReport) -> str:
+def build_smart_report(
+    report: InternetQualityReport,
+    translate: Callable[[str], str] | None = None,
+) -> str:
+    tr = translate or (lambda text: text)
     speed = report.speedtest
     network = report.network
     local = report.local
-    location = ", ".join(value for value in (network.city, network.region) if value) or "не определён"
+    location = ", ".join(value for value in (network.city, network.region) if value) or tr("не определён")
     if local.vpn_detected or local.proxy_detected or network.vpn_detected is True or network.proxy_detected is True:
-        vpn_proxy = "обнаружен VPN/прокси"
+        vpn_proxy = tr("обнаружен VPN/прокси")
     elif network.vpn_detected is False and network.proxy_detected is False:
-        vpn_proxy = "не обнаружен"
+        vpn_proxy = tr("не обнаружен")
     else:
-        vpn_proxy = "не определён"
+        vpn_proxy = tr("не определён")
+    def format_speed(value: float | int | None) -> str:
+        return _format_speed(value) if value is not None else tr("не измерена")
     lines = [
-        f"Скорость скачивания: {_format_speed(speed.download_mbps)}.",
-        f"Публичный IP: {network.ipv4 or network.ipv6 or 'не определён'}; провайдер: {network.isp or 'не определён'}; регион: {location}.",
-        f"Локальный адаптер: {local.adapter_name or 'не определён'} ({_format_speed(local.adapter_speed_mbps)}).",
-        f"Локальный IP: {', '.join(local.local_ipv4) or 'не определён'}.",
-        f"VPN/прокси: {vpn_proxy}.",
+        tr("Скорость скачивания: {speed}.").format(speed=format_speed(speed.download_mbps)),
+        tr("Скорость отдачи: {speed}.").format(speed=format_speed(speed.upload_mbps)),
+        tr("Публичный IP: {ip}; провайдер: {isp}; регион: {location}.").format(
+            ip=network.ipv4 or network.ipv6 or tr("не определён"),
+            isp=network.isp or tr("не определён"),
+            location=location,
+        ),
+        tr("Локальный адаптер: {adapter} ({speed}).").format(
+            adapter=local.adapter_name or tr("не определён"),
+            speed=format_speed(local.adapter_speed_mbps),
+        ),
+        tr("Локальный IP: {ip}.").format(
+            ip=", ".join(local.local_ipv4) or tr("не определён"),
+        ),
+        tr("VPN/прокси: {status}.").format(status=vpn_proxy),
     ]
     if speed.ping_ms is not None:
-        lines.append(f"TCP-пинг: {speed.ping_ms:.1f} мс до {speed.server_name or 'DNS-сервиса'}.")
+        lines.append(
+            tr("TCP-пинг: {ping} до {server}.").format(
+                ping=f"{speed.ping_ms:.1f} мс",
+                server=speed.server_name or tr("DNS-сервиса"),
+            )
+        )
+    if speed.loaded_ping_ms is not None:
+        lines.append(
+            tr("Пинг под нагрузкой: {ping} до {server}.").format(
+                ping=f"{speed.loaded_ping_ms:.1f} мс",
+                server=speed.server_name or tr("DNS-сервиса"),
+            )
+        )
     if report.errors:
-        lines.append("Неполные источники: " + " | ".join(report.errors))
+        lines.append(tr("Неполные источники: {errors}").format(errors=" | ".join(report.errors)))
     return "\n".join(lines)
 
 

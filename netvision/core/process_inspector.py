@@ -142,30 +142,15 @@ def scan_processes() -> ProcessScanResult:
         if pid is None or local is None:
             continue
 
-        protocol = _protocol(getattr(connection, "type", None))
-        status = str(getattr(connection, "status", "")) or "ACTIVE"
-        if protocol == "TCP" and status not in ACTIVE_TCP_STATUSES:
-            continue
-        remote = _endpoint(getattr(connection, "raddr", None))
-        # Windows exposes many UDP sockets without a peer address. They are
-        # still useful for selecting a game and observing its live local ports.
-        if remote is None and protocol != "UDP":
+        parsed_connection = _to_process_connection(connection)
+        if parsed_connection is None:
             continue
 
         if pid not in names:
             names[pid] = _process_name(pid)
         if is_ignored_process(names[pid]):
             continue
-        grouped.setdefault(pid, []).append(
-            ProcessConnection(
-                protocol=protocol,
-                status=status,
-                local_address=local[0],
-                local_port=local[1],
-                remote_address=remote[0] if remote else "",
-                remote_port=remote[1] if remote else 0,
-            )
-        )
+        grouped.setdefault(pid, []).append(parsed_connection)
 
     processes = tuple(
         ProcessNetworkInfo(
@@ -176,6 +161,45 @@ def scan_processes() -> ProcessScanResult:
         for pid, items in sorted(grouped.items(), key=lambda item: (names[item[0]].lower(), item[0]))
     )
     return ProcessScanResult(processes)
+
+
+def scan_process(pid: int) -> ProcessScanResult:
+    """Collect only one process's active sockets without a global scan."""
+    if pid < 1:
+        return ProcessScanResult((), "Некорректный PID процесса")
+    try:
+        process = psutil.Process(pid)
+        name = str(process.name() or f"PID {pid}").strip()
+    except psutil.NoSuchProcess:
+        return ProcessScanResult((), "Выбранный процесс уже завершился")
+    except (psutil.AccessDenied, OSError) as exc:
+        return ProcessScanResult((), f"Не удалось открыть процесс: {exc}")
+
+    try:
+        connections = process.net_connections(kind="inet")
+    except psutil.NoSuchProcess:
+        return ProcessScanResult((), "Выбранный процесс уже завершился")
+    except psutil.AccessDenied:
+        return ProcessScanResult(
+            (),
+            "Windows не разрешила получить сокеты выбранного процесса. Запустите NetVision с нужными правами.",
+        )
+    except OSError as exc:
+        return ProcessScanResult((), f"Не удалось получить сокеты выбранного процесса: {exc}")
+
+    parsed_connections = tuple(
+        sorted(
+            (
+                parsed
+                for connection in connections
+                if (parsed := _to_process_connection(connection)) is not None
+            ),
+            key=_connection_sort_key,
+        )
+    )
+    if not parsed_connections:
+        return ProcessScanResult(())
+    return ProcessScanResult((ProcessNetworkInfo(pid, name, parsed_connections),))
 
 
 def _process_name(pid: int) -> str:
@@ -209,6 +233,30 @@ def friendly_process_name(name: str) -> str:
 def is_ignored_process(name: str) -> bool:
     """Return whether a known background service should stay out of the default picker."""
     return name.strip().casefold() in IGNORED_PROCESS_NAMES
+
+
+def _to_process_connection(connection: object) -> ProcessConnection | None:
+    """Normalize a psutil socket record used by global and PID-scoped scans."""
+    local = _endpoint(getattr(connection, "laddr", None))
+    if local is None:
+        return None
+    protocol = _protocol(getattr(connection, "type", None))
+    status = str(getattr(connection, "status", "")) or "ACTIVE"
+    if protocol == "TCP" and status not in ACTIVE_TCP_STATUSES:
+        return None
+    remote = _endpoint(getattr(connection, "raddr", None))
+    # Windows exposes many UDP sockets without a peer address. They remain
+    # useful for selected-process monitoring even without a remote endpoint.
+    if remote is None and protocol != "UDP":
+        return None
+    return ProcessConnection(
+        protocol=protocol,
+        status=status,
+        local_address=local[0],
+        local_port=local[1],
+        remote_address=remote[0] if remote else "",
+        remote_port=remote[1] if remote else 0,
+    )
 
 
 def _endpoint(value: object) -> tuple[str, int] | None:

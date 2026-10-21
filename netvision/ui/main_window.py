@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import csv
+import ipaddress
 import json
 from pathlib import Path
 import re
+import time
+from threading import Event
 
 from PySide6.QtCore import QEvent, QIODevice, QObject, QSaveFile, QSettings, QThread, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QCloseEvent, QCursor, QShowEvent, QWheelEvent
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QCursor, QPixmap, QShowEvent, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
@@ -20,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QApplication,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -42,6 +46,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -58,6 +63,9 @@ except Exception:  # QtWebEngine is an optional dependency for portable builds.
     QWebEngineView = None
 
 from netvision.core.diagnostics import DiagnosticService
+from netvision.core.episodes import Episode, EpisodeTracker
+from netvision.core.bufferbloat import BufferbloatReport, resolve_target_ipv4, run_bufferbloat_test
+from netvision.core.game_monitor import GameLaunchMonitor, GameMonitorEvent
 from netvision.core.dns_benchmark import (
     DnsBenchmarkResult,
     DnsResolverProfile,
@@ -73,6 +81,7 @@ from netvision.core.internet_quality import (
     fetch_public_ip_addresses,
     run_internet_quality_check,
 )
+from netvision.core.nat_diagnostics import NatReport, probe_nat
 from netvision.core.network_boost import (
     BackgroundTrafficCandidate,
     NetworkBoostScanResult,
@@ -90,6 +99,7 @@ from netvision.core.packet_loss import (
     run_udp_stress_test,
     summarize_loss,
 )
+from netvision.core.udp_stress import UdpStressReport, run_udp_packet_loss_stress
 from netvision.core.tcp_diagnostics import (
     TcpConnectMeasurement,
     TcpSocketRecord,
@@ -98,6 +108,9 @@ from netvision.core.tcp_diagnostics import (
     scan_tcp_sockets,
 )
 from netvision.core.tls_diagnostics import CertificateRecord, TlsAuditResult, audit_tls_endpoint
+from netvision.core.test_history import TestHistoryStore
+from netvision.core.session_journal import JournalEvent, JournalStore, Layer, SessionJournal
+from netvision.core.traceroute import MtrSnapshot, TracerouteHop, run_visual_traceroute
 from netvision.core.ping_benchmark import (
     LatencyStatistics,
     MtuProbeResult,
@@ -108,6 +121,13 @@ from netvision.core.ping_benchmark import (
     latency_statistics,
     run_mtu_stress_test,
 )
+from netvision.core.mtu_optimizer import (
+    MtuOptimizerProbe,
+    MtuOptimizerReport,
+    detect_active_adapter,
+    probe_path_mtu,
+    run_mtu_optimizer,
+)
 from netvision.core.process_inspector import (
     ProcessConnection,
     ProcessListResult,
@@ -115,29 +135,58 @@ from netvision.core.process_inspector import (
     ProcessScanResult,
     RunningProcess,
     list_running_processes,
+    scan_process,
     scan_processes,
 )
 from netvision.core.probes import probe_ping
 from netvision.core.udp_monitor import UdpPortActivity, UdpPortHistory, UdpPortSnapshot, get_process_udp_ports
-from netvision.core.root_cause import analyze_report
+from netvision.core.root_cause import analyze_report, vpn_bypass_connections
 from netvision.core.system_actions import (
+    SystemChange,
     SystemActionResult,
+    apply_mtu_trial,
     apply_dns_servers,
     flush_dns_cache,
-    optimize_mtu,
     open_network_adapters,
     open_network_proxy_settings,
     open_windows_firewall,
+    persist_mtu,
     reset_tcpip_stack,
-    restart_network_adapter,
+    restart_adapter_verified,
+    rollback_change,
 )
 from netvision.core.system import DnsConfiguration, collect_dns_configuration
 from netvision.core.target import parse_target
-from netvision.models import DiagnosticReport, HopResult, NetworkInterface, ProbeStatus, SystemSnapshot, Target
-from netvision.reporting import serialize_report, serialize_udp_events_csv, serialize_udp_events_json
+from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
+from netvision.models import (
+    DefaultRoute,
+    DiagnosticReport,
+    HopResult,
+    MonitorScope,
+    NetworkInterface,
+    ProbeStatus,
+    SystemSnapshot,
+    Target,
+    WifiSnapshot,
+)
+from netvision.reporting import (
+    serialize_journal_csv,
+    serialize_journal_json,
+    serialize_report,
+    serialize_support_bundle,
+    serialize_udp_events_csv,
+    serialize_udp_events_json,
+)
 from netvision.ui.theme import APP_STYLE, LIGHT_STYLE
 from netvision.ui.i18n import UiTranslator
-from netvision.ui.monitor_workers import LatencyMonitorWorker, WorkerRegistry, UdpPortMonitorWorker
+from netvision.ui.monitor_workers import (
+    LatencyMonitorWorker,
+    MtrMonitorWorker,
+    UdpPortMonitorWorker,
+    WifiMonitorWorker,
+    WifiSignalTracker,
+    WorkerRegistry,
+)
 from netvision.ui.widgets import (
     EmbeddedComboBox,
     LatencyChart,
@@ -150,6 +199,7 @@ from netvision.ui.widgets import (
     apply_panel_shadow,
 )
 from netvision.ui.lite_mode import LiteStatus, summarize_report
+from netvision.version import __version__, display_version
 
 
 METRIC_TOOLTIPS = {
@@ -169,6 +219,16 @@ QUICK_PRESETS = (
 )
 
 
+def _is_thread_alive(thread: object | None) -> bool:
+    """Return whether a Qt thread is running without touching deleted wrappers."""
+    if thread is None:
+        return False
+    try:
+        return bool(thread.isRunning())  # type: ignore[attr-defined]
+    except RuntimeError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class UdpEventRow:
     observed_at: datetime
@@ -185,6 +245,9 @@ class JitterEventRow:
     deviation_ms: float
     endpoint: str
     details: str
+    kind: str = "spike"
+    ended_at: datetime | None = None
+    samples: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +367,86 @@ class PresetEditorDialog(QDialog):
         self.accept()
 
 
+class RollbackConfirmDialog(QDialog):
+    """Require a short explicit confirmation for a reversible system change."""
+
+    def __init__(
+        self,
+        change: SystemChange,
+        translate: Callable[[str], str],
+        parent: QWidget | None = None,
+        seconds: float = 20.0,
+    ) -> None:
+        super().__init__(parent)
+        self._change = change
+        self._translate = translate
+        self._remaining_seconds = max(0.05, float(seconds))
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._expiry_timer = QTimer(self)
+        self._expiry_timer.setSingleShot(True)
+        self._expiry_timer.setInterval(round(self._remaining_seconds * 1000))
+        self._expiry_timer.timeout.connect(self.reject)
+        self.setModal(True)
+        self.setWindowTitle(self._translate("Подтвердите изменения"))
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        description = QLabel(
+            self._translate(
+                "Настройки {kind} для «{adapter}» изменены. Подтвердите сохранение, иначе настройки будут восстановлены."
+            ).format(kind=change.kind.upper(), adapter=change.adapter)
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        self.countdown_label = QLabel()
+        self.countdown_label.setObjectName("RollbackCountdown")
+        layout.addWidget(self.countdown_label)
+
+        actions = QHBoxLayout()
+        self.rollback_button = QPushButton(self._translate("Откатить изменения"))
+        self.confirm_button = QPushButton(self._translate("Сохранить изменения"))
+        self.rollback_button.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self.accept)
+        actions.addWidget(self.rollback_button)
+        actions.addStretch(1)
+        actions.addWidget(self.confirm_button)
+        layout.addLayout(actions)
+        self._update_countdown()
+        self._timer.start()
+        self._expiry_timer.start()
+
+    @Slot()
+    def _tick(self) -> None:
+        self._remaining_seconds -= 1
+        if self._remaining_seconds <= 0:
+            self.reject()
+            return
+        self._update_countdown()
+
+    def _update_countdown(self) -> None:
+        self.countdown_label.setText(
+            self._translate("Осталось {seconds} с").format(seconds=max(0, round(self._remaining_seconds)))
+        )
+
+    def done(self, result: int) -> None:
+        self._timer.stop()
+        self._expiry_timer.stop()
+        super().done(result)
+
+
+@dataclass(slots=True)
+class PendingAction:
+    """A reversible system change awaiting the user's confirmation."""
+
+    apply: Callable[[], None]
+    rollback: Callable[[], SystemActionResult]
+    timeout_s: float
+
+
 class DiagnosticWorker(QObject):
     progress = Signal(str, str)
     completed = Signal(object)
@@ -355,6 +498,24 @@ class ProcessScanWorker(QObject):
             result = scan_processes()
         except Exception as exc:  # Keep process enumeration failures inside the worker.
             result = ProcessScanResult((), f"Не удалось просканировать процессы: {exc}")
+        self.completed.emit(result)
+
+
+class ProcessSocketsWorker(QObject):
+    """Read sockets only for the already selected process."""
+
+    completed = Signal(object)
+
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self._pid = pid
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = scan_process(self._pid)
+        except Exception as exc:  # Keep per-process inspection failures off the GUI thread.
+            result = ProcessScanResult((), f"Не удалось прочитать сокеты процесса: {exc}")
         self.completed.emit(result)
 
 
@@ -800,6 +961,108 @@ class InternetQualityWorker(QObject):
         self.completed.emit(report)
 
 
+class NatProbeWorker(QObject):
+    """Run the UDP-only STUN check outside the Qt GUI thread."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        external_ip: str | None,
+        hops: tuple[HopResult, ...],
+        thresholds: Thresholds,
+    ) -> None:
+        super().__init__()
+        self._external_ip = external_ip
+        self._hops = hops
+        self._thresholds = thresholds
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            report = probe_nat(
+                timeout_s=self._thresholds.stun_timeout_s,
+                retries=self._thresholds.stun_retries,
+                external_ip=self._external_ip,
+                hops=self._hops,
+                cgnat_hop_limit=self._thresholds.cgnat_hop_limit,
+            )
+        except Exception as exc:
+            self.failed.emit(f"Ошибка STUN-проверки: {exc}")
+            return
+        self.completed.emit(report)
+
+
+class BufferbloatWorker(QObject):
+    progress = Signal(str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        target: str | None,
+        gateway: str | None,
+        th: Thresholds = DEFAULT_THRESHOLDS,
+    ) -> None:
+        super().__init__()
+        self._target = target
+        self._gateway = gateway
+        self._thresholds = th
+        self._stop_event = Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.completed.emit(
+                run_bufferbloat_test(
+                    self.progress.emit,
+                    target=self._target,
+                    gateway=self._gateway,
+                    stop_event=self._stop_event,
+                    thresholds=self._thresholds,
+                )
+            )
+        except Exception as exc:
+            self.failed.emit(f"Тест bufferbloat завершился ошибкой: {exc}")
+
+
+class GameLaunchMonitorWorker(QObject):
+    event = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        process_names: tuple[str, ...] = (),
+        target: tuple[str, int] = ("1.1.1.1", 53),
+    ) -> None:
+        super().__init__()
+        self._stop_event = Event()
+        self._process_names = process_names
+        self._target = target
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        monitor = GameLaunchMonitor(self._process_names, self._target)
+        try:
+            while not self._stop_event.is_set():
+                update = monitor.poll()
+                if update is not None:
+                    self.event.emit(update)
+                self._stop_event.wait(5.0)
+        finally:
+            final_event = monitor.close()
+            if final_event is not None:
+                self.event.emit(final_event)
+            self.finished.emit()
+
+
 class DnsBenchmarkWorker(QObject):
     completed = Signal(object)
     failed = Signal(str)
@@ -877,6 +1140,55 @@ class PingBenchmarkWorker(QObject):
         self.completed.emit(regional_results, mtu_results)
 
 
+class MtuOptimizerWorker(QObject):
+    """Discover a non-fragmenting path MTU outside the GUI thread."""
+
+    progress = Signal(str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        target_host: str,
+        snapshot: SystemSnapshot | None = None,
+        th: Thresholds = DEFAULT_THRESHOLDS,
+    ) -> None:
+        super().__init__()
+        self._target_host = target_host
+        self._snapshot = snapshot
+        self._thresholds = th
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.completed.emit(
+                run_mtu_optimizer(
+                    self._target_host,
+                    progress=self.progress.emit,
+                    snapshot=self._snapshot,
+                    th=self._thresholds,
+                )
+            )
+        except Exception as exc:
+            self.failed.emit(f"MTU-оптимизатор завершился ошибкой: {exc}")
+
+
+class MtuControlProbeWorker(QObject):
+    """Check the active MTU trial without blocking the confirmation dialog."""
+
+    completed = Signal(object)
+
+    def __init__(self, target_ip: str, mtu: int, timeout_ms: int) -> None:
+        super().__init__()
+        self._target_ip = target_ip
+        self._mtu = mtu
+        self._timeout_ms = timeout_ms
+
+    @Slot()
+    def run(self) -> None:
+        self.completed.emit(probe_path_mtu(self._target_ip, self._mtu, self._timeout_ms))
+
+
 class PacketLossTestWorker(QObject):
     """Keep hop and controlled packet-burst checks off the Qt GUI thread."""
 
@@ -901,12 +1213,64 @@ class PacketLossTestWorker(QObject):
         self.completed.emit(hop_results, icmp_result, udp_result)
 
 
+class UdpStressWorker(QObject):
+    """Run the measured UDP request/response check away from the GUI thread."""
+
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, host: str, port: int) -> None:
+        super().__init__()
+        self._host = host
+        self._port = port
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            report = run_udp_packet_loss_stress(self._host, self._port)
+        except Exception as exc:
+            self.failed.emit(f"UDP-стресс завершился ошибкой: {exc}")
+            return
+        self.completed.emit(report)
+
+
+class TracerouteWorker(QObject):
+    """Stream traceroute hops from a worker thread to the visual route table."""
+
+    hop_found = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, host: str) -> None:
+        super().__init__()
+        self._host = host
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            hops = run_visual_traceroute(self._host, on_hop=self.hop_found.emit)
+        except Exception as exc:
+            self.failed.emit(f"Трассировка завершилась ошибкой: {exc}")
+            return
+        self.completed.emit(hops)
+
+
 @dataclass(frozen=True, slots=True)
 class GameAutoCheckResult:
     process: RunningProcess | None
     connections: tuple[ProcessConnection, ...]
     ping: object | None
     warning: str | None = None
+    selected_connection: ProcessConnection | None = None
+    selection_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointChoice:
+    connection: ProcessConnection
+    rule: str
+    candidates: int
+    excluded_cdn: int
 
 
 class GameAutoCheckWorker(QObject):
@@ -920,34 +1284,45 @@ class GameAutoCheckWorker(QObject):
     def run(self) -> None:
         try:
             process_result = list_running_processes()
-            preferred = (self._preferred_process or "HuntGame.exe").casefold()
+            preferred_name = (
+                "HuntGame.exe" if self._preferred_process is None else self._preferred_process
+            )
+            preferred = preferred_name.casefold()
             process = next(
                 (item for item in process_result.processes if item.name.casefold() == preferred),
                 None,
             )
-            if process is None and preferred != "huntgame.exe":
-                process = next(
-                    (item for item in process_result.processes if item.name.casefold() == "huntgame.exe"),
-                    None,
-                )
+            if process is None:
+                warning = process_result.warning or f"Процесс {preferred_name} не найден"
+                self.completed.emit(GameAutoCheckResult(None, (), None, warning, None))
+                return
 
-            network_result = scan_processes()
-            connections: tuple[ProcessConnection, ...] = ()
-            if process is not None:
-                network_process = next(
-                    (item for item in network_result.processes if item.pid == process.pid),
-                    None,
-                )
-                if network_process is not None:
-                    connections = network_process.connections
+            network_result = scan_process(process.pid)
+            network_process = next(
+                (item for item in network_result.processes if item.pid == process.pid),
+                None,
+            )
+            connections = network_process.connections if network_process is not None else ()
 
             selected_connection = self._select_game_connection(connections)
+            choice = _explain_game_connection(selected_connection, connections)
             remote_host = selected_connection.remote_address if selected_connection else None
             ping = probe_ping(remote_host, count=5, wait_ms=450) if remote_host else None
             warning = process_result.warning or network_result.warning
-            self.completed.emit(GameAutoCheckResult(process, connections, ping, warning))
+            self.completed.emit(
+                GameAutoCheckResult(
+                    process=process,
+                    connections=connections,
+                    ping=ping,
+                    warning=warning,
+                    selected_connection=selected_connection,
+                    selection_reason=choice.rule if choice is not None else None,
+                )
+            )
         except Exception as exc:
-            self.completed.emit(GameAutoCheckResult(None, (), None, str(exc)))
+            self.completed.emit(
+                GameAutoCheckResult(None, (), None, str(exc), None)
+            )
 
     @staticmethod
     def _select_game_connection(
@@ -957,31 +1332,40 @@ class GameAutoCheckWorker(QObject):
         if not candidates:
             return None
         non_cdn = [item for item in candidates if not _is_background_cdn(item.remote_address)]
-        candidates = non_cdn or candidates
+        if not non_cdn:
+            return None
+        candidates = non_cdn
         return sorted(candidates, key=_game_connection_key)[0]
 
 
 class GameAutoCheckDialog(QDialog):
     """Compact background process and packet-stability check for a game."""
 
+    endpoint_chosen = Signal(object)
+
     def __init__(
         self,
         translate: Callable[[str], str],
         preferred_process: str | None = None,
         parent: QWidget | None = None,
+        th: Thresholds = DEFAULT_THRESHOLDS,
     ) -> None:
         super().__init__(parent)
         self._translate = translate
         self._preferred_process = preferred_process
+        self._thresholds = th
         self._thread: QThread | None = None
         self._worker: GameAutoCheckWorker | None = None
         self._monitor_timer = QTimer(self)
         self._monitor_timer.setInterval(8000)
         self._monitor_timer.timeout.connect(self._start_check)
         self._history: list[dict[str, object]] = []
+        self._samples: list[dict[str, object]] = []
         self._last_result: GameAutoCheckResult | None = None
         self.setObjectName("GameAutoCheckDialog")
-        self.setWindowTitle(self._translate("Автопроверка игры"))
+        self.setWindowTitle(
+            f"{self._translate('Автопроверка игры')} · {display_version()}"
+        )
         self.setModal(True)
         self.resize(600, 480)
         self.setMinimumSize(500, 380)
@@ -990,12 +1374,20 @@ class GameAutoCheckDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
+        title_row = QHBoxLayout()
         title = QLabel(self._translate("Автоматическая проверка процесса"))
         title.setObjectName("GameAutoCheckTitle")
+        self.version_label = QLabel(
+            self._translate("Версия {version}").format(version=display_version())
+        )
+        self.version_label.setObjectName("GameAutoCheckVersion")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        title_row.addWidget(self.version_label)
         subtitle = QLabel(self._translate("Поиск HuntGame.exe, сокетов и быстрый тест стабильности соединения"))
         subtitle.setObjectName("Muted")
         subtitle.setWordWrap(True)
-        layout.addWidget(title)
+        layout.addLayout(title_row)
         layout.addWidget(subtitle)
 
         cards = QGridLayout()
@@ -1028,12 +1420,13 @@ class GameAutoCheckDialog(QDialog):
         history_title = QLabel(self._translate("История критических всплесков"))
         history_title.setObjectName("FieldLabel")
         layout.addWidget(history_title)
-        self.history_table = QTableWidget(0, 3)
+        self.history_table = QTableWidget(0, 4)
         self.history_table.setObjectName("GameAutoCheckHistoryTable")
         self.history_table.setHorizontalHeaderLabels(
             [
                 self._translate("Время"),
                 self._translate("Потери"),
+                self._translate("RTT"),
                 self._translate("Статус"),
             ]
         )
@@ -1136,6 +1529,9 @@ class GameAutoCheckDialog(QDialog):
             self.socket_value.setText("--")
             self.loss_value.setText("--")
             self.stability_value.setText(self._translate("Нет данных"))
+            self.endpoint_label.setText(self._translate("Удалённая цель: не определена"))
+            self.endpoint_label.setToolTip("")
+            self.socket_list.clear()
             self.status_label.setText(self._translate("Запустите игру и повторите проверку"))
             self._set_alert_state("warning")
             return
@@ -1151,16 +1547,41 @@ class GameAutoCheckDialog(QDialog):
         if not value.connections:
             self.socket_list.addItem(self._translate("Активные соединения не найдены"))
 
+        choice = _explain_game_connection(value.selected_connection, value.connections)
+        if choice is not None:
+            endpoint = choice.connection.remote_endpoint
+            reason = self._translate(value.selection_reason or choice.rule)
+            self.endpoint_label.setText(
+                self._translate("Игровой узел: {endpoint} · {reason}").format(
+                    endpoint=endpoint,
+                    reason=reason,
+                )
+            )
+            self.endpoint_label.setToolTip(
+                self._translate(
+                    "Правило выбора: {rule}. Кандидатов: {count}; исключено CDN: {excluded}."
+                ).format(
+                    rule=reason,
+                    count=choice.candidates,
+                    excluded=choice.excluded_cdn,
+                )
+            )
+            self.endpoint_chosen.emit(choice)
+
         ping = value.ping
         if ping is None:
-            self.endpoint_label.setText(self._translate("Удалённая цель: не определена"))
+            if choice is None:
+                self.endpoint_label.setText(self._translate("Удалённая цель: не определена"))
+                self.endpoint_label.setToolTip("")
             self.loss_value.setText("--")
             self.stability_value.setText(self._translate("Нет удалённой цели"))
             self._set_alert_state("warning")
         else:
-            self.endpoint_label.setText(
-                self._translate("Удалённая цель: {host}").format(host=ping.host)
-            )
+            if choice is None:
+                self.endpoint_label.setText(
+                    self._translate("Игровой узел: {endpoint}").format(endpoint=ping.host)
+                )
+                self.endpoint_label.setToolTip("")
             self.loss_value.setText(f"{ping.loss_percent:.1f}%")
             jitter = "--" if ping.jitter_ms is None else f"{ping.jitter_ms:.1f} ms"
             self.stability_value.setText(
@@ -1169,16 +1590,28 @@ class GameAutoCheckDialog(QDialog):
                     jitter=jitter,
                 )
             )
+            self._record_sample(ping, value.selected_connection)
             self._record_critical_event(ping)
             self._set_alert_state("error" if self._is_critical_ping(ping) else "good")
-        self.status_label.setText(value.warning or self._translate("Проверка завершена"))
+        self.status_label.setText(
+            self._translate_runtime_warning(value.warning)
+            if value.warning
+            else self._translate("Проверка завершена")
+        )
 
-    @staticmethod
-    def _is_critical_ping(ping: object) -> bool:
+    def _translate_runtime_warning(self, warning: str) -> str:
+        prefix = "Не удалось получить сетевые соединения: "
+        if warning.startswith(prefix):
+            return self._translate("Не удалось получить сетевые соединения: {error}").format(
+                error=warning.removeprefix(prefix),
+            )
+        return self._translate(warning)
+
+    def _is_critical_ping(self, ping: object) -> bool:
         return bool(
             getattr(ping, "loss_percent", 0.0) >= 5.0
-            or (getattr(ping, "jitter_ms", None) or 0.0) >= 25.0
-            or (getattr(ping, "average_ms", None) or 0.0) >= 100.0
+            or (getattr(ping, "jitter_ms", None) or 0.0) >= self._thresholds.jitter_critical_ms
+            or (getattr(ping, "average_ms", None) or 0.0) >= self._thresholds.rtt_high_ms
         )
 
     def _record_critical_event(self, ping: object) -> None:
@@ -1190,9 +1623,9 @@ class GameAutoCheckDialog(QDialog):
         reasons: list[str] = []
         if loss >= 5.0:
             reasons.append(self._translate("потери выше 5%"))
-        if (jitter or 0.0) >= 25.0:
+        if (jitter or 0.0) >= self._thresholds.jitter_critical_ms:
             reasons.append(self._translate("резкий jitter"))
-        if (rtt or 0.0) >= 100.0:
+        if (rtt or 0.0) >= self._thresholds.rtt_high_ms:
             reasons.append(self._translate("высокий RTT"))
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -1209,17 +1642,41 @@ class GameAutoCheckDialog(QDialog):
         values = (
             datetime.fromisoformat(str(row["timestamp"])).strftime("%H:%M:%S"),
             f"{loss:.1f}%",
+            "--" if rtt is None else f"{float(rtt):.1f} ms",
             str(row["status"]),
         )
         for column, text in enumerate(values):
             self.history_table.setItem(table_row, column, QTableWidgetItem(text))
         self.history_table.scrollToBottom()
 
+    def _record_sample(
+        self,
+        ping: object,
+        connection: ProcessConnection | None,
+    ) -> None:
+        """Keep bounded session measurements even when no alert is raised."""
+        sample = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "endpoint": (
+                connection.remote_endpoint
+                if connection is not None
+                else str(getattr(ping, "host", ""))
+            ),
+            "protocol": connection.protocol if connection is not None else None,
+            "loss_percent": round(float(getattr(ping, "loss_percent", 0.0) or 0.0), 1),
+            "rtt_ms": _optional_rounded(getattr(ping, "average_ms", None)),
+            "jitter_ms": _optional_rounded(getattr(ping, "jitter_ms", None)),
+            "critical": self._is_critical_ping(ping),
+        }
+        self._samples.append(sample)
+        del self._samples[:-300]
+
     @Slot(bool)
     def _toggle_monitoring(self, enabled: bool) -> None:
         if enabled:
             self._monitor_timer.start()
             self.status_label.setText(self._translate("Мониторинг включён"))
+            self._start_check()
         else:
             self._monitor_timer.stop()
             self.status_label.setText(self._translate("Мониторинг выключен"))
@@ -1243,6 +1700,7 @@ class GameAutoCheckDialog(QDialog):
         if not path:
             return
         report = {
+            "app_version": __version__,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "process": (
                 {"name": self._last_result.process.name, "pid": self._last_result.process.pid}
@@ -1259,6 +1717,16 @@ class GameAutoCheckDialog(QDialog):
                 }
                 for item in (self._last_result.connections if self._last_result else ())
             ],
+            "selected_connection": (
+                {
+                    "protocol": self._last_result.selected_connection.protocol,
+                    "remote_endpoint": self._last_result.selected_connection.remote_endpoint,
+                    "remote_address": self._last_result.selected_connection.remote_address,
+                    "remote_port": self._last_result.selected_connection.remote_port,
+                }
+                if self._last_result and self._last_result.selected_connection is not None
+                else None
+            ),
             "last_ping": (
                 {
                     "host": self._last_result.ping.host,
@@ -1269,21 +1737,35 @@ class GameAutoCheckDialog(QDialog):
                 if self._last_result and self._last_result.ping is not None
                 else None
             ),
+            "samples": self._samples,
             "history": self._history,
         }
         try:
             if "CSV" in selected_filter or path.casefold().endswith(".csv"):
+                if not path.casefold().endswith(".csv"):
+                    path += ".csv"
                 process_name = report["process"]["name"] if report["process"] else ""
                 process_pid = report["process"]["pid"] if report["process"] else ""
                 socket_count = len(report["connections"])
+                source_rows = self._history or self._samples
                 csv_rows = [
                     {
-                        **row,
+                        "timestamp": row.get("timestamp", ""),
                         "process_name": process_name,
                         "process_pid": process_pid,
                         "socket_count": socket_count,
+                        "endpoint": row.get("endpoint", ""),
+                        "loss_percent": row.get("loss_percent", ""),
+                        "rtt_ms": row.get("rtt_ms", ""),
+                        "jitter_ms": row.get("jitter_ms", ""),
+                        "status": row.get(
+                            "status",
+                            self._translate("Критический всплеск")
+                            if row.get("critical")
+                            else self._translate("Стабильно"),
+                        ),
                     }
-                    for row in self._history
+                    for row in source_rows
                 ]
                 with open(path, "w", newline="", encoding="utf-8-sig") as output:
                     writer = csv.DictWriter(
@@ -1917,11 +2399,14 @@ class GeoHideDialog(QDialog):
             return
         self._result = value
         self._render_result()
-        status = (
-            "GeoHide недоступен, показан резервный список: {count} адресов"
-            if value.used_fallback
-            else "Данные GeoHide обновлены: {count} адресов"
-        )
+        if value.used_fallback:
+            status = "GeoHide недоступен, показан резервный список: {count} адресов"
+        elif value.truncated:
+            status = "Данные GeoHide частично загружены: {count} адресов"
+        elif not value.confirmed:
+            status = "Адреса GeoHide найдены, но не подтверждены контекстом DNS: {count}"
+        else:
+            status = "Данные GeoHide обновлены: {count} адресов"
         self._set_status(status, count=len(value.servers))
 
     @Slot(str)
@@ -1971,22 +2456,33 @@ class GeoHideDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("NetVision — визуальная диагностика сети")
+        self.setWindowTitle(f"NetVision {display_version()} — визуальная диагностика сети")
         self.resize(1280, 820)
         self.setMinimumSize(960, 680)
 
         self._thread: QThread | None = None
         self._worker: DiagnosticWorker | None = None
         self._report: DiagnosticReport | None = None
+        self._thresholds = DEFAULT_THRESHOLDS
         self._selected_process: ProcessNetworkInfo | None = None
         self._selected_connection: ProcessConnection | None = None
+        self._connection_pick_auto = False
+        self._endpoint_choice_state: tuple[str, int, str, int, str] | None = None
+        self._published_monitor_scope: MonitorScope | None = None
         self._system_action_threads: set[QThread] = set()
         self._system_action_workers: dict[QThread, SystemActionWorker] = {}
         self._system_action_status: dict[QPushButton, QLabel] = {}
+        self._rollback_actions: dict[str, tuple[SystemChange, PendingAction]] = {}
         self.quick_fix_status: dict[str, QLabel] = {}
         self.quick_fix_buttons: dict[str, list[QPushButton]] = {}
         self._process_scan_thread: QThread | None = None
         self._process_scan_worker: ProcessScanWorker | None = None
+        self._process_sockets_thread: QThread | None = None
+        self._process_sockets_worker: ProcessSocketsWorker | None = None
+        self._process_sockets_pid: int | None = None
+        self._process_sockets_report: DiagnosticReport | None = None
+        self._vpn_process_sockets: ProcessNetworkInfo | None = None
+        self._vpn_process_sockets_ready = False
         self._network_boost_scan_thread: QThread | None = None
         self._network_boost_scan_worker: NetworkBoostScanWorker | None = None
         self._network_boost_terminate_thread: QThread | None = None
@@ -2003,8 +2499,22 @@ class MainWindow(QMainWindow):
         self._quality_thread: QThread | None = None
         self._quality_worker: InternetQualityWorker | None = None
         self._quality_report: InternetQualityReport | None = None
+        self._nat_thread: QThread | None = None
+        self._nat_worker: NatProbeWorker | None = None
+        self._nat_report: NatReport | None = None
+        self._bufferbloat_thread: QThread | None = None
+        self._bufferbloat_worker: BufferbloatWorker | None = None
+        self._bufferbloat_report: BufferbloatReport | None = None
+        self._game_monitor_thread: QThread | None = None
+        self._game_monitor_worker: GameLaunchMonitorWorker | None = None
         self._latency_thread: QThread | None = None
         self._latency_worker: LatencyMonitorWorker | None = None
+        self._wifi_thread: QThread | None = None
+        self._wifi_worker: WifiMonitorWorker | None = None
+        self._wifi_snapshot: WifiSnapshot | None = None
+        self._wifi_signal_low = False
+        self._wifi_signal_tracker = WifiSignalTracker()
+        self._wifi_probe_state: str | None = None
         self._worker_registry = WorkerRegistry(self)
         self._worker_registry.idle.connect(self._finish_monitor_shutdown)
         self._closing = False
@@ -2022,10 +2532,31 @@ class MainWindow(QMainWindow):
         self._geohide_dialog: GeoHideDialog | None = None
         self._ping_benchmark_thread: QThread | None = None
         self._ping_benchmark_worker: PingBenchmarkWorker | None = None
+        self._mtu_optimizer_thread: QThread | None = None
+        self._mtu_optimizer_worker: MtuOptimizerWorker | None = None
+        self._mtu_optimizer_report: MtuOptimizerReport | None = None
+        self._mtu_optimizer_active_button: QPushButton | None = None
+        self._mtu_trial_probe_thread: QThread | None = None
+        self._mtu_trial_probe_ok: bool | None = None
+        self._mtu_trial_dialog: RollbackConfirmDialog | None = None
+        self._mtu_trial_change: SystemChange | None = None
+        self._mtu_rollback_reasons: dict[str, str] = {}
         self._preferred_ping_target: RegionalPingTarget | None = None
         self._ping_matrix_results: tuple[RegionalPingResult, ...] = ()
         self._loss_test_thread: QThread | None = None
         self._loss_test_worker: PacketLossTestWorker | None = None
+        self._udp_stress_thread: QThread | None = None
+        self._udp_stress_worker: UdpStressWorker | None = None
+        self._traceroute_thread: QThread | None = None
+        self._traceroute_worker: TracerouteWorker | None = None
+        self._mtr_thread: QThread | None = None
+        self._mtr_worker: MtrMonitorWorker | None = None
+        self._mtr_snapshot: MtrSnapshot | None = None
+        self._mtr_stop_logged = False
+        self._test_history_store = TestHistoryStore()
+        self._test_history_records = self._test_history_store.load()
+        self._journal_store = JournalStore()
+        self._journal = SessionJournal.create(self._journal_store)
         self._tcp_diagnostics_thread: QThread | None = None
         self._tcp_diagnostics_worker: TcpDiagnosticsWorker | None = None
         self._tls_audit_thread: QThread | None = None
@@ -2037,8 +2568,13 @@ class MainWindow(QMainWindow):
         self._jitter_events: list[JitterEventRow] = []
         self._jitter_deviations: list[float] = []
         self._jitter_previous_rtt: float | None = None
+        self._jitter_episode_tracker = self._new_jitter_episode_tracker()
+        self._jitter_episode_row_index: int | None = None
+        self._jitter_timeout_row_index: int | None = None
+        self._rtt_episode_tracker = self._new_rtt_episode_tracker()
+        self._rtt_episode_log_index: int | None = None
         self._jitter_target_host = self.target_input.text().strip() if hasattr(self, "target_input") else ""
-        self._loss_analyzer = PacketLossAnalyzer()
+        self._loss_analyzer = PacketLossAnalyzer(th=self._thresholds)
         self._previous_workspace = "expert"
         self._active_preset: str | None = None
         self._theme = "dark"
@@ -2059,14 +2595,115 @@ class MainWindow(QMainWindow):
             name: (name, host, port) for name, host, port in QUICK_PRESETS
         }
         self._preset_settings = QSettings()
+        self._alarm_settings = QSettings()
+        self._background_enabled = self._alarm_settings.value(
+            "background/enabled", False, type=bool
+        )
+        self._background_auto_monitor = self._alarm_settings.value(
+            "background/auto_monitor", False, type=bool
+        )
+        self._notifications_paused = self._alarm_settings.value(
+            "background/notifications_paused", False, type=bool
+        )
+        self._quit_requested = False
+        self._background_hidden = False
+        self._auto_monitor_active = False
+        self._auto_monitor_thread: QThread | None = None
+        self._auto_monitor_worker: GameAutoCheckWorker | None = None
+        self._network_alarm_cooldown_seconds = 60.0
+        self._last_network_alarm_at: dict[str, float] = {}
+        self._network_alarm_enabled = self._alarm_settings.value(
+            "network_health/alarms_enabled", True, type=bool
+        )
+        self._network_ping_alarm_threshold = self._alarm_settings.value(
+            "network_health/ping_threshold_ms", int(DEFAULT_THRESHOLDS.rtt_high_ms), type=int
+        )
+        self._network_loss_alarm_threshold = self._alarm_settings.value(
+            "network_health/loss_threshold_percent", 3.0, type=float
+        )
         self._preset_profiles = self._load_preset_profiles()
         self.preset_buttons: dict[str, QPushButton] = {}
 
         self._build_ui()
+        self._setup_network_health_tray()
+        self.game_monitor_checkbox.setChecked(self._background_auto_monitor)
         self._refresh_session_capsule()
         self._set_status("READY", "idle")
         self._append_log("NetVision готов к диагностике")
         self._retranslate_ui(self._language)
+
+    def _setup_network_health_tray(self) -> None:
+        self._network_health_tray = QSystemTrayIcon(self)
+        icon = QApplication.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        self._network_health_tray.setIcon(icon)
+        self._network_health_tray.setToolTip("NetVision — Network Health")
+
+        menu = QMenu(self)
+        self._tray_show_action = QAction(self._tr("Показать"), self)
+        self._tray_show_action.triggered.connect(self._show_from_tray)
+        self._tray_background_action = QAction(self._tr("Работа в фоне"), self)
+        self._tray_background_action.setCheckable(True)
+        self._tray_background_action.setChecked(self._background_enabled)
+        self._tray_background_action.toggled.connect(self._set_background_enabled)
+        self._tray_game_monitor_action = QAction(
+            self._tr("Мониторинг запуска игры"), self
+        )
+        self._tray_game_monitor_action.setCheckable(True)
+        self._tray_game_monitor_action.setChecked(self._background_auto_monitor)
+        self._tray_game_monitor_action.toggled.connect(self._set_game_monitor_from_tray)
+        self._tray_pause_action = QAction(self._tr("Пауза уведомлений"), self)
+        self._tray_pause_action.setCheckable(True)
+        self._tray_pause_action.setChecked(self._notifications_paused)
+        self._tray_pause_action.toggled.connect(self._set_notification_pause)
+        self._tray_exit_action = QAction(self._tr("Выход"), self)
+        self._tray_exit_action.triggered.connect(self._exit_from_tray)
+        menu.addAction(self._tray_show_action)
+        menu.addSeparator()
+        menu.addAction(self._tray_background_action)
+        menu.addAction(self._tray_game_monitor_action)
+        menu.addAction(self._tray_pause_action)
+        menu.addSeparator()
+        menu.addAction(self._tray_exit_action)
+        self._network_health_tray.setContextMenu(menu)
+        self._network_health_tray.activated.connect(self._on_tray_activated)
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._network_health_tray.show()
+
+    @Slot(QSystemTrayIcon.ActivationReason)
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            self._show_from_tray()
+
+    @Slot()
+    def _show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    @Slot(bool)
+    def _set_background_enabled(self, enabled: bool) -> None:
+        self._background_enabled = enabled
+        self._alarm_settings.setValue("background/enabled", enabled)
+
+    @Slot(bool)
+    def _set_game_monitor_from_tray(self, enabled: bool) -> None:
+        if self.game_monitor_checkbox.isChecked() != enabled:
+            self.game_monitor_checkbox.setChecked(enabled)
+
+    @Slot(bool)
+    def _set_notification_pause(self, paused: bool) -> None:
+        self._notifications_paused = paused
+        self._alarm_settings.setValue("background/notifications_paused", paused)
+
+    @Slot()
+    def _exit_from_tray(self) -> None:
+        self._quit_requested = True
+        self.close()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -2120,7 +2757,9 @@ class MainWindow(QMainWindow):
         brand_box.setSpacing(0)
         brand = QLabel("NETVISION")
         brand.setObjectName("Brand")
-        self.brand_caption = QLabel("NETWORK DIAGNOSTICS / WINDOWS")
+        self.brand_caption = QLabel(
+            f"NETWORK DIAGNOSTICS / WINDOWS · {display_version()}"
+        )
         self.brand_caption.setObjectName("BrandCaption")
         brand.setMargin(0)
         self.brand_caption.setMargin(0)
@@ -2221,6 +2860,16 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._export_report)
 
+        self.support_bundle_button = QToolButton()
+        self.support_bundle_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        )
+        self.support_bundle_button.setToolTip("Экспортировать пакет для техподдержки")
+        self.support_bundle_button.setAccessibleName("Экспортировать пакет для техподдержки")
+        self.support_bundle_button.setFixedSize(36, 36)
+        self.support_bundle_button.setEnabled(False)
+        self.support_bundle_button.clicked.connect(self._export_support_bundle)
+
         self.connection_capture_button = QPushButton("⌕  Выбрать соединение")
         self.connection_capture_button.setObjectName("ProcessCaptureButton")
         self.connection_capture_button.setToolTip(self._tr("Выбрать соединение"))
@@ -2292,6 +2941,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.header_mode_controls, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.export_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.support_bundle_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(
             self.header_settings,
             0,
@@ -2442,13 +3092,23 @@ class MainWindow(QMainWindow):
         if normalized_state in {"warning", "error"}:
             signature = (normalized_state, source)
             if signature != self._last_header_anomaly_signature:
+                observed_at = datetime.now()
                 self._header_anomaly_history.append(
                     HeaderAnomalyEvent(
-                        observed_at=datetime.now(),
+                        observed_at=observed_at,
                         state=normalized_state,
                         source=source,
                         values=tuple(values.items()),
                     )
+                )
+                self._record_journal_event(
+                    "header.anomaly",
+                    severity=normalized_state,
+                    subject="network-health",
+                    template=source,
+                    values=values,
+                    refs={"state": normalized_state},
+                    at=observed_at,
                 )
             self._last_header_anomaly_signature = signature
         else:
@@ -2627,9 +3287,23 @@ class MainWindow(QMainWindow):
         widgets, tabs and table headers here instead.
         """
         self._language = language
-        self.setWindowTitle(self._tr("NetVision — визуальная диагностика сети"))
+        self.setWindowTitle(
+            self._translator.format(
+                "NetVision {version} — визуальная диагностика сети",
+                version=display_version(),
+            )
+        )
+        if hasattr(self, "brand_caption"):
+            self.brand_caption.setText(
+                self._translator.format(
+                    "NETWORK DIAGNOSTICS / WINDOWS · {version}",
+                    version=display_version(),
+                )
+            )
         self._retranslate_widget_tree(self)
         self._refresh_preset_buttons()
+        if hasattr(self, "bufferbloat_recommendations"):
+            self._render_bufferbloat_recommendations()
 
         for widget in (getattr(self, "latency_chart", None), getattr(self, "jitter_chart", None), getattr(self, "topology", None)):
             if widget is not None and hasattr(widget, "set_translator"):
@@ -2647,10 +3321,23 @@ class MainWindow(QMainWindow):
         if hasattr(self, "jitter_event_status"):
             self.jitter_event_status.setText(
                 self._translator.format(
-                    "Критический порог: Δ RTT > 15 мс · событий: {count}",
+                    "Критический порог: Δ RTT > {threshold:.0f} мс · событий: {count}",
+                    threshold=self._thresholds.jitter_spike_ms,
                     count=len(self._jitter_events),
                 )
             )
+        if hasattr(self, "ping_spike_status") and not self._ping_spike_events:
+            self.ping_spike_status.setText(
+                self._translator.format(
+                    "Пики выше {threshold:.0f} мс и потери появятся здесь во время мониторинга",
+                    threshold=self._thresholds.rtt_high_ms,
+                )
+            )
+        if hasattr(self, "journal_layer_filter"):
+            self._retranslate_journal_filter()
+            self._render_journal()
+        if hasattr(self, "monitor_scope_label"):
+            self._update_monitor_scope_label(self._monitor_scope())
 
         # Theme tooltips are stateful, so set them from the current theme
         # rather than translating a stale tooltip from the prior language.
@@ -2894,6 +3581,15 @@ class MainWindow(QMainWindow):
         self.process_refresh_button.setFixedSize(36, 36)
         self.process_refresh_button.clicked.connect(self.refresh_processes)
 
+        self.game_monitor_checkbox = QCheckBox(self._tr("Мониторинг запуска игры"))
+        self.game_monitor_checkbox.setObjectName("GameLaunchMonitorToggle")
+        self.game_monitor_checkbox.setMinimumWidth(136)
+        self.game_monitor_checkbox.setToolTip(
+            self._tr("Автоматически отслеживать запуск и завершение HuntGame.exe")
+        )
+        self.game_monitor_checkbox.toggled.connect(self._toggle_game_launch_monitor)
+        self.game_monitor_checkbox.toggled.connect(self._sync_tray_game_monitor)
+
         self.process_status = QLabel()
         self.process_status.setObjectName("Muted")
         self.process_status.setVisible(False)
@@ -2903,6 +3599,8 @@ class MainWindow(QMainWindow):
         self.udp_ports_status.setToolTip(
             "В реальном времени показывает локальные UDP-порты, занятые выбранным процессом."
         )
+        self.monitor_scope_label = QLabel("Наблюдение: только цель")
+        self.monitor_scope_label.setObjectName("MonitorScopeLabel")
 
         layout.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.process_selector, 1)
@@ -2911,8 +3609,49 @@ class MainWindow(QMainWindow):
         layout.addWidget(connection_title, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.process_connection_selector, 1)
         layout.addWidget(self.process_refresh_button)
+        layout.addWidget(self.game_monitor_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
         panel_layout.addLayout(layout)
         panel_layout.addWidget(self.udp_ports_status)
+        panel_layout.addWidget(self.monitor_scope_label)
+        self._update_monitor_scope_label(self._monitor_scope())
+        self.game_monitor_status = QLabel(self._tr("Мониторинг игры выключен"))
+        self.game_monitor_status.setObjectName("Muted")
+        panel_layout.addWidget(self.game_monitor_status)
+
+        alarms_layout = QHBoxLayout()
+        alarms_layout.setContentsMargins(0, 0, 0, 0)
+        alarms_layout.setSpacing(6)
+        self.network_alarm_checkbox = QCheckBox(self._tr("Уведомления о качестве сети"))
+        self.network_alarm_checkbox.setObjectName("NetworkHealthAlarmToggle")
+        self.network_alarm_checkbox.setChecked(bool(self._network_alarm_enabled))
+        self.network_alarm_checkbox.setToolTip(
+            self._tr("Показывать уведомления Windows при высоком ping или потерях")
+        )
+        self.network_alarm_checkbox.toggled.connect(self._save_network_alarm_settings)
+        ping_alarm_label = QLabel(self._tr("Ping >"))
+        ping_alarm_label.setObjectName("Muted")
+        self.network_ping_alarm_spin = QSpinBox()
+        self.network_ping_alarm_spin.setRange(50, 2000)
+        self.network_ping_alarm_spin.setValue(int(self._network_ping_alarm_threshold))
+        self.network_ping_alarm_spin.setSuffix(" ms")
+        self.network_ping_alarm_spin.setFixedWidth(82)
+        self.network_ping_alarm_spin.valueChanged.connect(self._save_network_alarm_settings)
+        loss_alarm_label = QLabel(self._tr("Потери >"))
+        loss_alarm_label.setObjectName("Muted")
+        self.network_loss_alarm_spin = QDoubleSpinBox()
+        self.network_loss_alarm_spin.setRange(0.1, 100.0)
+        self.network_loss_alarm_spin.setDecimals(1)
+        self.network_loss_alarm_spin.setValue(float(self._network_loss_alarm_threshold))
+        self.network_loss_alarm_spin.setSuffix(" %")
+        self.network_loss_alarm_spin.setFixedWidth(78)
+        self.network_loss_alarm_spin.valueChanged.connect(self._save_network_alarm_settings)
+        alarms_layout.addWidget(self.network_alarm_checkbox)
+        alarms_layout.addWidget(ping_alarm_label)
+        alarms_layout.addWidget(self.network_ping_alarm_spin)
+        alarms_layout.addWidget(loss_alarm_label)
+        alarms_layout.addWidget(self.network_loss_alarm_spin)
+        alarms_layout.addStretch(1)
+        panel_layout.addLayout(alarms_layout)
 
         self.embedded_dropdown = QFrame(panel)
         self.embedded_dropdown.setObjectName("EmbeddedDropdown")
@@ -3003,7 +3742,7 @@ class MainWindow(QMainWindow):
     def _quick_fix_tooltip(action_key: str) -> str:
         return {
             "dns": "Очистить локальный DNS-кэш без открытия окна консоли",
-            "mtu": "Применить консервативный MTU 1500 к активному адаптеру",
+            "mtu": "Рассчитать безопасный MTU бинарным поиском и применить его к активному адаптеру",
             "stack": "Сбросить TCP/IP и Winsock; после этого потребуется перезагрузка Windows",
             "adapter": "Временно отключить и снова включить активный сетевой адаптер",
         }[action_key]
@@ -3018,21 +3757,21 @@ class MainWindow(QMainWindow):
             for interface in self._report.system.interfaces:
                 if interface.is_up and interface.name.strip():
                     return interface.name
-        return None
+        return detect_active_adapter()
 
     def _trigger_quick_fix(self, action_key: str, button: QPushButton, status: QLabel) -> None:
         if action_key == "dns":
             self._run_system_action("Сброс кэша DNS", flush_dns_cache, button, status)
+            return
+        if action_key == "mtu":
+            self._mtu_optimizer_active_button = button
+            self.start_mtu_optimizer()
             return
         adapter = self._active_adapter_name()
         if not adapter:
             status.setText(self._tr("Активный адаптер не определён"))
             return
         confirmations = {
-            "mtu": (
-                "Оптимизация MTU",
-                f"Применить MTU 1500 к адаптеру «{adapter}»?\nТекущая сеть может кратковременно прерваться.",
-            ),
             "stack": (
                 "Сброс TCP/IP",
                 "Сбросить TCP/IP и Winsock? Потребуется перезагрузка Windows, а текущие соединения будут закрыты.",
@@ -3054,9 +3793,11 @@ class MainWindow(QMainWindow):
             status.setText(self._tr("Действие отменено"))
             return
         actions: dict[str, tuple[str, Callable[[], SystemActionResult]]] = {
-            "mtu": ("Оптимизация MTU", lambda adapter=adapter: optimize_mtu(adapter)),
             "stack": ("Сброс TCP/IP и Winsock", reset_tcpip_stack),
-            "adapter": ("Перезапуск адаптера", lambda adapter=adapter: restart_network_adapter(adapter)),
+            "adapter": (
+                "Перезапуск адаптера",
+                lambda adapter=adapter: restart_adapter_verified(adapter),
+            ),
         }
         label, action = actions[action_key]
         self._run_system_action(label, action, button, status)
@@ -3340,22 +4081,42 @@ class MainWindow(QMainWindow):
         value = self.process_selector.itemData(index)
         self._selected_process = value if isinstance(value, ProcessNetworkInfo) else None
         self._selected_connection = None
+        self._vpn_process_sockets = None
+        self._vpn_process_sockets_ready = False
+        self._connection_pick_auto = False
+        self.process_connection_selector.blockSignals(True)
         self.process_connection_selector.clear()
         if self._selected_process is None:
             self._stop_udp_port_monitor()
             self._set_udp_ports_status(None)
             self.process_connection_selector.addItem(self._tr("Сначала выберите процесс"), None)
+            self.process_connection_selector.blockSignals(False)
             return
         for connection in self._selected_process.connections:
             self.process_connection_selector.addItem(self._connection_display_label(connection), connection)
         if not self._selected_process.connections:
             self.process_connection_selector.addItem(self._tr("Нет активных соединений"), None)
+        else:
+            self.process_connection_selector.setCurrentIndex(-1)
+        self.process_connection_selector.blockSignals(False)
         self.process_status.setText(
             f"{self._selected_process.name}: {len(self._selected_process.connections)}"
         )
         self._append_log(f"Выбран процесс: {self._process_display_label(self._selected_process)}")
+        self._record_journal_event(
+            "action.process_selected",
+            subject=self._selected_process.name,
+            template="Выбран процесс: {process} (PID {pid})",
+            values={
+                "process": self._selected_process.name,
+                "pid": self._selected_process.pid,
+                "connections": len(self._selected_process.connections),
+            },
+            refs={"pid": self._selected_process.pid},
+        )
         self._start_udp_port_monitor(self._selected_process.pid)
-        if self.lite_mode_button.isChecked() and self._selected_process.connections:
+        if self._selected_process.connections:
+            self._connection_pick_auto = self.lite_mode_button.isChecked()
             self.process_connection_selector.setCurrentIndex(0)
 
     @Slot(int)
@@ -3363,6 +4124,8 @@ class MainWindow(QMainWindow):
         connection = self.process_connection_selector.itemData(index)
         if not isinstance(connection, ProcessConnection):
             return
+        picked_automatically = self._connection_pick_auto
+        self._connection_pick_auto = False
         self._selected_connection = connection
         if not connection.remote_address or connection.remote_port < 1:
             self.process_status.setText(
@@ -3373,12 +4136,131 @@ class MainWindow(QMainWindow):
                 f"{self._translator.format('локальный UDP-порт {port}', port=connection.local_port)}; "
                 f"{self._tr('цель диагностики не изменена')}"
             )
+            self._publish_monitor_scope()
             return
+        self.stop_mtr_monitor("target_changed")
         self.target_input.setText(connection.remote_address)
         self.port_input.setValue(connection.remote_port)
-        self._append_log(
-            f"Цель подставлена из процесса: {connection.remote_endpoint} ({connection.protocol})"
+        if not self._ping_mtu_host_manually_edited:
+            self.ping_mtu_host_input.setText(connection.remote_address)
+        if picked_automatically:
+            candidates = self._selected_process.connections if self._selected_process else ()
+            explanation = _explain_game_connection(connection, candidates)
+            choice = (
+                replace(explanation, rule="Первое доступное соединение")
+                if explanation is not None
+                else EndpointChoice(connection, "Первое доступное соединение", 1, 0)
+            )
+            reason = self._tr(choice.rule)
+            self._append_log(
+                self._translator.format(
+                    "Цель автоматически выбрана из процесса: {target} ({protocol}); правило: {rule}",
+                    target=connection.remote_endpoint,
+                    protocol=connection.protocol,
+                    rule=reason,
+                )
+            )
+            self._record_endpoint_choice(choice)
+        else:
+            self._append_log(
+                f"Цель подставлена из процесса: {connection.remote_endpoint} ({connection.protocol})"
+            )
+            self._record_journal_event(
+                "action.target_selected",
+                subject=connection.remote_endpoint,
+                template="Цель выбрана из процесса: {target} ({protocol})",
+                values={"target": connection.remote_endpoint, "protocol": connection.protocol},
+                refs={"host": connection.remote_address, "port": connection.remote_port},
+            )
+        self._publish_monitor_scope()
+
+    @Slot(object)
+    def _on_endpoint_chosen(self, value: object) -> None:
+        if isinstance(value, EndpointChoice):
+            self._record_endpoint_choice(value)
+
+    def _record_endpoint_choice(self, choice: EndpointChoice) -> None:
+        connection = choice.connection
+        state = (
+            connection.protocol,
+            connection.local_port,
+            connection.remote_address,
+            connection.remote_port,
+            choice.rule,
         )
+        if state == self._endpoint_choice_state:
+            return
+        self._endpoint_choice_state = state
+        self._record_journal_event(
+            "endpoint.choice",
+            subject=connection.remote_endpoint,
+            template="Автоматически выбран endpoint: {endpoint} ({rule})",
+            values={
+                "endpoint": connection.remote_endpoint,
+                "rule": self._tr(choice.rule),
+                "candidates": choice.candidates,
+                "excluded_cdn": choice.excluded_cdn,
+            },
+            refs={
+                "protocol": connection.protocol,
+                "host": connection.remote_address,
+                "port": connection.remote_port,
+            },
+        )
+
+    def _monitor_scope(self) -> MonitorScope:
+        process = self._selected_process
+        host = self.target_input.text().strip() if hasattr(self, "target_input") else ""
+        port = self.port_input.value() if hasattr(self, "port_input") else 0
+        return MonitorScope(
+            pid=process.pid if process is not None else None,
+            process_name=process.name if process is not None else None,
+            host=host,
+            port=port,
+        )
+
+    def _publish_monitor_scope(self) -> MonitorScope:
+        scope = self._monitor_scope()
+        self._update_monitor_scope_label(scope)
+        if scope == self._published_monitor_scope:
+            return scope
+        self._published_monitor_scope = scope
+        template = (
+            "Наблюдение: {process} · PID {pid} → {host}:{port}"
+            if scope.pid is not None and scope.process_name
+            else "Наблюдение: только цель {host}:{port}"
+        )
+        values: dict[str, object] = {"host": scope.host, "port": scope.port}
+        if scope.pid is not None and scope.process_name:
+            values.update({"process": scope.process_name, "pid": scope.pid})
+        self._record_journal_event(
+            "action.monitor_scope",
+            subject=f"{scope.host}:{scope.port}",
+            template=template,
+            values=values,
+            refs={"pid": scope.pid, "process_name": scope.process_name},
+        )
+        return scope
+
+    def _update_monitor_scope_label(self, scope: MonitorScope) -> None:
+        if not hasattr(self, "monitor_scope_label"):
+            return
+        if scope.pid is not None and scope.process_name:
+            text = self._translator.format(
+                "Наблюдение: {process} · PID {pid} → {host}:{port}",
+                process=scope.process_name,
+                pid=scope.pid,
+                host=scope.host,
+                port=scope.port,
+            )
+        else:
+            text = self._translator.format(
+                "Наблюдение: только цель {host}:{port}",
+                host=scope.host,
+                port=scope.port,
+            )
+        self.monitor_scope_label.setText(text)
+        self.monitor_scope_label.setToolTip(text)
 
     @Slot()
     def _clear_process_scan(self) -> None:
@@ -3386,6 +4268,78 @@ class MainWindow(QMainWindow):
             return
         self._process_scan_thread = None
         self._process_scan_worker = None
+
+    def _start_process_sockets_scan(self, report: DiagnosticReport, pid: int) -> None:
+        if self._process_sockets_thread and self._process_sockets_thread.isRunning():
+            return
+        thread = QThread(self)
+        worker = ProcessSocketsWorker(pid)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_process_sockets_completed)
+        worker.completed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_process_sockets_scan)
+        self._process_sockets_thread = thread
+        self._process_sockets_worker = worker
+        self._process_sockets_pid = pid
+        self._process_sockets_report = report
+        thread.start()
+
+    @Slot(object)
+    def _on_process_sockets_completed(self, result: object) -> None:
+        if self.sender() is not self._process_sockets_worker:
+            return
+        report = self._process_sockets_report
+        selected_process = self._selected_process
+        if (
+            report is None
+            or self._report is not report
+            or selected_process is None
+            or selected_process.pid != self._process_sockets_pid
+        ):
+            return
+        if not isinstance(result, ProcessScanResult):
+            result = ProcessScanResult((), "Сокеты выбранного процесса не получены")
+
+        process = next(
+            (item for item in result.processes if item.pid == selected_process.pid),
+            None,
+        )
+        socket_count = len(process.connections) if process is not None else 0
+        measurement = self._record_journal_event(
+            "process.sockets",
+            severity="warning" if result.warning else "info",
+            subject=selected_process.name,
+            template="Сокеты процесса: {count}",
+            values={"count": socket_count, "warning": result.warning or ""},
+            refs={"pid": selected_process.pid},
+        )
+        if result.warning:
+            self._append_log(f"Проверка сокетов процесса: {result.warning}")
+
+        self._vpn_process_sockets = process
+        self._vpn_process_sockets_ready = True
+        finding = vpn_bypass_connections(report, process)
+        if finding is not None:
+            self._record_journal_event(
+                "vpn.bypass_suspected",
+                severity="warning",
+                subject=selected_process.name,
+                template="Возможный обход VPN: {evidence}",
+                values={"evidence": finding.evidence},
+                refs={"measurement_event_id": measurement.id, "pid": selected_process.pid},
+            )
+        self._update_root_cause_analysis(report)
+
+    @Slot()
+    def _clear_process_sockets_scan(self) -> None:
+        if self.sender() is not self._process_sockets_thread:
+            return
+        self._process_sockets_thread = None
+        self._process_sockets_worker = None
+        self._process_sockets_pid = None
+        self._process_sockets_report = None
 
     def _make_network_boost_button(self) -> QPushButton:
         button = QPushButton("Оптимизировать сеть")
@@ -3445,6 +4399,13 @@ class MainWindow(QMainWindow):
         if not isinstance(value, tuple) or not all(isinstance(item, BackgroundTrafficCandidate) for item in value):
             self._set_network_boost_status("Network Boost: не удалось проверить выбранные процессы")
             return
+        self._record_journal_event(
+            "action.network_boost",
+            subject="network-boost",
+            template="Network Boost: выбрано процессов: {count}",
+            values={"count": len(value)},
+            refs={"pids": [item.pid for item in value]},
+        )
         dialog = self._network_boost_dialog
         if dialog is not None:
             dialog.set_busy(True)
@@ -3530,6 +4491,7 @@ class MainWindow(QMainWindow):
         self._network_boost_dialog = None
 
     def _start_udp_port_monitor(self, pid: int) -> None:
+        self._publish_monitor_scope()
         if self._udp_monitor_pid == pid and self._udp_monitor_thread and self._udp_monitor_thread.isRunning():
             return
         self._stop_udp_port_monitor()
@@ -3589,26 +4551,42 @@ class MainWindow(QMainWindow):
     def _record_udp_activity(self, activity: UdpPortActivity, include_warning: bool) -> None:
         snapshot = activity.snapshot
         rows: list[UdpEventRow] = []
-        rows.extend(
-            UdpEventRow(
-                activity.observed_at,
-                "Порт открыт",
-                port,
-                f"UDP-порт {port} появился у PID {snapshot.pid}",
-                pid=snapshot.pid,
+        for port in activity.opened_ports:
+            rows.append(
+                UdpEventRow(
+                    activity.observed_at,
+                    "Порт открыт",
+                    port,
+                    f"UDP-порт {port} появился у PID {snapshot.pid}",
+                    pid=snapshot.pid,
+                )
             )
-            for port in activity.opened_ports
-        )
-        rows.extend(
-            UdpEventRow(
-                activity.observed_at,
-                "Порт закрыт",
-                port,
-                f"UDP-порт {port} исчез у PID {snapshot.pid}",
-                pid=snapshot.pid,
+            self._record_journal_event(
+                "udp.port_opened",
+                subject=f"UDP:{port}",
+                template="UDP-порт {port} появился у PID {pid}",
+                values={"port": port, "pid": snapshot.pid},
+                refs={"pid": snapshot.pid, "port": port},
+                at=activity.observed_at,
             )
-            for port in activity.closed_ports
-        )
+        for port in activity.closed_ports:
+            rows.append(
+                UdpEventRow(
+                    activity.observed_at,
+                    "Порт закрыт",
+                    port,
+                    f"UDP-порт {port} исчез у PID {snapshot.pid}",
+                    pid=snapshot.pid,
+                )
+            )
+            self._record_journal_event(
+                "udp.port_closed",
+                subject=f"UDP:{port}",
+                template="UDP-порт {port} исчез у PID {pid}",
+                values={"port": port, "pid": snapshot.pid},
+                refs={"pid": snapshot.pid, "port": port},
+                at=activity.observed_at,
+            )
         if activity.anomaly is not None:
             details = (
                 "Все ранее активные UDP-порты исчезли между опросами"
@@ -3625,6 +4603,14 @@ class MainWindow(QMainWindow):
                     pid=snapshot.pid,
                 )
             )
+            self._record_journal_event(
+                "udp.possible_disconnect",
+                severity="warning",
+                subject=f"PID {snapshot.pid}",
+                template=details,
+                refs={"pid": snapshot.pid, "anomaly": activity.anomaly.value},
+                at=activity.observed_at,
+            )
         if include_warning and snapshot.warning:
             rows.append(
                 UdpEventRow(
@@ -3634,6 +4620,15 @@ class MainWindow(QMainWindow):
                     snapshot.warning,
                     pid=snapshot.pid,
                 )
+            )
+            self._record_journal_event(
+                "udp.monitor_error",
+                severity="warning",
+                subject=f"PID {snapshot.pid}",
+                template="Ошибка UDP-монитора: {message}",
+                values={"message": snapshot.warning},
+                refs={"pid": snapshot.pid},
+                at=activity.observed_at,
             )
         if not rows:
             return
@@ -4068,7 +5063,12 @@ class MainWindow(QMainWindow):
         spike_layout.setSpacing(7)
         spike_title = QLabel("SPIKE / LAG DETECTOR")
         spike_title.setObjectName("FieldLabel")
-        self.ping_spike_status = QLabel("Пики выше 100 мс и потери появятся здесь во время мониторинга")
+        self.ping_spike_status = QLabel(
+            self._translator.format(
+                "Пики выше {threshold:.0f} мс и потери появятся здесь во время мониторинга",
+                threshold=self._thresholds.rtt_high_ms,
+            )
+        )
         self.ping_spike_status.setObjectName("Muted")
         self.ping_spike_status.setWordWrap(True)
         self.ping_spike_log = QPlainTextEdit()
@@ -4087,31 +5087,77 @@ class MainWindow(QMainWindow):
         mtu_layout = QVBoxLayout(mtu_panel)
         mtu_layout.setContentsMargins(12, 10, 12, 12)
         mtu_layout.setSpacing(7)
-        mtu_title = QLabel("MTU / PACKET SIZE STRESS TEST")
+        mtu_title = QLabel("MTU OPTIMIZER RESULTS")
         mtu_title.setObjectName("FieldLabel")
-        mtu_note = QLabel("ICMP с флагом Don't Fragment: 32, 512 и 1472 байт")
+        mtu_note = QLabel("Последние результаты DF-проверок оптимального MTU")
         mtu_note.setObjectName("Muted")
-        host_row = QHBoxLayout()
-        host_label = QLabel("ЦЕЛЬ MTU")
-        host_label.setObjectName("FieldLabel")
+        mtu_controls = QHBoxLayout()
+        mtu_target_label = QLabel("ЦЕЛЬ MTU")
+        mtu_target_label.setObjectName("FieldLabel")
         self.ping_mtu_host_input = QLineEdit()
         self.ping_mtu_host_input.setPlaceholderText("Адрес для MTU-проверки")
         self.ping_mtu_host_input.setClearButtonEnabled(True)
-        self.ping_mtu_run_button = QPushButton("Проверить MTU")
+        self.ping_mtu_host_input.setText(self.target_input.text().strip())
+        self._ping_mtu_host_manually_edited = False
+        self.ping_mtu_host_input.textEdited.connect(self._mark_mtu_host_manually_edited)
+        self.ping_mtu_run_button = QPushButton("Найти оптимальный MTU")
         self.ping_mtu_run_button.setObjectName("PingSecondaryButton")
         self.ping_mtu_run_button.clicked.connect(self.start_mtu_test)
-        host_row.addWidget(host_label)
-        host_row.addWidget(self.ping_mtu_host_input, 1)
-        host_row.addWidget(self.ping_mtu_run_button)
-        self.ping_mtu_table = QTableWidget(0, 4)
-        self.ping_mtu_table.setObjectName("PingMtuTable")
-        self.ping_mtu_table.setHorizontalHeaderLabels(["Payload", "Ответы", "Потери", "Результат"])
-        self._configure_table(self.ping_mtu_table, (100, 95, 85, 220))
-        self.ping_mtu_table.setMinimumHeight(150)
+        self.ping_mtu_status = QLabel("Готов к проверке")
+        self.ping_mtu_status.setObjectName("Muted")
+        self.mtu_optimizer_progress = QProgressBar()
+        self.mtu_optimizer_progress.setRange(0, 0)
+        self.mtu_optimizer_progress.setTextVisible(False)
+        self.mtu_optimizer_progress.setFixedHeight(5)
+        self.mtu_optimizer_progress.hide()
+        mtu_controls.addWidget(mtu_target_label)
+        mtu_controls.addWidget(self.ping_mtu_host_input, 1)
+        mtu_controls.addWidget(self.ping_mtu_run_button)
+        self.ping_mtu_table = QTableWidget(0, 5)
+        self.ping_mtu_table.setObjectName("MtuOptimizerTable")
+        self.ping_mtu_table.setHorizontalHeaderLabels(
+            ["MTU", "Payload", "RTT", "Статус", "Детали"]
+        )
+        self._configure_table(self.ping_mtu_table, (70, 85, 75, 125, 180))
+        self.ping_mtu_table.setMinimumHeight(190)
+        self.mtu_optimizer_target_input = self.ping_mtu_host_input
+        self.mtu_optimizer_start_button = self.ping_mtu_run_button
+        self.mtu_optimizer_status = self.ping_mtu_status
+        self.mtu_optimizer_table = self.ping_mtu_table
+        self.mtu_current_value = QLabel("--")
+        self.mtu_optimal_value = QLabel("--")
+        self.mtu_fragmentation_value = QLabel(self._tr("Ожидание проверки"))
+        mtu_metrics = QGridLayout()
+        mtu_metrics.setSpacing(6)
+        for index, (title, value) in enumerate(
+            (
+                (self._tr("Текущий системный MTU"), self.mtu_current_value),
+                (self._tr("Оптимальный MTU"), self.mtu_optimal_value),
+                (self._tr("Проверка фрагментации"), self.mtu_fragmentation_value),
+            )
+        ):
+            card = QFrame()
+            card.setObjectName("MetricTile")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(8, 7, 8, 7)
+            card_layout.setSpacing(3)
+            title_label = QLabel(title)
+            title_label.setObjectName("Muted")
+            value.setObjectName("MtuOptimizerValue")
+            card_layout.addWidget(title_label)
+            card_layout.addWidget(value)
+            mtu_metrics.addWidget(card, 0, index)
+        self.mtu_optimizer_apply_button = QPushButton(self._tr("Применить найденный MTU"))
+        self.mtu_optimizer_apply_button.setEnabled(False)
+        self.mtu_optimizer_apply_button.clicked.connect(self._apply_optimized_mtu)
         mtu_layout.addWidget(mtu_title)
         mtu_layout.addWidget(mtu_note)
-        mtu_layout.addLayout(host_row)
+        mtu_layout.addLayout(mtu_controls)
+        mtu_layout.addWidget(self.mtu_optimizer_progress)
+        mtu_layout.addWidget(self.ping_mtu_status)
+        mtu_layout.addLayout(mtu_metrics)
         mtu_layout.addWidget(self.ping_mtu_table, 1)
+        mtu_layout.addWidget(self.mtu_optimizer_apply_button)
 
         self.ping_tools_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.ping_tools_splitter.setObjectName("WorkspaceSplitter")
@@ -4128,8 +5174,8 @@ class MainWindow(QMainWindow):
         scroll.setWidget(content)
         outer_layout.addWidget(scroll)
         self._render_ping_matrix_placeholders()
-        self._render_mtu_placeholders()
-        self._set_ping_statistics(latency_statistics(()))
+        self._render_quality_mtu_placeholders()
+        self._set_ping_statistics(latency_statistics((), th=self._thresholds))
         return workspace
 
     def _render_ping_matrix_placeholders(self) -> None:
@@ -4148,6 +5194,10 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor("#00E5A3"))
                 self.ping_matrix_table.setItem(row, column, item)
         self._update_ping_matrix_selection_status()
+
+    def _render_quality_mtu_placeholders(self) -> None:
+        self.ping_mtu_table.setRowCount(0)
+        self.ping_mtu_status.setText(self._tr("Готов к тесту"))
 
     @Slot(int, int)
     def _select_ping_region(self, row: int, _column: int) -> None:
@@ -4180,19 +5230,10 @@ class MainWindow(QMainWindow):
             )
         )
 
-    def _render_mtu_placeholders(self) -> None:
-        self.ping_mtu_table.setRowCount(3)
-        for row, payload_size in enumerate((32, 512, 1472)):
-            values = [f"{payload_size} B", "--", "--", "Готов к тесту"]
-            for column, value in enumerate(values):
-                self.ping_mtu_table.setItem(row, column, QTableWidgetItem(value))
-
     def _open_ping_workspace(self) -> None:
         if self.mode_stack.currentWidget() is not self.ping_view:
             self._previous_workspace = "lite" if self.mode_stack.currentWidget() is self.lite_view else "expert"
         self._close_combo_popups()
-        if not self.ping_mtu_host_input.text().strip():
-            self.ping_mtu_host_input.setText(self.target_input.text().strip())
         self._refresh_ping_statistics()
         self.mode_stack.setCurrentWidget(self.ping_view)
         self.ping_back_button.setFocus()
@@ -4299,7 +5340,13 @@ class MainWindow(QMainWindow):
         events_header = QHBoxLayout()
         events_title = QLabel("SPIKE LOG & FREQUENCY")
         events_title.setObjectName("FieldLabel")
-        self.jitter_event_status = QLabel("Критический порог: Δ RTT > 15 мс")
+        self.jitter_event_status = QLabel(
+            self._translator.format(
+                "Критический порог: Δ RTT > {threshold:.0f} мс · событий: {count}",
+                threshold=self._thresholds.jitter_spike_ms,
+                count=0,
+            )
+        )
         self.jitter_event_status.setObjectName("Muted")
         self.jitter_event_status.setWordWrap(True)
         self.jitter_clear_button = QPushButton("Очистить журнал")
@@ -4344,23 +5391,24 @@ class MainWindow(QMainWindow):
         current = chart_samples[-1] if chart_samples and chart_samples[-1] is not None else None
         maximum = max(values) if values else None
         spike_count = len(self._jitter_events)
-        state = _jitter_state(current)
+        state = _jitter_state(current, self._thresholds)
         self._set_jitter_impact_value("current", _ms(current), state)
-        self._set_jitter_impact_value("maximum", _ms(maximum), _jitter_state(maximum))
+        self._set_jitter_impact_value("maximum", _ms(maximum), _jitter_state(maximum, self._thresholds))
         self._set_jitter_impact_value("spikes", str(spike_count), "bad" if spike_count else "good")
-        self._set_jitter_impact_value("voice", self._tr(_voice_jitter_rating(current)), state)
-        self._set_jitter_impact_value("gaming", self._tr(_gaming_jitter_rating(current)), state)
+        self._set_jitter_impact_value("voice", self._tr(_voice_jitter_rating(current, self._thresholds)), state)
+        self._set_jitter_impact_value("gaming", self._tr(_gaming_jitter_rating(current, self._thresholds)), state)
         self._set_jitter_impact_value(
             "stability",
-            self._tr(_jitter_stability_rating(current, spike_count)),
+            self._tr(_jitter_stability_rating(current, spike_count, self._thresholds)),
             state,
         )
         self.jitter_graph_status.setText(
             self._tr("Нет достаточного числа измерений для расчёта jitter")
             if current is None
             else self._translator.format(
-                "Текущий Δ RTT: {current:.1f} ms · порог micro-spike: 15 ms",
+                "Текущий Δ RTT: {current:.1f} ms · порог micro-spike: {threshold:.0f} ms",
                 current=current,
+                threshold=self._thresholds.jitter_spike_ms,
             )
         )
         self._render_jitter_events()
@@ -4377,39 +5425,125 @@ class MainWindow(QMainWindow):
         previous = self._jitter_previous_rtt
         deviation = abs(value - previous) if success and value is not None and previous is not None else None
         self.jitter_chart.add_sample(deviation)
+        observed_at = datetime.now()
+        if success and value is not None:
+            self._jitter_timeout_row_index = None
         if deviation is not None:
             self._jitter_deviations.append(deviation)
             self._jitter_deviations = self._jitter_deviations[-60:]
-            if deviation > 15:
-                self._jitter_events.append(
-                    JitterEventRow(
-                        datetime.now(),
-                        deviation,
-                        self._jitter_target_host or self.target_input.text().strip() or "не определён",
-                        "Превышен безопасный порог вариации RTT",
-                    )
-                )
-                self._jitter_events = self._jitter_events[-120:]
+            step, episode = self._jitter_episode_tracker.update(deviation, observed_at)
+            self._sync_jitter_episode(step, episode)
+            if step == "opened":
+                self._record_wifi_correlation("jitter")
         elif not success:
-            self._jitter_events.append(
-                JitterEventRow(
-                    datetime.now(),
-                    0.0,
-                    self._jitter_target_host or self.target_input.text().strip() or "не определён",
-                    "Timeout: непрерывность RTT нарушена",
-                )
+            self._sync_jitter_episode(
+                "closed",
+                self._jitter_episode_tracker.close("break", observed_at),
             )
-            self._jitter_events = self._jitter_events[-120:]
+            self._record_jitter_timeout(observed_at)
         self._jitter_previous_rtt = value if success and value is not None else None
         if self.mode_stack.currentWidget() is self.jitter_view:
             self._refresh_jitter_workspace()
 
+    def _new_jitter_episode_tracker(self) -> EpisodeTracker:
+        return EpisodeTracker(
+            self._thresholds.jitter_spike_ms,
+            self._thresholds.jitter_clear_ms,
+            self._thresholds.episode_quiet_samples,
+        )
+
+    def _new_rtt_episode_tracker(self) -> EpisodeTracker:
+        return EpisodeTracker(
+            self._thresholds.rtt_high_ms,
+            self._thresholds.rtt_normal_ms,
+            self._thresholds.episode_quiet_samples,
+            break_on_none=True,
+        )
+
+    def _jitter_endpoint(self) -> str:
+        return self._jitter_target_host or self.target_input.text().strip() or "не определён"
+
+    def _append_jitter_event(self, event: JitterEventRow) -> int:
+        self._jitter_events.append(event)
+        self._jitter_events = self._jitter_events[-120:]
+        return len(self._jitter_events) - 1
+
+    def _sync_jitter_episode(self, step: str | None, episode: Episode | None) -> None:
+        if step == "opened" and episode is not None:
+            self._jitter_episode_row_index = self._append_jitter_event(
+                JitterEventRow(
+                    episode.started_at,
+                    episode.peak,
+                    self._jitter_endpoint(),
+                    "Превышен безопасный порог вариации RTT",
+                )
+            )
+            self._record_journal_event(
+                "jitter.episode",
+                severity="warning",
+                subject=self._jitter_endpoint(),
+                template="Эпизод jitter: пик {peak:.1f} мс · отсчётов: {samples}",
+                values={"peak": episode.peak, "samples": episode.samples_over},
+                refs={"started_at": episode.started_at.isoformat()},
+                at=episode.started_at,
+            )
+        if episode is None or self._jitter_episode_row_index is None:
+            return
+        row_index = self._jitter_episode_row_index
+        if row_index >= len(self._jitter_events):
+            self._jitter_episode_row_index = None
+            return
+        current = self._jitter_events[row_index]
+        details = f"Превышен безопасный порог вариации RTT · отсчётов: {episode.samples_over}"
+        self._jitter_events[row_index] = replace(
+            current,
+            deviation_ms=episode.peak,
+            details=details,
+            ended_at=episode.ended_at,
+            samples=episode.samples_over,
+        )
+        if step == "closed":
+            self._jitter_episode_row_index = None
+
+    def _record_jitter_timeout(self, observed_at: datetime) -> None:
+        if self._jitter_timeout_row_index is None:
+            self._jitter_timeout_row_index = self._append_jitter_event(
+                JitterEventRow(
+                    observed_at,
+                    0.0,
+                    self._jitter_endpoint(),
+                    "Timeout: непрерывность RTT нарушена · подряд: 1",
+                    kind="timeout",
+                )
+            )
+            self._record_journal_event(
+                "jitter.episode",
+                severity="warning",
+                subject=self._jitter_endpoint(),
+                template="Timeout RTT: непрерывность нарушена",
+                refs={"kind": "timeout"},
+                at=observed_at,
+            )
+            return
+        row_index = self._jitter_timeout_row_index
+        if row_index >= len(self._jitter_events):
+            self._jitter_timeout_row_index = None
+            self._record_jitter_timeout(observed_at)
+            return
+        current = self._jitter_events[row_index]
+        samples = current.samples + 1
+        self._jitter_events[row_index] = replace(
+            current,
+            details=f"Timeout: непрерывность RTT нарушена · подряд: {samples}",
+            samples=samples,
+        )
+
     def _render_jitter_events(self) -> None:
         self.jitter_events_table.setRowCount(len(self._jitter_events))
         for row, event in enumerate(reversed(self._jitter_events)):
-            deviation = "timeout" if event.deviation_ms == 0 else f"{event.deviation_ms:.1f} ms"
+            deviation = "timeout" if event.kind == "timeout" else f"{event.deviation_ms:.1f} ms"
             values = (f"{event.observed_at:%H:%M:%S}", deviation, event.endpoint, event.details)
-            color = QColor("#FF4757") if event.deviation_ms == 0 or event.deviation_ms > 30 else QColor("#FFB800")
+            color = QColor("#FF4757") if event.kind == "timeout" or event.deviation_ms > self._thresholds.jitter_bad_ms else QColor("#FFB800")
             for column, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
@@ -4417,7 +5551,8 @@ class MainWindow(QMainWindow):
                 self.jitter_events_table.setItem(row, column, item)
         self.jitter_event_status.setText(
             self._translator.format(
-                "Критический порог: Δ RTT > 15 мс · событий: {count}",
+                "Критический порог: Δ RTT > {threshold:.0f} мс · событий: {count}",
+                threshold=self._thresholds.jitter_spike_ms,
                 count=len(self._jitter_events),
             )
         )
@@ -4425,6 +5560,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def _clear_jitter_events(self) -> None:
         self._jitter_events.clear()
+        self._jitter_episode_tracker = self._new_jitter_episode_tracker()
+        self._jitter_episode_row_index = None
+        self._jitter_timeout_row_index = None
         self._refresh_jitter_workspace()
 
     def _build_loss_workspace(self) -> QFrame:
@@ -4538,7 +5676,11 @@ class MainWindow(QMainWindow):
         stress_layout.setSpacing(7)
         stress_title = QLabel("ICMP / UDP STRESS TEST")
         stress_title.setObjectName("FieldLabel")
-        stress_note = QLabel("ICMP измеряет ответы. UDP отражает локальную отправку: без ACK приложения нельзя подтвердить доставку.")
+        stress_note = QLabel(
+            self._tr(
+                "ICMP измеряет ответы. UDP-строка показывает локальную отправку; отдельный UDP-тест ниже измеряет ответы DNS."
+            )
+        )
         stress_note.setObjectName("Muted")
         stress_note.setWordWrap(True)
         target_row = QHBoxLayout()
@@ -4556,6 +5698,57 @@ class MainWindow(QMainWindow):
         target_row.addWidget(self.loss_target_input, 1)
         target_row.addWidget(port_label)
         target_row.addWidget(self.loss_port_input)
+
+        udp_target_row = QHBoxLayout()
+        udp_target_label = QLabel(self._tr("Цель UDP"))
+        udp_target_label.setObjectName("FieldLabel")
+        self.udp_stress_target_input = QLineEdit("1.1.1.1")
+        self.udp_stress_target_input.setPlaceholderText(self._tr("DNS-сервер или IP-адрес"))
+        self.udp_stress_target_input.setClearButtonEnabled(True)
+        udp_port_label = QLabel(self._tr("Порт UDP"))
+        udp_port_label.setObjectName("FieldLabel")
+        self.udp_stress_port_input = QSpinBox()
+        self.udp_stress_port_input.setRange(1, 65535)
+        self.udp_stress_port_input.setValue(53)
+        self.udp_stress_button = QPushButton(self._tr("▶  Запустить UDP-тест"))
+        self.udp_stress_button.setObjectName("UdpStressButton")
+        self.udp_stress_button.setToolTip(
+            self._tr("UDP тест измеряет ответы DNS по UDP/53; это не замена тесту игрового сервера.")
+        )
+        self.udp_stress_button.clicked.connect(self.start_udp_packet_loss_stress)
+        udp_target_row.addWidget(udp_target_label)
+        udp_target_row.addWidget(self.udp_stress_target_input, 1)
+        udp_target_row.addWidget(udp_port_label)
+        udp_target_row.addWidget(self.udp_stress_port_input)
+        udp_target_row.addWidget(self.udp_stress_button)
+
+        udp_metrics_row = QHBoxLayout()
+        self.udp_stress_sent_value = QLabel("--")
+        self.udp_stress_received_value = QLabel("--")
+        self.udp_stress_loss_value = QLabel("--")
+        self.udp_stress_status = QLabel(self._tr("UDP-тест ещё не запускался"))
+        self.udp_stress_status.setObjectName("Muted")
+        for caption, value in (
+            ("Отправлено", self.udp_stress_sent_value),
+            ("Получено", self.udp_stress_received_value),
+            ("Потери", self.udp_stress_loss_value),
+        ):
+            metric = QVBoxLayout()
+            metric.setSpacing(1)
+            label = QLabel(self._tr(caption))
+            label.setObjectName("FieldLabel")
+            value.setObjectName("LossStatValue")
+            metric.addWidget(label)
+            metric.addWidget(value)
+            udp_metrics_row.addLayout(metric)
+        udp_metrics_row.addStretch(1)
+        udp_metrics_row.addWidget(self.udp_stress_status, 1)
+        self.udp_stress_progress = QProgressBar()
+        self.udp_stress_progress.setObjectName("UdpStressProgress")
+        self.udp_stress_progress.setRange(0, 0)
+        self.udp_stress_progress.setTextVisible(False)
+        self.udp_stress_progress.setFixedHeight(6)
+        self.udp_stress_progress.setVisible(False)
         self.loss_stress_table = QTableWidget(0, 5)
         self.loss_stress_table.setObjectName("LossStressTable")
         self.loss_stress_table.setHorizontalHeaderLabels(["Протокол", "Пакеты", "Ответы", "Потери", "Результат"])
@@ -4568,6 +5761,9 @@ class MainWindow(QMainWindow):
         stress_layout.addWidget(stress_title)
         stress_layout.addWidget(stress_note)
         stress_layout.addLayout(target_row)
+        stress_layout.addLayout(udp_target_row)
+        stress_layout.addLayout(udp_metrics_row)
+        stress_layout.addWidget(self.udp_stress_progress)
         stress_layout.addWidget(self.loss_stress_table, 1)
 
         self.loss_tools_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -4647,7 +5843,8 @@ class MainWindow(QMainWindow):
             if isinstance(self._selected_process, ProcessNetworkInfo)
             else None
         )
-        dialog = GameAutoCheckDialog(self._tr, preferred_process, self)
+        dialog = GameAutoCheckDialog(self._tr, preferred_process, self, self._thresholds)
+        dialog.endpoint_chosen.connect(self._on_endpoint_chosen)
         dialog.exec()
 
     def _close_loss_workspace(self) -> None:
@@ -5439,6 +6636,340 @@ class MainWindow(QMainWindow):
         self._loss_test_thread = None
         self._loss_test_worker = None
 
+    @Slot()
+    def start_udp_packet_loss_stress(self) -> None:
+        if self._udp_stress_thread and self._udp_stress_thread.isRunning():
+            return
+        host = self.udp_stress_target_input.text().strip()
+        port = self.udp_stress_port_input.value()
+        if not host:
+            self.udp_stress_status.setText(self._tr("UDP: выберите адрес DNS"))
+            return
+        self._set_task_button_busy(self.udp_stress_button, True, "UDP стресс выполняется...")
+        self.udp_stress_progress.setVisible(True)
+        self.udp_stress_status.setText(self._tr("UDP стресс выполняется..."))
+        self.udp_stress_sent_value.setText("--")
+        self.udp_stress_received_value.setText("--")
+        self.udp_stress_loss_value.setText("--")
+        thread = QThread(self)
+        worker = UdpStressWorker(host, port)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_udp_packet_loss_stress_completed)
+        worker.failed.connect(self._on_udp_packet_loss_stress_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_udp_packet_loss_worker)
+        self._udp_stress_thread = thread
+        self._udp_stress_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_udp_packet_loss_stress_completed(self, value: object) -> None:
+        self._set_task_button_busy(self.udp_stress_button, False)
+        self.udp_stress_progress.setVisible(False)
+        if not isinstance(value, UdpStressReport):
+            self._on_udp_packet_loss_stress_failed("UDP-тест вернул некорректный результат")
+            return
+        self.udp_stress_sent_value.setText(str(value.sent))
+        self.udp_stress_received_value.setText(str(value.received))
+        self.udp_stress_loss_value.setText(f"{value.loss_percent:.1f}%")
+        status = self._tr(value.status)
+        if value.average_ms is not None:
+            status = f"{status} · RTT {value.average_ms:.1f} ms"
+        self.udp_stress_status.setText(status)
+        self.udp_stress_status.setToolTip(value.error or value.target)
+        self._render_udp_stress_result(value)
+
+    @Slot(str)
+    def _on_udp_packet_loss_stress_failed(self, message: str) -> None:
+        self._set_task_button_busy(self.udp_stress_button, False)
+        self.udp_stress_progress.setVisible(False)
+        self.udp_stress_status.setText(self._tr("UDP-тест недоступен: {error}").format(error=message))
+
+    @Slot()
+    def _clear_udp_packet_loss_worker(self) -> None:
+        if self.sender() is not self._udp_stress_thread:
+            return
+        self._udp_stress_thread = None
+        self._udp_stress_worker = None
+
+    def _render_udp_stress_result(self, result: UdpStressReport) -> None:
+        row = next(
+            (index for index in range(self.loss_stress_table.rowCount())
+             if self.loss_stress_table.item(index, 0)
+             and self.loss_stress_table.item(index, 0).text() == "UDP"),
+            None,
+        )
+        if row is None:
+            row = self.loss_stress_table.rowCount()
+            self.loss_stress_table.insertRow(row)
+        values = (
+            "UDP",
+            str(result.sent),
+            str(result.received),
+            f"{result.loss_percent:.1f}%",
+            self._tr(result.status),
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setToolTip(result.error or result.target)
+            if result.loss_percent == 0:
+                item.setForeground(QColor("#00E5A3"))
+            elif result.loss_percent >= 3:
+                item.setForeground(QColor("#FF6B78"))
+            else:
+                item.setForeground(QColor("#FFB800"))
+            self.loss_stress_table.setItem(row, column, item)
+
+    @Slot()
+    def start_visual_traceroute(self) -> None:
+        if self._traceroute_thread and self._traceroute_thread.isRunning():
+            return
+        host = self.traceroute_target_input.text().strip()
+        if not host:
+            self.traceroute_status.setText(self._tr("Выберите целевой хост"))
+            return
+        self._set_task_button_busy(self.traceroute_start_button, True, "Трассировка выполняется...")
+        self.traceroute_progress.show()
+        self.traceroute_status.setText(self._tr("Трассировка выполняется..."))
+        self.traceroute_table.setRowCount(0)
+        thread = QThread(self)
+        worker = TracerouteWorker(host)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.hop_found.connect(self._on_traceroute_hop_found)
+        worker.completed.connect(self._on_traceroute_completed)
+        worker.failed.connect(self._on_traceroute_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_traceroute_worker)
+        self._traceroute_thread = thread
+        self._traceroute_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_traceroute_hop_found(self, value: object) -> None:
+        if not isinstance(value, TracerouteHop):
+            return
+        row = self.traceroute_table.rowCount()
+        self.traceroute_table.insertRow(row)
+        values = (
+            f"{value.index:02}",
+            value.address or "--",
+            value.hostname or "--",
+            _ms(value.latency_ms),
+            self._tr(value.status),
+            self._tr("Ответ не получен") if value.timed_out else self._tr("Узел обнаружен"),
+        )
+        for column, text in enumerate(values):
+            item = QTableWidgetItem(text)
+            item.setToolTip(text)
+            if value.timed_out:
+                item.setForeground(QColor("#FFB800"))
+            elif value.address:
+                item.setForeground(QColor("#00E5A3"))
+            self.traceroute_table.setItem(row, column, item)
+        self.traceroute_status.setText(
+            self._translator.format("Найден узел {hop}", hop=value.index)
+        )
+
+    @Slot(object)
+    def _on_traceroute_completed(self, value: object) -> None:
+        self._set_task_button_busy(self.traceroute_start_button, False)
+        self.traceroute_progress.hide()
+        if not isinstance(value, tuple) or not all(isinstance(item, TracerouteHop) for item in value):
+            self._on_traceroute_failed("Трассировка вернула некорректный результат")
+            return
+        if not value:
+            self.traceroute_status.setText(self._tr("Маршрут не найден"))
+            return
+        self.traceroute_status.setText(
+            self._translator.format("Трассировка завершена: {count} узлов", count=len(value))
+        )
+
+    @Slot(str)
+    def _on_traceroute_failed(self, message: str) -> None:
+        self._set_task_button_busy(self.traceroute_start_button, False)
+        self.traceroute_progress.hide()
+        self.traceroute_status.setText(
+            self._tr("Трассировка недоступна: {error}").format(error=message)
+        )
+
+    @Slot()
+    def _clear_traceroute_worker(self) -> None:
+        if self.sender() is not self._traceroute_thread:
+            return
+        self._traceroute_thread = None
+        self._traceroute_worker = None
+
+    @Slot(bool)
+    def _toggle_mtr_monitor(self, enabled: bool) -> None:
+        if enabled:
+            self.start_mtr_monitor()
+        else:
+            self.stop_mtr_monitor("manual")
+
+    @Slot(str)
+    def _on_mtr_target_changed(self, _text: str) -> None:
+        self.stop_mtr_monitor("target_changed")
+
+    @Slot()
+    def start_mtr_monitor(self) -> None:
+        if self._mtr_thread and self._mtr_thread.isRunning():
+            return
+        host = self.traceroute_target_input.text().strip()
+        if not host:
+            self.mtr_status.setText(self._tr("Выберите целевой хост для MTR"))
+            self.mtr_start_button.blockSignals(True)
+            self.mtr_start_button.setChecked(False)
+            self.mtr_start_button.blockSignals(False)
+            return
+        self.mtr_table.setRowCount(0)
+        self.mtr_status.setText(self._tr("MTR запускается..."))
+        self._mtr_snapshot = None
+        self._mtr_stop_logged = False
+        worker = MtrMonitorWorker(host, th=self._thresholds)
+        worker.snapshot.connect(self._on_mtr_snapshot)
+        worker.failed.connect(self._on_mtr_failed)
+        worker.finished.connect(self._clear_mtr_worker)
+        self._mtr_worker = worker
+        self._mtr_thread = self._worker_registry.start(worker)
+        self._record_journal_event(
+            "mtr.started",
+            subject=host,
+            template="Непрерывный MTR запущен для {host}",
+            values={"host": host},
+        )
+
+    def stop_mtr_monitor(self, reason: str = "manual") -> None:
+        worker = self._mtr_worker
+        if worker is None:
+            return
+        self._worker_registry.stop(self._mtr_thread)
+        if not self._mtr_stop_logged:
+            self._record_journal_event(
+                "mtr.stopped",
+                subject=self.traceroute_target_input.text().strip(),
+                template="Непрерывный MTR остановлен: {reason}",
+                values={"reason": reason},
+            )
+            self._mtr_stop_logged = True
+        self.mtr_status.setText(self._tr("MTR останавливается..."))
+        self._mtr_snapshot = None
+        self.mtr_start_button.blockSignals(True)
+        self.mtr_start_button.setChecked(False)
+        self.mtr_start_button.blockSignals(False)
+
+    @Slot(object)
+    def _on_mtr_snapshot(self, value: object) -> None:
+        if (
+            self.sender() is not self._mtr_worker
+            or self._mtr_worker is None
+            or self._mtr_worker.stopped
+            or not isinstance(value, MtrSnapshot)
+        ):
+            return
+        self._mtr_snapshot = value
+        self._render_mtr_snapshot(value)
+        if value.undetermined:
+            self.mtr_status.setText(self._tr("Цель не отвечает на ICMP: выводы о потерях не делаются"))
+        elif value.real_loss_start_hop is not None:
+            self.mtr_status.setText(
+                self._translator.format(
+                    "Сквозные потери с hop {hop}: {loss}%",
+                    hop=value.real_loss_start_hop,
+                    loss=f"{value.real_loss_pct:.1f}",
+                )
+            )
+        else:
+            self.mtr_status.setText(self._tr("MTR: маршрут стабилен"))
+        for event in value.events:
+            if event.kind == "route_changed":
+                self._record_journal_event(
+                    "mtr.route_changed",
+                    subject=f"hop {event.hop}",
+                    template="MTR: hop {hop} сменил адрес {old} -> {new}",
+                    values={
+                        "hop": event.hop,
+                        "old": event.previous_address or "???",
+                        "new": event.address or "???",
+                    },
+                )
+            elif event.kind in {"loss_opened", "loss_closed"}:
+                self._record_journal_event(
+                    "mtr.loss_episode",
+                    severity="warning" if event.kind == "loss_opened" else "info",
+                    subject=f"hop {event.hop}",
+                    template="MTR: {kind} потерь на hop {hop}, {loss}%",
+                    values={
+                        "kind": "начало" if event.kind == "loss_opened" else "конец",
+                        "hop": event.hop,
+                        "loss": event.loss_pct,
+                        "duration": event.duration_s,
+                    },
+                )
+        if self._report is not None:
+            self._update_root_cause_analysis(self._report)
+
+    def _render_mtr_snapshot(self, snapshot: MtrSnapshot) -> None:
+        self.mtr_table.setRowCount(len(snapshot.hops))
+        for row, hop in enumerate(snapshot.hops):
+            if snapshot.undetermined:
+                status, color = self._tr("Не определено"), "#91A4C3"
+            elif hop.real_loss:
+                status, color = self._tr("Сквозная потеря"), "#FF6B78"
+            elif hop.icmp_limited:
+                status, color = self._tr("ICMP rate-limit"), "#FFB800"
+            else:
+                status, color = self._tr("Стабильно"), "#00E5A3"
+            values = (
+                f"{hop.ttl:02}",
+                " / ".join(hop.addresses) or "???",
+                str(hop.sent),
+                str(hop.recv),
+                f"{hop.loss_pct:.1f}%",
+                _ms(hop.last_ms),
+                _ms(hop.avg_ms),
+                _ms(hop.best_ms),
+                _ms(hop.worst_ms),
+                _ms(hop.jitter_ms),
+                status,
+            )
+            for column, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                item.setForeground(QColor(color))
+                self.mtr_table.setItem(row, column, item)
+
+    @Slot(str)
+    def _on_mtr_failed(self, message: str) -> None:
+        if self.sender() is not self._mtr_worker:
+            return
+        self.mtr_status.setText(self._tr(message))
+        self.mtr_start_button.blockSignals(True)
+        self.mtr_start_button.setChecked(False)
+        self.mtr_start_button.blockSignals(False)
+        self._record_journal_event(
+            "mtr.probe_failed",
+            severity="warning",
+            subject=self.traceroute_target_input.text().strip(),
+            template="MTR недоступен: {error}",
+            values={"error": message},
+        )
+
+    @Slot()
+    def _clear_mtr_worker(self) -> None:
+        if self.sender() is not self._mtr_worker:
+            return
+        self._mtr_thread = None
+        self._mtr_worker = None
+        self.mtr_start_button.blockSignals(True)
+        self.mtr_start_button.setChecked(False)
+        self.mtr_start_button.blockSignals(False)
+
     def _render_loss_stress_placeholders(self, status: str = "Готов к тесту") -> None:
         self.loss_stress_table.setRowCount(2)
         for row, protocol in enumerate(("ICMP", "UDP")):
@@ -5508,7 +7039,7 @@ class MainWindow(QMainWindow):
                 self.loss_stress_table.setItem(row, column, item)
 
     def _loss_analyzer_snapshot(self) -> PacketLossSnapshot:
-        return summarize_loss(self._loss_analyzer.samples)
+        return summarize_loss(self._loss_analyzer.samples, th=self._thresholds)
 
     def _set_loss_snapshot(self, snapshot: PacketLossSnapshot) -> None:
         self.loss_stat_window.setText(str(snapshot.sent))
@@ -5531,31 +7062,33 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_ping_benchmark(self) -> None:
-        self._start_ping_analysis(include_matrix=True, include_mtu=True)
+        self._start_ping_analysis(include_matrix=True, include_mtu=False)
 
     @Slot()
     def start_mtu_test(self) -> None:
-        self._start_ping_analysis(include_matrix=False, include_mtu=True)
+        target = self.ping_mtu_host_input.text().strip() or self.target_input.text().strip()
+        self.mtu_optimizer_target_input.setText(target)
+        self._mtu_optimizer_active_button = self.ping_mtu_run_button
+        self.start_mtu_optimizer()
+
+    @Slot(str)
+    def _mark_mtu_host_manually_edited(self, _text: str) -> None:
+        self._ping_mtu_host_manually_edited = True
 
     def _start_ping_analysis(self, *, include_matrix: bool, include_mtu: bool) -> None:
         if self._ping_benchmark_thread and self._ping_benchmark_thread.isRunning():
             return
-        mtu_host = self.ping_mtu_host_input.text().strip() or self.target_input.text().strip()
+        mtu_host = self.target_input.text().strip()
         try:
             parsed_target = parse_target(mtu_host, self.port_input.value())
         except ValueError as exc:
             self.ping_spike_status.setText(f"MTU-проверка: {exc}")
             return
 
-        self.ping_mtu_host_input.setText(parsed_target.host)
-        self._set_task_button_busy(self.ping_run_button, include_matrix, "Проверка")
-        self._set_task_button_busy(self.ping_mtu_run_button, include_mtu, "Проверка")
+        self._set_task_button_busy(self.ping_run_button, True, "Проверка")
         self.ping_run_button.setDisabled(True)
-        self.ping_mtu_run_button.setDisabled(True)
         if include_matrix:
             self._render_ping_matrix_placeholders()
-        if include_mtu:
-            self._render_mtu_placeholders()
         running_parts = []
         if include_matrix:
             running_parts.append("региональные ориентиры")
@@ -5595,9 +7128,7 @@ class MainWindow(QMainWindow):
     @Slot(object, object)
     def _on_ping_benchmark_completed(self, regional_value: object, mtu_value: object) -> None:
         self._set_task_button_busy(self.ping_run_button, False)
-        self._set_task_button_busy(self.ping_mtu_run_button, False)
         self.ping_run_button.setEnabled(True)
-        self.ping_mtu_run_button.setEnabled(True)
         if not isinstance(regional_value, tuple) or not all(
             isinstance(item, RegionalPingResult) for item in regional_value
         ):
@@ -5608,8 +7139,7 @@ class MainWindow(QMainWindow):
             return
         if regional_value:
             self._render_ping_matrix(regional_value)
-        if mtu_value:
-            self._render_mtu_results(mtu_value)
+        self._render_ping_mtu_probe_results(mtu_value)
         tested = []
         if regional_value:
             tested.append(f"регионов: {len(regional_value)}")
@@ -5620,9 +7150,7 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_ping_benchmark_failed(self, message: str) -> None:
         self._set_task_button_busy(self.ping_run_button, False)
-        self._set_task_button_busy(self.ping_mtu_run_button, False)
         self.ping_run_button.setEnabled(True)
-        self.ping_mtu_run_button.setEnabled(True)
         self.ping_spike_status.setText(message)
 
     @Slot()
@@ -5668,28 +7196,38 @@ class MainWindow(QMainWindow):
                 self.ping_matrix_table.setItem(row, column, item)
         self._update_ping_matrix_selection_status()
 
-    def _render_mtu_results(self, results: tuple[MtuProbeResult, ...]) -> None:
+    def _render_ping_mtu_probe_results(self, results: tuple[MtuProbeResult, ...]) -> None:
+        """Render the DF probes returned with the regional ping benchmark."""
         self.ping_mtu_table.setRowCount(len(results))
-        for row, result in enumerate(results):
-            outcome = _ms(result.average_ms) if result.success else (result.error or "Нет ответа")
-            values = [
-                f"{result.payload_size} B",
-                f"{result.received}/{result.sent}",
-                f"{result.loss_percent:.0f}%",
-                outcome,
-            ]
+        for row, probe in enumerate(results):
+            status = (
+                self._tr("DF-пакет доставлен")
+                if probe.success
+                else probe.error or self._tr("Фрагментация или потеря")
+            )
+            details = (
+                f"{probe.received}/{probe.sent} · {self._tr('Потери')}: {probe.loss_percent:.0f}%"
+                if probe.sent
+                else self._tr("Проба не выполнена")
+            )
+            values = (
+                str(probe.payload_size + 28),
+                f"{probe.payload_size} B",
+                _ms(probe.average_ms),
+                status,
+                details,
+            )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setToolTip(result.error or value)
-                if result.success:
-                    item.setForeground(QColor("#00E5A3"))
-                else:
-                    item.setForeground(QColor("#FF6B78"))
+                item.setToolTip(probe.error or value)
+                item.setForeground(QColor("#00E5A3" if probe.success else "#FF6B78"))
                 self.ping_mtu_table.setItem(row, column, item)
 
     def _refresh_ping_statistics(self) -> None:
         values = [value for value in self._latency_window if value is not None]
-        self._set_ping_statistics(latency_statistics(values, sent=len(self._latency_window)))
+        self._set_ping_statistics(
+            latency_statistics(values, sent=len(self._latency_window), th=self._thresholds)
+        )
         if self._ping_spike_events:
             self.ping_spike_log.setPlainText("\n".join(self._ping_spike_events))
 
@@ -5972,12 +7510,15 @@ class MainWindow(QMainWindow):
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         tabs.addTab(self._build_details_tab(), "Обзор")
         tabs.addTab(self._build_path_tab(), "Маршруты / Geo")
+        tabs.addTab(self._build_traceroute_tab(), "Трассировка")
         tabs.addTab(self._build_interfaces_tab(), "Интерфейсы")
         tabs.addTab(self._build_udp_history_tab(), "UDP-события")
         self.log_tab = self._build_log_tab()
         tabs.addTab(self.log_tab, "Журнал")
         tabs.addTab(self._build_analysis_tab(), "Диагноз")
         tabs.addTab(self._build_internet_quality_tab(), "Качество")
+        tabs.addTab(self._build_bufferbloat_tab(), "Bufferbloat")
+        tabs.addTab(self._build_history_tab(), "История / Тренды")
         return tabs
 
     def _build_internet_quality_tab(self) -> QWidget:
@@ -6001,8 +7542,15 @@ class MainWindow(QMainWindow):
         self.quality_test_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.quality_test_button.setToolTip("Запустить Ookla Speedtest и запросить данные Интернетометра")
         self.quality_test_button.clicked.connect(self.start_quality_check)
+        self.quality_export_image_button = QPushButton(self._tr("Экспортировать сводку PNG"))
+        self.quality_export_image_button.setObjectName("QualityExportImageButton")
+        self.quality_export_image_button.setToolTip(self._tr("Сохранить сводку качества как изображение PNG"))
+        self.quality_export_image_button.clicked.connect(
+            lambda: self._export_widget_png(tab, "Качество")
+        )
         heading_row.addWidget(heading)
         heading_row.addStretch(1)
+        heading_row.addWidget(self.quality_export_image_button)
         heading_row.addWidget(self.quality_test_button)
 
         self.quality_progress = QProgressBar()
@@ -6063,6 +7611,19 @@ class MainWindow(QMainWindow):
         self.quality_report_output.setMaximumHeight(112)
         self.quality_report_output.setPlaceholderText("Здесь появится сопоставление результатов Speedtest, Яндекса и локального адаптера.")
 
+        nat_heading = QLabel("NAT / STUN")
+        nat_heading.setObjectName("FieldLabel")
+        self.nat_probe_button = QPushButton("Проверить NAT")
+        self.nat_probe_button.setToolTip("Определить тип UDP NAT через публичные STUN-серверы")
+        self.nat_probe_button.clicked.connect(self.start_nat_probe)
+        self.nat_probe_status = QLabel("Проверка NAT ещё не запускалась")
+        self.nat_probe_status.setObjectName("Muted")
+        self.nat_probe_status.setWordWrap(True)
+        nat_row = QHBoxLayout()
+        nat_row.addWidget(nat_heading)
+        nat_row.addStretch(1)
+        nat_row.addWidget(self.nat_probe_button)
+
         layout.addLayout(heading_row)
         layout.addWidget(self.quality_progress)
         layout.addWidget(self.quality_status)
@@ -6071,10 +7632,915 @@ class MainWindow(QMainWindow):
         layout.addLayout(details_grid)
         layout.addWidget(report_title)
         layout.addWidget(self.quality_report_output)
+        layout.addLayout(nat_row)
+        layout.addWidget(self.nat_probe_status)
         layout.addStretch(1)
         scroll.setWidget(content)
         tab_layout.addWidget(scroll)
         return tab
+
+    def _build_traceroute_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("TracerouteScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(9)
+
+        heading_row = QHBoxLayout()
+        heading = QLabel(self._tr("ВИЗУАЛЬНАЯ ТРАССИРОВКА"))
+        heading.setObjectName("FieldLabel")
+        default_host = self.target_input.text().strip() if hasattr(self, "target_input") else ""
+        self.traceroute_target_input = QLineEdit(default_host)
+        self.traceroute_target_input.setPlaceholderText(self._tr("Введите домен или IP-адрес"))
+        self.traceroute_target_input.setClearButtonEnabled(True)
+        self.traceroute_start_button = QPushButton(self._tr("▶  Запустить трассировку"))
+        self.traceroute_start_button.setObjectName("TracerouteStartButton")
+        self.traceroute_start_button.clicked.connect(self.start_visual_traceroute)
+        self.mtr_start_button = QPushButton(self._tr("▶  Непрерывный MTR"))
+        self.mtr_start_button.setObjectName("TracerouteStartButton")
+        self.mtr_start_button.setCheckable(True)
+        self.mtr_start_button.toggled.connect(self._toggle_mtr_monitor)
+        self.traceroute_target_input.textEdited.connect(self._on_mtr_target_changed)
+        heading_row.addWidget(heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.traceroute_target_input, 1)
+        heading_row.addWidget(self.traceroute_start_button)
+        heading_row.addWidget(self.mtr_start_button)
+
+        self.traceroute_progress = QProgressBar()
+        self.traceroute_progress.setObjectName("TracerouteProgress")
+        self.traceroute_progress.setRange(0, 0)
+        self.traceroute_progress.setTextVisible(False)
+        self.traceroute_progress.setFixedHeight(6)
+        self.traceroute_progress.hide()
+        self.traceroute_status = QLabel(self._tr("Трассировка ещё не запускалась"))
+        self.traceroute_status.setObjectName("Muted")
+        self.traceroute_status.setWordWrap(True)
+
+        note = QLabel(
+            self._tr(
+                "Пакеты отправляются с возрастающим TTL. Каждый найденный узел появляется в таблице по мере получения ответа."
+            )
+        )
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+
+        self.traceroute_table = QTableWidget(0, 6)
+        self.traceroute_table.setObjectName("TracerouteTable")
+        self.traceroute_table.setHorizontalHeaderLabels(
+            [
+                self._tr("Прыжок"),
+                self._tr("IP-адрес"),
+                self._tr("Имя узла"),
+                self._tr("Задержка"),
+                self._tr("Статус"),
+                self._tr("Описание"),
+            ]
+        )
+        self._configure_table(self.traceroute_table, (75, 155, 240, 110, 130, 300))
+        self.traceroute_table.setMinimumHeight(220)
+        self.traceroute_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.traceroute_table.setAlternatingRowColors(True)
+
+        self.mtr_status = QLabel(self._tr("Непрерывный MTR ещё не запускался"))
+        self.mtr_status.setObjectName("Muted")
+        self.mtr_status.setWordWrap(True)
+        self.mtr_table = QTableWidget(0, 11)
+        self.mtr_table.setObjectName("MtrTable")
+        self.mtr_table.setHorizontalHeaderLabels(
+            [
+                self._tr("Прыжок"),
+                self._tr("IP-адрес"),
+                self._tr("Отправлено"),
+                self._tr("Получено"),
+                self._tr("Потери"),
+                self._tr("Последний"),
+                self._tr("Средний"),
+                self._tr("Лучший"),
+                self._tr("Худший"),
+                self._tr("Jitter"),
+                self._tr("Статус"),
+            ]
+        )
+        self._configure_table(
+            self.mtr_table,
+            (62, 155, 90, 90, 82, 88, 88, 88, 88, 88, 170),
+        )
+        self.mtr_table.setMinimumHeight(220)
+        self.mtr_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.mtr_table.setAlternatingRowColors(True)
+
+        route_tables = QSplitter(Qt.Orientation.Horizontal)
+        route_tables.setChildrenCollapsible(False)
+        traceroute_panel = QWidget()
+        traceroute_layout = QVBoxLayout(traceroute_panel)
+        traceroute_layout.setContentsMargins(0, 0, 0, 0)
+        traceroute_layout.addWidget(self.traceroute_table)
+        mtr_panel = QWidget()
+        mtr_layout = QVBoxLayout(mtr_panel)
+        mtr_layout.setContentsMargins(0, 0, 0, 0)
+        mtr_layout.addWidget(self.mtr_status)
+        mtr_layout.addWidget(self.mtr_table)
+        route_tables.addWidget(traceroute_panel)
+        route_tables.addWidget(mtr_panel)
+        route_tables.setStretchFactor(0, 1)
+        route_tables.setStretchFactor(1, 1)
+
+        layout.addLayout(heading_row)
+        layout.addWidget(self.traceroute_progress)
+        layout.addWidget(self.traceroute_status)
+        layout.addWidget(note)
+        layout.addWidget(route_tables, 1)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        return tab
+
+    def _build_bufferbloat_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(9)
+
+        heading_row = QHBoxLayout()
+        heading = QLabel("BUFFERBLOAT")
+        heading.setObjectName("FieldLabel")
+        self.bufferbloat_start_button = QPushButton("Начать тест")
+        self.bufferbloat_start_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self.bufferbloat_start_button.clicked.connect(self.start_bufferbloat_test)
+        self.bufferbloat_export_image_button = QPushButton(self._tr("Экспортировать сводку PNG"))
+        self.bufferbloat_export_image_button.setObjectName("BufferbloatExportImageButton")
+        self.bufferbloat_export_image_button.setToolTip(
+            self._tr("Сохранить сводку bufferbloat как изображение PNG")
+        )
+        self.bufferbloat_export_image_button.clicked.connect(
+            lambda: self._export_widget_png(tab, "Bufferbloat")
+        )
+        heading_row.addWidget(heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.bufferbloat_export_image_button)
+        heading_row.addWidget(self.bufferbloat_start_button)
+
+        self.bufferbloat_progress = QProgressBar()
+        self.bufferbloat_progress.setObjectName("BufferbloatProgress")
+        self.bufferbloat_progress.setRange(0, 0)
+        self.bufferbloat_progress.setTextVisible(False)
+        self.bufferbloat_progress.setFixedHeight(6)
+        self.bufferbloat_progress.hide()
+        self.bufferbloat_status = QLabel("Тест ещё не запускался")
+        self.bufferbloat_status.setObjectName("Muted")
+        self.bufferbloat_status.setWordWrap(True)
+        self.bufferbloat_phase_labels: list[QLabel] = []
+        phase_status_row = QHBoxLayout()
+        for source in ("Базовая задержка", "Скачивание под нагрузкой", "Отдача под нагрузкой"):
+            phase_label = QLabel(source)
+            phase_label.setObjectName("Muted")
+            phase_status_row.addWidget(phase_label, 1)
+            self.bufferbloat_phase_labels.append(phase_label)
+
+        phases_grid = QGridLayout()
+        phases_grid.setSpacing(7)
+        self.bufferbloat_values: dict[str, QLabel] = {}
+        self.bufferbloat_phase_details: dict[str, QLabel] = {}
+        phase_items = (
+            ("unloaded", "Базовая задержка", "Пинг в покое"),
+            ("download", "Скачивание под нагрузкой", "Задержка · скорость"),
+            ("upload", "Отдача под нагрузкой", "Задержка · скорость"),
+        )
+        for column, (key, title, hint) in enumerate(phase_items):
+            card = QFrame()
+            card.setObjectName("BufferbloatPhaseCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 10, 12, 10)
+            title_label = QLabel(title)
+            title_label.setObjectName("FieldLabel")
+            value_label = QLabel("--")
+            value_label.setObjectName("BufferbloatValue")
+            detail_label = QLabel(hint)
+            detail_label.setObjectName("Muted")
+            detail_label.setWordWrap(True)
+            card_layout.addWidget(title_label)
+            card_layout.addWidget(value_label)
+            card_layout.addWidget(detail_label)
+            phases_grid.addWidget(card, 0, column)
+            self.bufferbloat_values[key] = value_label
+            self.bufferbloat_phase_details[key] = detail_label
+
+        grade_panel = QFrame()
+        grade_panel.setObjectName("BufferbloatGrade")
+        grade_layout = QVBoxLayout(grade_panel)
+        grade_layout.setContentsMargins(14, 12, 14, 12)
+        grade_title = QLabel("ИТОГОВАЯ ОЦЕНКА БУФЕРА")
+        grade_title.setObjectName("FieldLabel")
+        self.bufferbloat_grade = QLabel("--")
+        self.bufferbloat_grade.setObjectName("BufferbloatGradeValue")
+        self.bufferbloat_verdict = QLabel("Недостаточно данных для оценки bufferbloat")
+        self.bufferbloat_verdict.setWordWrap(True)
+        self.bufferbloat_delta = QLabel("Δ download: -- · Δ upload: --")
+        self.bufferbloat_delta.setObjectName("Muted")
+        self.bufferbloat_network_boost_button = self._make_network_boost_button()
+        self.bufferbloat_network_boost_button.hide()
+        grade_layout.addWidget(grade_title)
+        grade_layout.addWidget(self.bufferbloat_grade)
+        grade_layout.addWidget(self.bufferbloat_verdict)
+        grade_layout.addWidget(self.bufferbloat_delta)
+        grade_layout.addWidget(self.bufferbloat_network_boost_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        recommendations_panel = QFrame()
+        recommendations_panel.setObjectName("BufferbloatRecommendations")
+        recommendations_layout = QVBoxLayout(recommendations_panel)
+        recommendations_layout.setContentsMargins(14, 12, 14, 12)
+        recommendations_title = QLabel("Рекомендации")
+        recommendations_title.setObjectName("FieldLabel")
+        self.bufferbloat_recommendation_sources: tuple[str, ...] = ()
+        self.bufferbloat_recommendations = QLabel("После теста здесь появятся рекомендации по настройке сети.")
+        self.bufferbloat_recommendations.setObjectName("BufferbloatRecommendationsText")
+        self.bufferbloat_recommendations.setWordWrap(True)
+        recommendations_layout.addWidget(recommendations_title)
+        recommendations_layout.addWidget(self.bufferbloat_recommendations)
+
+        layout.addLayout(heading_row)
+        layout.addWidget(self.bufferbloat_progress)
+        layout.addWidget(self.bufferbloat_status)
+        layout.addLayout(phase_status_row)
+        layout.addLayout(phases_grid)
+        layout.addWidget(grade_panel)
+        layout.addWidget(recommendations_panel)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
+        return tab
+
+    def _build_history_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        heading_row = QHBoxLayout()
+        heading = QLabel(self._tr("ИСТОРИЯ / ТРЕНДЫ"))
+        heading.setObjectName("FieldLabel")
+        self.history_refresh_button = QPushButton(self._tr("Обновить историю"))
+        self.history_refresh_button.clicked.connect(self._refresh_history_view)
+        self.history_clear_button = QPushButton(self._tr("Очистить историю"))
+        self.history_clear_button.setObjectName("HistoryClearButton")
+        self.history_clear_button.clicked.connect(self._clear_test_history)
+        heading_row.addWidget(heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.history_refresh_button)
+        heading_row.addWidget(self.history_clear_button)
+
+        self.history_summary = QLabel(self._tr("История тестов пока пуста"))
+        self.history_summary.setObjectName("Muted")
+        self.history_summary.setWordWrap(True)
+        self.history_trend = QLabel(self._tr("Для тренда нужны минимум два теста качества."))
+        self.history_trend.setObjectName("Muted")
+        self.history_trend.setWordWrap(True)
+
+        self.history_table = QTableWidget(0, 6)
+        self.history_table.setObjectName("TestHistoryTable")
+        self.history_table.setHorizontalHeaderLabels(
+            [
+                self._tr("Дата и время"),
+                self._tr("Тип теста"),
+                self._tr("Скачивание"),
+                self._tr("Отдача"),
+                self._tr("Ping"),
+                self._tr("Bufferbloat"),
+            ]
+        )
+        self._configure_table(self.history_table, (170, 170, 120, 120, 110, 120))
+        self.history_table.setMinimumHeight(240)
+        self.history_table.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+
+        layout.addLayout(heading_row)
+        layout.addWidget(self.history_summary)
+        layout.addWidget(self.history_trend)
+        layout.addWidget(self.history_table, 1)
+        self._refresh_history_view()
+        return tab
+
+    @Slot()
+    def start_mtu_optimizer(self) -> None:
+        if self._mtu_optimizer_thread and self._mtu_optimizer_thread.isRunning():
+            return
+        if self._mtu_optimizer_active_button is None:
+            self._mtu_optimizer_active_button = self.mtu_optimizer_start_button
+        target = self.mtu_optimizer_target_input.text().strip()
+        if not target:
+            self._set_mtu_optimizer_status(self._tr("Укажите целевой хост для MTU-проверки"))
+            self._mtu_optimizer_active_button = None
+            return
+
+        self._mtu_optimizer_report = None
+        self.mtu_optimizer_table.setRowCount(0)
+        self.mtu_current_value.setText("--")
+        self.mtu_optimal_value.setText("--")
+        self.mtu_fragmentation_value.setText(self._tr("Проверка выполняется"))
+        self.mtu_optimizer_apply_button.setEnabled(False)
+        self._set_mtu_optimizer_status(self._tr("MTU-оптимизатор выполняется..."))
+        self.mtu_optimizer_progress.show()
+        self._set_task_button_busy(self._mtu_optimizer_active_button, True, "Выполняется")
+
+        thread = QThread(self)
+        snapshot = self._report.system if self._report is not None else None
+        worker = MtuOptimizerWorker(target, snapshot, self._thresholds)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_mtu_optimizer_progress)
+        worker.completed.connect(self._on_mtu_optimizer_completed)
+        worker.failed.connect(self._on_mtu_optimizer_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_mtu_optimizer_worker)
+        self._mtu_optimizer_thread = thread
+        self._mtu_optimizer_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _on_mtu_optimizer_progress(self, message: str) -> None:
+        match = re.fullmatch(r"Проверяем MTU (\d+)", message)
+        if match:
+            self._set_mtu_optimizer_status(
+                self._tr("Проверяем MTU {mtu}").format(mtu=match.group(1))
+            )
+            return
+        self._set_mtu_optimizer_status(self._tr(message))
+
+    @Slot(object)
+    def _on_mtu_optimizer_completed(self, value: object) -> None:
+        self._finish_mtu_optimizer()
+        if not isinstance(value, MtuOptimizerReport):
+            self._on_mtu_optimizer_failed("MTU-оптимизатор вернул некорректный результат")
+            return
+
+        self._mtu_optimizer_report = value
+        self.mtu_current_value.setText(str(value.current_mtu) if value.current_mtu else "--")
+        self.mtu_optimal_value.setText(str(value.optimal_mtu) if value.optimal_mtu else "--")
+        self.mtu_fragmentation_value.setText(
+            self._tr("Пакет без фрагментации найден")
+            if value.optimal_mtu
+            else self._tr("Безопасный размер не найден")
+        )
+        self._render_mtu_optimizer_probes(value.probes)
+
+        if value.optimal_mtu is None:
+            self._record_journal_event(
+                "mtu.probe_failed",
+                severity="warning",
+                subject=value.target,
+                template="MTU-проверка не завершена: {reason}",
+                values={"reason": value.error_code or value.error or "unknown"},
+                refs={"target_ip": value.target_ip, "route_interface": value.route_interface},
+            )
+        else:
+            self._record_journal_event(
+                "mtu.measured",
+                subject=value.target,
+                template="Измерен MTU маршрута: {found}",
+                values={
+                    "target": value.target,
+                    "target_ip": value.target_ip or "",
+                    "route_interface": value.route_interface or "",
+                    "found": value.optimal_mtu,
+                    "probes": len(value.probes),
+                    "inferred_by_timeout": value.inferred_by_timeout,
+                },
+            )
+            self._record_journal_event(
+                "mtu.recommendation",
+                subject=value.route_interface or value.target,
+                template="Рекомендация MTU: {decision}",
+                values={
+                    "decision": value.decision,
+                    "current": value.current_mtu,
+                    "found": value.optimal_mtu,
+                },
+            )
+
+        if value.optimal_mtu:
+            self._set_mtu_optimizer_status(
+                self._tr("Найден оптимальный MTU: {mtu}").format(mtu=value.optimal_mtu)
+            )
+            self.mtu_optimizer_apply_button.setEnabled(value.decision == "LOWER")
+        else:
+            self._set_mtu_optimizer_status(
+                self._tr(value.error or "Не удалось определить оптимальный MTU")
+            )
+        self._append_log(self.mtu_optimizer_status.text())
+
+    @Slot(str)
+    def _on_mtu_optimizer_failed(self, message: str) -> None:
+        self._finish_mtu_optimizer()
+        prefix = "MTU-оптимизатор завершился ошибкой: "
+        status = (
+            self._tr("MTU-оптимизатор завершился ошибкой: {error}").format(
+                error=message.removeprefix(prefix),
+            )
+            if message.startswith(prefix)
+            else self._tr(message)
+        )
+        self._set_mtu_optimizer_status(status)
+        self.mtu_fragmentation_value.setText(self._tr("Ошибка проверки"))
+        self._append_log(f"MTU: {message}")
+
+    def _finish_mtu_optimizer(self) -> None:
+        button = self._mtu_optimizer_active_button or self.mtu_optimizer_start_button
+        self._set_task_button_busy(button, False)
+        self.mtu_optimizer_progress.hide()
+        self._mtu_optimizer_active_button = None
+
+    def _set_mtu_optimizer_status(self, text: str) -> None:
+        self.mtu_optimizer_status.setText(text)
+        if hasattr(self, "ping_mtu_status"):
+            self.ping_mtu_status.setText(text)
+
+    @Slot()
+    def _clear_mtu_optimizer_worker(self) -> None:
+        if self.sender() is not self._mtu_optimizer_thread:
+            return
+        self._mtu_optimizer_thread = None
+        self._mtu_optimizer_worker = None
+
+    @Slot()
+    def _apply_optimized_mtu(self) -> None:
+        report = self._mtu_optimizer_report
+        if report is None or report.optimal_mtu is None:
+            self.mtu_optimizer_status.setText(self._tr("Сначала найдите оптимальный MTU"))
+            return
+        if report.decision != "LOWER":
+            self.mtu_optimizer_status.setText(self._tr("Найденный MTU не требует понижения"))
+            return
+        if not report.route_interface:
+            self.mtu_optimizer_status.setText(self._tr("Интерфейс маршрута не определён"))
+            return
+        adapter = report.route_interface
+        self._set_mtu_optimizer_status(f"Интерфейс маршрута: {adapter}")
+
+        message = self._tr(
+            "Применить пробный MTU {mtu} к интерфейсу маршрута «{adapter}»?\n"
+            "После контрольной пробы настройку нужно подтвердить."
+        ).format(mtu=report.optimal_mtu, adapter=adapter)
+        answer = QMessageBox.question(
+            self,
+            self._tr("Применить найденный MTU"),
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._run_system_action(
+            "Пробное применение MTU",
+            lambda: apply_mtu_trial(adapter, report.optimal_mtu),
+            self.mtu_optimizer_apply_button,
+            self.mtu_optimizer_status,
+        )
+
+    def _start_mtu_trial_confirmation(
+        self,
+        button: QPushButton,
+        status_label: QLabel | None,
+        change: SystemChange,
+    ) -> None:
+        report = self._mtu_optimizer_report
+        if report is None or report.target_ip is None or not isinstance(change.after, int):
+            self._begin_mtu_rollback(change, button, status_label, "missing_target")
+            return
+        self._record_journal_event(
+            "mtu.apply_trial",
+            subject=change.adapter,
+            template="Применён пробный MTU: {mtu}",
+            values={"mtu": change.after, "target_ip": report.target_ip},
+        )
+        self._mtu_trial_probe_ok = None
+        self._mtu_trial_change = change
+        pending = PendingAction(
+            apply=lambda: self._run_system_action(
+                "Сохранение MTU",
+                lambda: persist_mtu(change.adapter, change.after),
+                button,
+                status_label,
+            ),
+            rollback=lambda: rollback_change(change),
+            timeout_s=self._action_confirm_timeout_s(),
+        )
+        dialog = RollbackConfirmDialog(change, self._tr, self, seconds=pending.timeout_s)
+        dialog.confirm_button.setEnabled(False)
+        self._mtu_trial_dialog = dialog
+        self._start_mtu_control_probe(report.target_ip, change.after)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        self._mtu_trial_dialog = None
+        if accepted and self._mtu_trial_probe_ok is True:
+            pending.apply()
+            return
+        reason = "probe_failed" if self._mtu_trial_probe_ok is False else "timeout"
+        self._begin_mtu_rollback(change, button, status_label, reason, pending)
+
+    def _start_mtu_control_probe(self, target_ip: str, mtu: int) -> None:
+        thread = QThread(self)
+        worker = MtuControlProbeWorker(target_ip, mtu, self._thresholds.mtu_probe_timeout_ms)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_mtu_control_probe_completed)
+        worker.completed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_mtu_control_probe)
+        self._mtu_trial_probe_thread = thread
+        thread.start()
+
+    @Slot(object)
+    def _on_mtu_control_probe_completed(self, value: object) -> None:
+        probe_ok = isinstance(value, MtuOptimizerProbe) and value.success
+        self._mtu_trial_probe_ok = probe_ok
+        if probe_ok:
+            if self._mtu_trial_dialog is not None:
+                self._mtu_trial_dialog.confirm_button.setEnabled(True)
+            return
+        if self._mtu_trial_dialog is not None:
+            self._mtu_trial_dialog.reject()
+
+    @Slot()
+    def _clear_mtu_control_probe(self) -> None:
+        if self.sender() is self._mtu_trial_probe_thread:
+            self._mtu_trial_probe_thread = None
+
+    def _begin_mtu_rollback(
+        self,
+        change: SystemChange,
+        button: QPushButton,
+        status_label: QLabel | None,
+        reason: str,
+        pending: PendingAction | None = None,
+    ) -> None:
+        rollback_label = "Откат MTU"
+        action = pending.rollback if pending is not None else lambda: rollback_change(change)
+        self._rollback_actions[rollback_label] = (
+            change,
+            pending or PendingAction(lambda: None, action, self._action_confirm_timeout_s()),
+        )
+        self._mtu_rollback_reasons[rollback_label] = reason
+        self._run_system_action(rollback_label, action, button, status_label)
+
+    def _render_mtu_optimizer_probes(
+        self,
+        probes: tuple[MtuOptimizerProbe, ...],
+    ) -> None:
+        """Show optimizer probes in the shared Ping/MTU quality table."""
+        for table in (self.mtu_optimizer_table, self.ping_mtu_table):
+            table.setRowCount(len(probes))
+            for row, probe in enumerate(probes):
+                values = (
+                    str(probe.mtu),
+                    f"{probe.payload_size} B",
+                    _ms(probe.latency_ms),
+                    self._tr("DF-пакет доставлен")
+                    if probe.success
+                    else self._tr("Фрагментация или потеря"),
+                    probe.error or self._tr("Пакет доставлен без фрагментации"),
+                )
+                for column, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setToolTip(text)
+                    item.setForeground(QColor("#00E5A3" if probe.success else "#FF6B78"))
+                    table.setItem(row, column, item)
+
+    @Slot()
+    def start_bufferbloat_test(self) -> None:
+        if self._bufferbloat_thread and self._bufferbloat_thread.isRunning():
+            return
+        self._bufferbloat_report = None
+        self._set_task_button_busy(self.bufferbloat_start_button, True, "Проверка")
+        self.bufferbloat_progress.show()
+        self.bufferbloat_status.setText(self._tr("Фаза 1/3: базовая задержка"))
+        self._update_bufferbloat_phase(0)
+        self.bufferbloat_recommendation_sources = ()
+        self._render_bufferbloat_recommendations()
+        for label in self.bufferbloat_values.values():
+            label.setText("--")
+        self.bufferbloat_grade.setText("--")
+        self.bufferbloat_verdict.setText(self._tr("Недостаточно данных для оценки bufferbloat"))
+        self.bufferbloat_delta.setText(
+            self._tr("Δ download: {download} · Δ upload: {upload}").format(
+                download="--", upload="--"
+            )
+        )
+        self.bufferbloat_network_boost_button.hide()
+
+        target_ip = resolve_target_ipv4(self.target_input.text().strip())
+        gateway = None
+        if self._report and self._report.system.gateway:
+            gateway = self._report.system.gateway.address
+        elif self._report and self._report.system.default_routes:
+            gateway = self._report.system.default_routes[0].gateway
+
+        thread = QThread(self)
+        worker = BufferbloatWorker(target_ip, gateway, self._thresholds)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_bufferbloat_progress)
+        worker.completed.connect(self._on_bufferbloat_completed)
+        worker.failed.connect(self._on_bufferbloat_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_bufferbloat_worker)
+        self._bufferbloat_thread = thread
+        self._bufferbloat_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _on_bufferbloat_progress(self, message: str) -> None:
+        self.bufferbloat_status.setText(self._tr(message))
+        if message.startswith("Фаза 1/3"):
+            self._update_bufferbloat_phase(0)
+        elif message.startswith("Фаза 2/3"):
+            self._update_bufferbloat_phase(1)
+        elif message.startswith("Фаза 3/3"):
+            self._update_bufferbloat_phase(2)
+        self._append_log(message)
+
+    @Slot(object)
+    def _on_bufferbloat_completed(self, value: object) -> None:
+        self._finish_bufferbloat_test()
+        if not isinstance(value, BufferbloatReport):
+            self._on_bufferbloat_failed("Модуль bufferbloat вернул неизвестный результат")
+            return
+        self._bufferbloat_report = value
+        self._record_test_history(
+            "Bufferbloat",
+            download_mbps=value.download_active.speed_mbps,
+            upload_mbps=value.upload_active.speed_mbps,
+            ping_ms=value.unloaded.latency_ms,
+            bufferbloat_grade=value.grade,
+        )
+        self._update_bufferbloat_phase(3)
+        self.bufferbloat_recommendation_sources = value.recommendations
+        self._render_bufferbloat_recommendations()
+        self.bufferbloat_values["unloaded"].setText(_ms(value.unloaded.latency_ms))
+        self.bufferbloat_values["download"].setText(
+            f"{_ms(value.download_active.latency_ms)} · {_bufferbloat_speed(value.download_active.speed_mbps)}"
+        )
+        self.bufferbloat_values["upload"].setText(
+            f"{_ms(value.upload_active.latency_ms)} · {_bufferbloat_speed(value.upload_active.speed_mbps)}"
+        )
+        self.bufferbloat_phase_details["unloaded"].setText(self._tr("Базовый ping"))
+        self.bufferbloat_phase_details["download"].setText(
+            self._tr("Дельта: {delta} · скорость: {speed}").format(
+                delta=_ms(value.download_active.delta_ms),
+                speed=_bufferbloat_speed(value.download_active.speed_mbps),
+            )
+        )
+        self.bufferbloat_phase_details["upload"].setText(
+            self._tr("Дельта: {delta} · скорость: {speed}").format(
+                delta=_ms(value.upload_active.delta_ms),
+                speed=_bufferbloat_speed(value.upload_active.speed_mbps),
+            )
+        )
+        self.bufferbloat_grade.setText(value.grade)
+        self.bufferbloat_verdict.setText(self._tr(value.verdict))
+        attribution = self._bufferbloat_attribution(value)
+        self.bufferbloat_delta.setText(
+            self._tr("Δ download: {download} · Δ upload: {upload} · {attribution}").format(
+                download=_ms(value.download_active.delta_ms),
+                upload=_ms(value.upload_active.delta_ms),
+                attribution=attribution,
+            )
+        )
+        self.bufferbloat_network_boost_button.setVisible(value.grade in {"C", "D", "F"})
+        self._record_bufferbloat_journal(value, attribution)
+        self.bufferbloat_status.setText(
+            self._tr("Тест завершён частично") if value.error else self._tr("Тест завершён")
+        )
+        self._set_status("BUFFERBLOAT READY", "warning" if value.error else "success")
+
+    @Slot(str)
+    def _on_bufferbloat_failed(self, message: str) -> None:
+        self._finish_bufferbloat_test()
+        prefix = "Тест bufferbloat завершился ошибкой: "
+        status = (
+            self._tr("Тест bufferbloat завершился ошибкой: {error}").format(
+                error=message.removeprefix(prefix),
+            )
+            if message.startswith(prefix)
+            else self._tr(message)
+        )
+        self.bufferbloat_status.setText(status)
+        self._set_status("BUFFERBLOAT ERROR", "error")
+        self._append_log(f"Bufferbloat: {message}")
+
+    def _finish_bufferbloat_test(self) -> None:
+        self._set_task_button_busy(self.bufferbloat_start_button, False)
+        self.bufferbloat_progress.hide()
+
+    def _bufferbloat_attribution(self, report: BufferbloatReport) -> str:
+        if (
+            report.gateway_delta_ms is not None
+            and report.gateway_delta_ms >= self._thresholds.bufferbloat_local_delta_ms
+        ):
+            return self._tr("Очередь LAN/Wi-Fi")
+        if report.grade in {"C", "D", "F"}:
+            return self._tr("Очередь WAN: SQM/QoS на роутере")
+        return self._tr("Существенная очередь не обнаружена")
+
+    def _record_bufferbloat_journal(
+        self,
+        report: BufferbloatReport,
+        attribution: str,
+    ) -> None:
+        phases = (
+            ("unloaded", report.unloaded),
+            ("download", report.download_active),
+            ("upload", report.upload_active),
+        )
+        for phase_name, phase in phases:
+            for series in phase.series:
+                self._record_journal_event(
+                    "bufferbloat.measured",
+                    subject=series.name,
+                    template="Bufferbloat {phase}/{series}: p50 {p50} мс, p95 {p95} мс",
+                    values={
+                        "phase": phase_name,
+                        "series": series.name,
+                        "p50": series.p50_ms,
+                        "p95": series.p95_ms,
+                        "max": series.max_ms,
+                        "samples": series.samples,
+                        "mbps": phase.speed_mbps,
+                    },
+                )
+        self._record_journal_event(
+            "bufferbloat.verdict",
+            severity="warning" if report.grade in {"C", "D", "F"} else "info",
+            subject=report.target_ip or "1.1.1.1",
+            template="Bufferbloat: {grade}; {attribution}",
+            values={
+                "grade": report.grade,
+                "attribution": attribution,
+                "download_delta": report.download_active.delta_ms,
+                "upload_delta": report.upload_active.delta_ms,
+                "target_delta": report.target_delta_ms,
+                "gateway_delta": report.gateway_delta_ms,
+            },
+        )
+
+    def _update_bufferbloat_phase(self, active_index: int) -> None:
+        sources = ("Базовая задержка", "Скачивание под нагрузкой", "Отдача под нагрузкой")
+        for index, label in enumerate(self.bufferbloat_phase_labels):
+            marker = "✓" if index < active_index else "●" if index == active_index else "○"
+            label.setText(f"{marker} {self._tr(sources[index])}")
+
+    def _render_bufferbloat_recommendations(self) -> None:
+        if not self.bufferbloat_recommendation_sources:
+            self.bufferbloat_recommendations.setText(
+                self._tr("После теста здесь появятся рекомендации по настройке сети.")
+            )
+            return
+        self.bufferbloat_recommendations.setText(
+            "\n".join(
+                f"• {self._tr(source)}"
+                for source in self.bufferbloat_recommendation_sources
+            )
+        )
+
+    @Slot()
+    def _clear_bufferbloat_worker(self) -> None:
+        if self.sender() is not self._bufferbloat_thread:
+            return
+        self._bufferbloat_thread = None
+        self._bufferbloat_worker = None
+
+    def _record_test_history(
+        self,
+        test_type: str,
+        *,
+        download_mbps: float | None = None,
+        upload_mbps: float | None = None,
+        ping_ms: float | None = None,
+        bufferbloat_grade: str | None = None,
+    ) -> None:
+        try:
+            self._test_history_store.append(
+                test_type,
+                download_mbps=download_mbps,
+                upload_mbps=upload_mbps,
+                ping_ms=ping_ms,
+                bufferbloat_grade=bufferbloat_grade,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._append_log(f"История тестов не сохранена: {exc}")
+            return
+        self._test_history_records = self._test_history_store.load()
+        if hasattr(self, "history_table"):
+            self._refresh_history_view()
+
+    @staticmethod
+    def _format_history_metric(value: object, unit: str) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.1f} {unit}"
+        return "--"
+
+    @staticmethod
+    def _history_delta(latest: object, previous: object, unit: str) -> str:
+        if not isinstance(latest, (int, float)) or not isinstance(previous, (int, float)):
+            return "--"
+        return f"{latest - previous:+.1f} {unit}"
+
+    @Slot()
+    def _refresh_history_view(self) -> None:
+        self._test_history_records = self._test_history_store.load()
+        self.history_table.setRowCount(len(self._test_history_records))
+        for row, record in enumerate(reversed(self._test_history_records)):
+            test_type = str(record.get("test_type") or "Неизвестный тест")
+            values = (
+                str(record.get("timestamp") or "--").replace("T", " "),
+                self._tr(test_type),
+                self._format_history_metric(record.get("download_mbps"), "Мбит/с"),
+                self._format_history_metric(record.get("upload_mbps"), "Мбит/с"),
+                self._format_history_metric(record.get("ping_ms"), "мс"),
+                str(record.get("bufferbloat_grade") or "--"),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                if column == 5 and value in {"A+", "A"}:
+                    item.setForeground(QColor("#00E5A3"))
+                self.history_table.setItem(row, column, item)
+
+        count = len(self._test_history_records)
+        self.history_summary.setText(
+            self._translator.format("Сохранено тестов: {count}", count=count)
+            if count
+            else self._tr("История тестов пока пуста")
+        )
+        quality_records = [
+            record
+            for record in self._test_history_records
+            if record.get("test_type") == "Качество интернета"
+        ]
+        if len(quality_records) < 2:
+            self.history_trend.setText(self._tr("Для тренда нужны минимум два теста качества."))
+            return
+        latest, previous = quality_records[-1], quality_records[-2]
+        self.history_trend.setText(
+            self._translator.format(
+                "Динамика качества: ping {ping_delta} · download {download_delta}",
+                ping_delta=self._history_delta(
+                    latest.get("ping_ms"), previous.get("ping_ms"), "мс"
+                ),
+                download_delta=self._history_delta(
+                    latest.get("download_mbps"), previous.get("download_mbps"), "Мбит/с"
+                ),
+            )
+        )
+
+    @Slot()
+    def _clear_test_history(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            self._tr("Очистить историю"),
+            self._tr("Удалить все сохранённые результаты тестов?"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._test_history_store.clear()
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                self._tr("История тестов"),
+                self._translator.format("Не удалось очистить историю: {error}", error=exc),
+            )
+            return
+        self._test_history_records = []
+        self._refresh_history_view()
 
     def _build_analysis_tab(self) -> QWidget:
         tab = QWidget()
@@ -6214,7 +8680,14 @@ class MainWindow(QMainWindow):
         self.interfaces_table = QTableWidget(0, 4)
         self.interfaces_table.setHorizontalHeaderLabels(["Имя", "Тип", "IPv4", "Состояние"])
         self._configure_table(self.interfaces_table, (180, 110, 200, 100))
+        self.wifi_status_label = QLabel("Wi-Fi: ожидание активного маршрута")
+        self.wifi_status_label.setObjectName("Muted")
+        self.wifi_status_label.setWordWrap(True)
+        self.wifi_status_label.setToolTip(
+            "В Windows 11 для данных Wi-Fi может потребоваться разрешение «Расположение»."
+        )
         layout.addWidget(self.interfaces_table)
+        layout.addWidget(self.wifi_status_label)
         return tab
 
     def _build_udp_history_tab(self) -> QWidget:
@@ -6274,13 +8747,224 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        heading_row = QHBoxLayout()
+        self.journal_heading = QLabel("ЕДИНЫЙ ЖУРНАЛ СЕССИИ")
+        self.journal_heading.setObjectName("FieldLabel")
+        self.journal_layer_filter = QComboBox()
+        self.journal_layer_filter.setObjectName("JournalLayerFilter")
+        self.journal_layer_filter.currentIndexChanged.connect(
+            lambda _index: self._render_journal()
+        )
+        self.journal_include_past_sessions = QCheckBox("Прошлые сессии")
+        self.journal_include_past_sessions.toggled.connect(
+            lambda _checked: self._render_journal()
+        )
+        heading_row.addWidget(self.journal_heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.journal_layer_filter)
+        heading_row.addWidget(self.journal_include_past_sessions)
+
+        actions_row = QHBoxLayout()
+        self.export_journal_json_button = QPushButton("Экспорт JSON")
+        self.export_journal_json_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
+        )
+        self.export_journal_json_button.clicked.connect(lambda: self._export_journal("json"))
+        self.export_journal_csv_button = QPushButton("Экспорт CSV")
+        self.export_journal_csv_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
+        )
+        self.export_journal_csv_button.clicked.connect(lambda: self._export_journal("csv"))
+        self.clear_journal_button = QPushButton("Очистить журнал")
+        self.clear_journal_button.clicked.connect(self._clear_journal)
+        actions_row.addStretch(1)
+        actions_row.addWidget(self.export_journal_json_button)
+        actions_row.addWidget(self.export_journal_csv_button)
+        actions_row.addWidget(self.clear_journal_button)
+
+        self.journal_status = QLabel("Журнал текущей сессии пока пуст")
+        self.journal_status.setObjectName("Muted")
+        self.journal_table = QTableWidget(0, 5)
+        self.journal_table.setObjectName("SessionJournalTable")
+        self.journal_table.setSortingEnabled(False)
+        self._configure_table(self.journal_table, (100, 105, 145, 180, 400))
+
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
         _keep_wheel_scroll_local(self.log_output)
         self.log_output.setMaximumBlockCount(500)
         self.log_output.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.log_output.setMaximumHeight(120)
+        layout.addLayout(heading_row)
+        layout.addLayout(actions_row)
+        layout.addWidget(self.journal_status)
+        layout.addWidget(self.journal_table, 1)
         layout.addWidget(self.log_output)
+        self._retranslate_journal_filter()
+        self._render_journal()
         return tab
+
+    def _retranslate_journal_filter(self) -> None:
+        selected = self.journal_layer_filter.currentData()
+        self.journal_layer_filter.blockSignals(True)
+        self.journal_layer_filter.clear()
+        self.journal_layer_filter.addItem(self._tr("Все слои"), None)
+        for layer in Layer:
+            self.journal_layer_filter.addItem(self._journal_layer_label(layer), layer.value)
+        index = self.journal_layer_filter.findData(selected)
+        self.journal_layer_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.journal_layer_filter.blockSignals(False)
+
+    def _journal_layer_label(self, layer: Layer) -> str:
+        sources = {
+            Layer.MEASUREMENT: "Измерение",
+            Layer.INFERENCE: "Вывод",
+            Layer.ACTION: "Действие",
+        }
+        return self._tr(sources[layer])
+
+    def _record_journal_event(
+        self,
+        kind: str,
+        *,
+        severity: str = "info",
+        subject: str = "",
+        template: str = "",
+        values: dict[str, object] | None = None,
+        refs: dict[str, object] | None = None,
+        at: datetime | None = None,
+    ) -> JournalEvent:
+        event = self._journal.record(
+            kind,
+            severity=severity,
+            subject=subject,
+            template=template,
+            values=values,
+            refs=refs,
+            at=at,
+        )
+        if hasattr(self, "journal_table"):
+            self._render_journal()
+        self._notify(event)
+        return event
+
+    def _notify(self, event: JournalEvent) -> None:
+        severity_rank = {"info": 0, "warning": 1, "error": 2}
+        if severity_rank.get(event.severity, 0) < severity_rank["warning"]:
+            return
+        if event.kind == "loss.episode" and event.refs.get("kind") not in {"drop", "burst"}:
+            return
+        if event.kind == "jitter.episode" and event.refs.get("kind") == "timeout":
+            return
+        if event.kind not in {"loss.episode", "jitter.episode", "game.session_ended", "mtu.rolled_back"}:
+            return
+        if not self._network_alarm_enabled:
+            return
+        if self._notifications_paused:
+            return
+        tray = getattr(self, "_network_health_tray", None)
+        if tray is None or not tray.isSystemTrayAvailable():
+            return
+        key = event.kind
+        now = time.monotonic()
+        cooldown = self._thresholds.alarm_cooldown_s
+        if now - self._last_network_alarm_at.get(key, 0.0) < cooldown:
+            return
+        self._last_network_alarm_at[key] = now
+        try:
+            message = self._translator.format(event.template, **event.values)
+        except (KeyError, ValueError):
+            message = event.template or event.kind
+        tray.showMessage(
+            self._tr("Ухудшение качества сети"),
+            message,
+            QSystemTrayIcon.MessageIcon.Warning,
+            5000,
+        )
+
+    def _journal_events_for_view(self) -> list[JournalEvent]:
+        include_past = self.journal_include_past_sessions.isChecked()
+        events = self._journal.events(include_past_sessions=include_past)
+        selected_layer = self.journal_layer_filter.currentData()
+        if isinstance(selected_layer, str):
+            events = [event for event in events if event.layer.value == selected_layer]
+        return events
+
+    def _render_journal(self) -> None:
+        if not hasattr(self, "journal_table"):
+            return
+        events = self._journal_events_for_view()
+        self.journal_table.setHorizontalHeaderLabels(
+            [self._tr(text) for text in ("Время", "Слой", "Тип", "Объект", "Подробности")]
+        )
+        self.journal_table.setRowCount(len(events))
+        for row_index, event in enumerate(reversed(events)):
+            try:
+                details = self._translator.format(event.template, **event.values)
+            except (KeyError, ValueError):
+                details = event.template
+            values = (
+                event.at.astimezone().strftime("%H:%M:%S"),
+                self._journal_layer_label(event.layer),
+                event.kind,
+                event.subject or "--",
+                details,
+            )
+            color = _journal_event_color(event.severity)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(value)
+                item.setForeground(color)
+                self.journal_table.setItem(row_index, column, item)
+        count = len(events)
+        self.journal_status.setText(
+            self._translator.format(
+                "Событий в журнале: {count}",
+                count=count,
+            ) if count else self._tr("Журнал текущей сессии пока пуст")
+        )
+        self.export_journal_json_button.setEnabled(bool(events))
+        self.export_journal_csv_button.setEnabled(bool(events))
+
+    @Slot()
+    def _clear_journal(self) -> None:
+        self._journal_store.clear(session=self._journal.session)
+        self._render_journal()
+
+    def _export_journal(self, file_format: str) -> None:
+        events = self._journal_events_for_view()
+        if not events:
+            return
+        if file_format not in {"json", "csv"}:
+            raise ValueError(f"Unsupported journal export format: {file_format}")
+        suggested_name = f"NetVision_Journal_{datetime.now():%Y%m%d_%H%M%S}.{file_format}"
+        filter_text = "JSON (*.json)" if file_format == "json" else "CSV (*.csv)"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            self._tr("Экспорт журнала"),
+            str(Path.home() / suggested_name),
+            filter_text,
+        )
+        if not path:
+            return
+        suffix = f".{file_format}"
+        if not path.lower().endswith(suffix):
+            path += suffix
+        payload = (
+            serialize_journal_json(events)
+            if file_format == "json"
+            else serialize_journal_csv(events)
+        ).encode("utf-8")
+        if self._write_export_payload(path, payload):
+            self._append_log(
+                self._translator.format(
+                    "Журнал сохранён в {format}: {path}",
+                    format=file_format.upper(),
+                    path=path,
+                )
+            )
 
     @Slot()
     def start_quality_check(self) -> None:
@@ -6289,10 +8973,10 @@ class MainWindow(QMainWindow):
         self._quality_report = None
         self._set_task_button_busy(self.quality_test_button, True, "Проверка")
         self.quality_progress.show()
-        self.quality_status.setText("Подготавливаем проверку качества...")
+        self.quality_status.setText(self._tr("Подготавливаем проверку качества..."))
         self.quality_report_output.clear()
         for tile in self.quality_metrics.values():
-            tile.set_metric("--", "выполняется")
+            tile.set_metric("--", self._tr("выполняется"))
         for label in self.quality_details.values():
             label.setText("--")
         self._append_log("Запуск проверки качества интернета")
@@ -6315,8 +8999,19 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_quality_progress(self, message: str) -> None:
-        self.quality_status.setText(message)
+        self.quality_status.setText(self._translate_quality_progress(message))
         self._append_log(message)
+
+    def _translate_quality_progress(self, message: str) -> str:
+        for prefix, template in (
+            ("Тест отдачи: ", "Тест отдачи: {host}"),
+            ("Пинг под нагрузкой: ", "Пинг под нагрузкой: {target}"),
+        ):
+            if message.startswith(prefix):
+                value = message.removeprefix(prefix)
+                field = "host" if "{host}" in template else "target"
+                return self._tr(template).format(**{field: value})
+        return self._tr(message)
 
     @Slot(object)
     def _on_quality_completed(self, value: object) -> None:
@@ -6328,18 +9023,42 @@ class MainWindow(QMainWindow):
         speed = value.speedtest
         network = value.network
         local = value.local
+        self._record_test_history(
+            "Качество интернета",
+            download_mbps=speed.download_mbps,
+            upload_mbps=speed.upload_mbps,
+            ping_ms=speed.ping_ms,
+        )
         self.quality_metrics["download"].set_metric(
             _speed(speed.download_mbps),
-            "HTTP CDN, 10 МБ",
+            self._tr("HTTP CDN, 10 МБ"),
             "good" if speed.download_mbps is not None else "neutral",
         )
-        self.quality_metrics["upload"].set_metric("N/A", "автономный тест не измеряет", "neutral")
+        upload_value = (
+            _speed(speed.upload_mbps)
+            if speed.upload_mbps is not None
+            else self._tr("Не измерена")
+        )
+        self.quality_metrics["upload"].set_metric(
+            upload_value,
+            self._tr("HTTP POST, 5 МБ"),
+            "good" if speed.upload_mbps is not None else "neutral",
+        )
         self.quality_metrics["ping"].set_metric(
             _latency(speed.ping_ms),
-            speed.server_name or "TCP DNS",
+            speed.server_name or self._tr("TCP DNS"),
             "good" if speed.ping_ms is not None else "neutral",
         )
-        self.quality_metrics["loaded_ping"].set_metric("N/A", "нет нагрузки upload", "neutral")
+        loaded_ping_value = (
+            _latency(speed.loaded_ping_ms)
+            if speed.loaded_ping_ms is not None
+            else self._tr("Не измерен")
+        )
+        self.quality_metrics["loaded_ping"].set_metric(
+            loaded_ping_value,
+            self._tr("TCP DNS во время отдачи"),
+            "good" if speed.loaded_ping_ms is not None else "neutral",
+        )
         self.quality_details["ipv4"].setText(network.ipv4 or "не определён")
         self.quality_details["ipv6"].setText(network.ipv6 or "не определён")
         self.quality_details["local_ip"].setText(
@@ -6365,24 +9084,29 @@ class MainWindow(QMainWindow):
         self.quality_details["adapter"].setText(
             f"{local.adapter_name or 'не определён'} · {adapter_speed}"
         )
-        self.quality_report_output.setPlainText(build_smart_report(value))
+        self.quality_report_output.setPlainText(build_smart_report(value, self._tr))
         if value.errors:
             self.quality_status.setText(
-                speed.error
-                or "Проверка завершена частично: часть источников недоступна"
+                self._tr(speed.error)
+                if speed.error
+                else self._tr("Проверка завершена частично: часть источников недоступна")
             )
             self._set_status("PARTIAL", "warning")
             for error in value.errors:
                 self._append_log(f"Качество: {error}")
         else:
-            self.quality_status.setText(f"Проверка качества завершена · Geo API: {network.source}")
+            self.quality_status.setText(
+                self._tr("Проверка качества завершена · Geo API: {source}").format(
+                    source=network.source,
+                )
+            )
             self._set_status("QUALITY READY", "success")
         self._append_log("Проверка качества интернета завершена")
 
     @Slot(str)
     def _on_quality_failed(self, message: str) -> None:
         self._finish_quality_check()
-        self.quality_status.setText(message)
+        self.quality_status.setText(self._tr(message))
         self._set_status("QUALITY ERROR", "error")
         self._append_log(f"Ошибка качества: {message}")
 
@@ -6397,6 +9121,112 @@ class MainWindow(QMainWindow):
             return
         self._quality_thread = None
         self._quality_worker = None
+
+    @Slot()
+    def start_nat_probe(self) -> None:
+        if self._nat_thread and self._nat_thread.isRunning():
+            return
+        self._nat_report = None
+        self._set_task_button_busy(self.nat_probe_button, True, "STUN")
+        self.nat_probe_status.setText("Проверяем UDP NAT через STUN...")
+        snapshot = self._report.system if self._report else None
+        thread = QThread(self)
+        worker = NatProbeWorker(
+            snapshot.external_ip if snapshot else None,
+            self._report.hops if self._report else (),
+            self._thresholds,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._on_nat_probe_completed)
+        worker.failed.connect(self._on_nat_probe_failed)
+        worker.completed.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_nat_worker)
+        self._nat_thread = thread
+        self._nat_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_nat_probe_completed(self, value: object) -> None:
+        if not isinstance(value, NatReport):
+            self._on_nat_probe_failed("STUN-проверка вернула неизвестный результат")
+            return
+        self._nat_report = value
+        endpoints = [endpoint.display for endpoint in value.mapped_endpoints]
+        if value.status in {"udp_blocked", "no_servers"}:
+            self.nat_probe_status.setText(
+                "UDP не получил ответа от STUN-серверов"
+                if value.status == "udp_blocked"
+                else "STUN-серверы недоступны"
+            )
+            self._record_journal_event(
+                "nat.probe_failed",
+                severity="warning",
+                subject="NAT/STUN",
+                template="NAT/STUN: {reason}",
+                values={"reason": value.status},
+            )
+        else:
+            flags = []
+            if value.cgnat_likely:
+                flags.append("возможен CGNAT")
+            if value.double_nat_likely:
+                flags.append("возможен Double NAT")
+            if value.udp_egress_differs:
+                flags.append("UDP egress отличается от внешнего IP")
+            suffix = f" · {', '.join(flags)}" if flags else ""
+            self.nat_probe_status.setText(
+                f"NAT: {value.nat_type or 'не определён'} · filtering: {value.filtering}"
+                f"\n{'; '.join(endpoints)}{suffix}"
+            )
+            self._record_journal_event(
+                "nat.measured",
+                subject="NAT/STUN",
+                template="NAT/STUN endpoints: {endpoints}",
+                values={"endpoints": endpoints},
+            )
+            self._record_journal_event(
+                "nat.inferred",
+                severity="warning" if value.nat_type == "apdm" else "info",
+                subject="NAT/STUN",
+                template="NAT: {nat_type}",
+                values={
+                    "nat_type": value.nat_type,
+                    "filtering": value.filtering,
+                    "cgnat_likely": value.cgnat_likely,
+                    "double_nat_likely": value.double_nat_likely,
+                    "udp_egress_differs": value.udp_egress_differs,
+                },
+            )
+        if self._report is not None:
+            self._update_root_cause_analysis(self._report)
+        self._append_log(f"NAT/STUN: {value.status}")
+
+    @Slot(str)
+    def _on_nat_probe_failed(self, message: str) -> None:
+        self._nat_report = None
+        self.nat_probe_status.setText(message)
+        self._record_journal_event(
+            "nat.probe_failed",
+            severity="warning",
+            subject="NAT/STUN",
+            template="NAT/STUN: {reason}",
+            values={"reason": message},
+        )
+        self._append_log(message)
+        if self._report is not None:
+            self._update_root_cause_analysis(self._report)
+
+    @Slot()
+    def _clear_nat_worker(self) -> None:
+        if self.sender() is not self._nat_thread:
+            return
+        self._set_task_button_busy(self.nat_probe_button, False)
+        self.nat_probe_button.setEnabled(True)
+        self._nat_thread = None
+        self._nat_worker = None
 
     @Slot()
     def start_diagnostic(self) -> None:
@@ -6443,10 +9273,16 @@ class MainWindow(QMainWindow):
             self._on_failed("Диагностический модуль вернул неизвестный результат")
             return
         self._report = report
+        self._vpn_process_sockets = None
+        self._vpn_process_sockets_ready = False
         self.topology.set_report(report)
         self._fill_metrics(report)
         self._set_ping_statistics(
-            latency_statistics(tuple(report.ping.samples_ms), sent=report.ping.sent)
+            latency_statistics(
+                tuple(report.ping.samples_ms),
+                sent=report.ping.sent,
+                th=self._thresholds,
+            )
         )
         self._render_loss_hops_placeholders(
             report.hops,
@@ -6456,11 +9292,21 @@ class MainWindow(QMainWindow):
             self._tr("Трассировка получена. Запустите анализ, чтобы проверить ICMP-потери по каждому hop.")
         )
         self._fill_interfaces(report.system.interfaces)
+        self._start_wifi_monitor(
+            report.system.default_routes[0] if report.system.default_routes else None
+        )
         self._fill_route_analysis(report)
         self._show_system_details(report)
         self._update_lite_summary(report)
         self._update_root_cause_analysis(report)
+        if (
+            self._selected_process is not None
+            and report.system.default_routes
+            and report.system.default_routes[0].is_vpn
+        ):
+            self._start_process_sockets_scan(report, self._selected_process.pid)
         self.export_button.setEnabled(True)
+        self.support_bundle_button.setEnabled(True)
         self._set_running(False)
         state = "CONNECTED" if report.tcp.status == ProbeStatus.SUCCESS else "ISSUES FOUND"
         self._set_status(state, "success" if report.tcp.status == ProbeStatus.SUCCESS else "warning")
@@ -6470,13 +9316,13 @@ class MainWindow(QMainWindow):
             self._set_header_anomaly("error", "Потери пакетов: {loss:.0f}%", loss=report.ping.loss_percent)
         elif report.ping.loss_percent > 0:
             self._set_header_anomaly("warning", "Потери пакетов: {loss:.0f}%", loss=report.ping.loss_percent)
-        elif (report.ping.average_ms or 0.0) >= 150:
+        elif (report.ping.average_ms or 0.0) >= self._thresholds.rtt_peak_ms:
             self._set_header_anomaly(
                 "error",
                 "Пик пинга > {latency:.0f} мс",
                 latency=report.ping.average_ms or 0.0,
             )
-        elif (report.ping.average_ms or 0.0) >= 100:
+        elif (report.ping.average_ms or 0.0) >= self._thresholds.rtt_high_ms:
             self._set_header_anomaly(
                 "warning",
                 "Высокий пинг: {latency:.0f} мс",
@@ -6533,8 +9379,8 @@ class MainWindow(QMainWindow):
 
         self.metrics["ping"].set_metric(
             _ms(report.ping.average_ms),
-            self._tr(_ping_verdict(report.ping.average_ms)),
-            _latency_state(report.ping.average_ms, 100),
+            self._tr(_ping_verdict(report.ping.average_ms, self._thresholds)),
+            _latency_state(report.ping.average_ms, self._thresholds.rtt_high_ms),
         )
         self.metrics["loss"].set_metric(
             f"{report.ping.loss_percent:.0f}%",
@@ -6543,8 +9389,8 @@ class MainWindow(QMainWindow):
         )
         self.metrics["jitter"].set_metric(
             _ms(report.ping.jitter_ms),
-            self._tr(_jitter_verdict(report.ping.jitter_ms)),
-            _latency_state(report.ping.jitter_ms, 20),
+            self._tr(_jitter_verdict(report.ping.jitter_ms, self._thresholds)),
+            _latency_state(report.ping.jitter_ms, self._thresholds.jitter_critical_ms),
         )
 
         tcp_ok = report.tcp.status == ProbeStatus.SUCCESS
@@ -6664,16 +9510,22 @@ class MainWindow(QMainWindow):
         self._jitter_events.clear()
         self._jitter_deviations.clear()
         self._jitter_previous_rtt = None
+        self._jitter_episode_tracker = self._new_jitter_episode_tracker()
+        self._jitter_episode_row_index = None
+        self._jitter_timeout_row_index = None
+        self._rtt_episode_tracker = self._new_rtt_episode_tracker()
+        self._rtt_episode_log_index = None
         self._jitter_target_host = target.host
         self._loss_analyzer.reset()
         self.ping_spike_log.clear()
         self.ping_spike_status.setText(
-            self._tr("Пики выше 100 мс и потери появятся здесь во время мониторинга")
+            self._translator.format(
+                "Пики выше {threshold:.0f} мс и потери появятся здесь во время мониторинга",
+                threshold=self._thresholds.rtt_high_ms,
+            )
         )
-        self._set_ping_statistics(latency_statistics(()))
-        self.ping_mtu_host_input.setText(target.host)
+        self._set_ping_statistics(latency_statistics((), th=self._thresholds))
         self._render_ping_matrix_placeholders()
-        self._render_mtu_placeholders()
         self.loss_events_log.clear()
         self.loss_detector_status.setText(self._tr("Ожидание данных live-монитора"))
         self._set_loss_snapshot(self._loss_analyzer_snapshot())
@@ -6686,6 +9538,7 @@ class MainWindow(QMainWindow):
         self._clear_detail_grid()
         self.detail_title.setText(self._tr("Диагностика выполняется"))
         self.interfaces_table.setRowCount(0)
+        self._set_wifi_status("Wi-Fi: ожидание активного маршрута")
         self.routes_table.setRowCount(0)
         self.geo_table.setRowCount(0)
         self.geo_status.setText(self._tr("GeoIP ещё не получен"))
@@ -6699,6 +9552,7 @@ class MainWindow(QMainWindow):
         self._clear_lite_details()
         self._set_lite_status_style(LiteStatus.WARNING)
         self.export_button.setEnabled(False)
+        self.support_bundle_button.setEnabled(False)
         for tile in self.metrics.values():
             tile.set_waiting(self._tr("Проверка выполняется"))
 
@@ -6844,7 +9698,7 @@ class MainWindow(QMainWindow):
                 self.process_selector.setItemText(index, self._process_display_label(process))
 
     def _update_lite_summary(self, report: DiagnosticReport) -> None:
-        summary = summarize_report(report)
+        summary = summarize_report(report, self._thresholds)
         self.lite_title.setText(summary.title)
         self.lite_message.setText(summary.message)
         self._set_lite_status_style(summary.status)
@@ -6864,7 +9718,19 @@ class MainWindow(QMainWindow):
             self.lite_detail_labels.append(label)
 
     def _update_root_cause_analysis(self, report: DiagnosticReport) -> None:
-        analysis = analyze_report(report, self._selected_process, self._selected_connection)
+        analysis = analyze_report(
+            report,
+            (
+                self._vpn_process_sockets
+                if self._vpn_process_sockets_ready
+                else self._selected_process
+            ),
+            self._selected_connection,
+            self._thresholds,
+            mtr=self._mtr_snapshot,
+            nat=self._nat_report,
+            wifi=self._wifi_snapshot,
+        )
         self.analysis_title.setText(f"{analysis.subject}: {analysis.headline}")
         primary = analysis.findings[0]
         self.lite_cause.setText(f"Диагноз: {primary.title}. {primary.explanation}")
@@ -6925,6 +9791,12 @@ class MainWindow(QMainWindow):
             status_label.setText(self._tr("Выполняется..."))
             self._system_action_status[button] = status_label
         self._append_log(f"Запуск системного действия: {label}")
+        self._record_journal_event(
+            "action.system_started",
+            subject=label,
+            template="Запуск системного действия: {action}",
+            values={"action": label},
+        )
 
         thread = QThread(self)
         worker = SystemActionWorker(label, button, action)
@@ -6954,6 +9826,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 6000)
             if status_label is not None:
                 status_label.setText(message)
+            self._record_journal_event(
+                "action.system_finished",
+                severity="error",
+                subject=label,
+                template="Системное действие завершилось с ошибкой: {action}",
+                values={"action": label},
+            )
             return
 
         message = f"{label}: {result.message}"
@@ -6964,6 +9843,102 @@ class MainWindow(QMainWindow):
             status_label.setText(
                 f"Успешно: {result.message}" if result.success else f"Ошибка: {result.message}"
             )
+        self._record_journal_event(
+            "action.system_finished",
+            severity="info" if result.success else "error",
+            subject=label,
+            template="Системное действие {action}: {message}",
+            values={"action": label, "message": result.message},
+            refs={"success": result.success},
+        )
+        if label == "Пробное применение MTU" and result.success and result.change is not None:
+            self._start_mtu_trial_confirmation(button, status_label, result.change)
+            return
+        if label == "Сохранение MTU" and result.success:
+            report = self._mtu_optimizer_report
+            if report is not None:
+                self._record_journal_event(
+                    "mtu.confirmed",
+                    subject=report.route_interface or report.target,
+                    template="MTU подтверждён: {mtu}",
+                    values={"mtu": report.optimal_mtu},
+                    refs={"target_ip": report.target_ip},
+                )
+            self._mtu_trial_change = None
+            return
+        if label == "Сохранение MTU":
+            change = self._mtu_trial_change
+            if change is not None:
+                self._begin_mtu_rollback(change, button, status_label, "persist_failed")
+            return
+        rollback = self._rollback_actions.pop(label, None)
+        if rollback is not None:
+            change, _pending = rollback
+            self._record_journal_event(
+                "action.system_rolled_back",
+                severity="info" if result.success else "error",
+                subject=change.adapter,
+                template="Откат изменения {action}: {message}",
+                values={"action": change.kind.upper(), "message": result.message},
+                refs={"success": result.success, "adapter": change.adapter},
+            )
+            reason = self._mtu_rollback_reasons.pop(label, None)
+            if reason is not None:
+                self._record_journal_event(
+                    "mtu.rolled_back",
+                    severity="info" if result.success else "error",
+                    subject=change.adapter,
+                    template="Пробный MTU отменён: {reason}",
+                    values={"reason": reason, "mtu": change.after},
+                    refs={"success": result.success},
+                )
+            self._mtu_trial_change = None
+            return
+        if result.success and result.change is not None:
+            self._confirm_system_change(label, button, status_label, result.change)
+
+    def _action_confirm_timeout_s(self) -> float:
+        """Read the confirmation window from settings without changing its default."""
+        configured = QSettings().value(
+            "system_actions/confirm_timeout_s",
+            self._thresholds.action_confirm_timeout_s,
+        )
+        try:
+            return max(0.05, float(configured))
+        except (TypeError, ValueError):
+            return self._thresholds.action_confirm_timeout_s
+
+    def _confirm_system_change(
+        self,
+        label: str,
+        button: QPushButton,
+        status_label: QLabel | None,
+        change: SystemChange,
+    ) -> None:
+        pending = PendingAction(
+            apply=lambda: self._record_journal_event(
+                "action.system_confirmed",
+                subject=change.adapter,
+                template="Изменение подтверждено: {action}",
+                values={"action": change.kind.upper()},
+                refs={"adapter": change.adapter, "kind": change.kind},
+            ),
+            rollback=lambda change=change: rollback_change(change),
+            timeout_s=self._action_confirm_timeout_s(),
+        )
+        dialog = RollbackConfirmDialog(change, self._tr, self, seconds=pending.timeout_s)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            pending.apply()
+            return
+        rollback_label = f"Откат: {label}"
+        self._rollback_actions[rollback_label] = (change, pending)
+        self._run_system_action(
+            rollback_label,
+            pending.rollback,
+            button,
+            status_label,
+        )
 
     @Slot()
     def _release_system_action(self) -> None:
@@ -6992,6 +9967,108 @@ class MainWindow(QMainWindow):
         payload = serialize_report(self._report, self._udp_event_rows).encode("utf-8")
         if self._write_export_payload(path, payload):
             self._append_log(f"Полный отчёт с UDP-историей сохранён: {path}")
+
+    @Slot()
+    def _export_support_bundle(self) -> None:
+        if self._report is None:
+            return
+        options = self._support_bundle_options()
+        if options is None:
+            return
+        redact, sections = options
+        target_slug = re.sub(r"[^A-Za-z0-9._-]", "_", self._report.target.host)
+        suggested_name = f"NetVision_Support_{target_slug}_{datetime.now():%Y%m%d_%H%M%S}.json"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт пакета для техподдержки",
+            str(Path.home() / suggested_name),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        payload = serialize_support_bundle(
+            self._report,
+            journal=self._journal,
+            thresholds=self._thresholds,
+            measurements=self._support_bundle_measurements(),
+            process=self._selected_process,
+            endpoints=(self._selected_connection,) if self._selected_connection else (),
+            history=self._test_history_store.load(),
+            sections=sections,
+            redact=redact,
+            max_events=self._thresholds.export_max_events,
+        ).encode("utf-8")
+        if self._write_export_payload(path, payload):
+            self._record_journal_event(
+                "export.created",
+                subject="support_bundle",
+                template="Создан пакет техподдержки: {filename}",
+                values={
+                    "filename": Path(path).name,
+                    "redacted": redact,
+                    "sections": sorted(sections),
+                    "size_bytes": len(payload),
+                },
+            )
+            self._append_log(f"Пакет для техподдержки сохранён: {Path(path).name}")
+
+    def _support_bundle_options(self) -> tuple[bool, tuple[str, ...]] | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Пакет для техподдержки")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(360)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(8)
+        description = QLabel("Будут включены выбранные диагностические данные. Сырой трафик и командные строки процессов не экспортируются.")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        section_labels = (
+            ("report", "Диагностический отчёт"),
+            ("session", "Журнал текущей сессии и пороги"),
+            ("measurements", "Последние измерения"),
+            ("process", "Выбранный процесс и endpoints"),
+            ("history", "История тестов"),
+        )
+        section_checks: list[tuple[str, QCheckBox]] = []
+        for name, label in section_labels:
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(True)
+            layout.addWidget(checkbox)
+            section_checks.append((name, checkbox))
+        redact_checkbox = QCheckBox("Скрыть личные данные (IP, MAC, Hostname, SSID)")
+        redact_checkbox.setChecked(True)
+        layout.addWidget(redact_checkbox)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("Отмена")
+        cancel.clicked.connect(dialog.reject)
+        create = QPushButton("Создать пакет")
+        create.setObjectName("PrimaryButton")
+        create.clicked.connect(dialog.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(create)
+        layout.addLayout(actions)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        sections = tuple(name for name, checkbox in section_checks if checkbox.isChecked())
+        return redact_checkbox.isChecked(), sections
+
+    def _support_bundle_measurements(self) -> dict[str, object]:
+        return {
+            "mtu": self._mtu_optimizer_report,
+            "bufferbloat": self._bufferbloat_report,
+            "mtr": self._mtr_snapshot,
+            "nat": self._nat_report,
+            "wifi": self._wifi_snapshot,
+            "loss": self._loss_analyzer_snapshot(),
+            "jitter": {
+                "latency_window_ms": tuple(self._latency_window),
+                "events": tuple(self._jitter_events),
+            },
+        }
 
     @Slot()
     def _export_udp_events_json(self) -> None:
@@ -7037,6 +10114,44 @@ class MainWindow(QMainWindow):
             return False
         return True
 
+    @Slot(QWidget, str)
+    def _export_widget_png(self, widget: QWidget, section: str) -> None:
+        if widget.width() <= 0 or widget.height() <= 0:
+            QMessageBox.warning(
+                self,
+                self._tr("Экспорт сводки"),
+                self._tr("Сводка пока недоступна для сохранения."),
+            )
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_section = re.sub(r"[^A-Za-z0-9_-]", "_", section)
+        suggested_name = str(Path.home() / f"NetVision_{safe_section}_{timestamp}.png")
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            self._tr("Экспорт сводки"),
+            suggested_name,
+            self._tr("PNG-изображение (*.png)"),
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        pixmap = QPixmap(widget.size())
+        pixmap.fill(widget.palette().color(widget.backgroundRole()))
+        widget.render(pixmap)
+        if not pixmap.save(path, "PNG"):
+            QMessageBox.critical(
+                self,
+                self._tr("Экспорт не выполнен"),
+                self._tr("Не удалось сохранить изображение PNG."),
+            )
+            return
+        self.statusBar().showMessage(
+            self._translator.format("Сводка сохранена: {path}", path=path),
+            6000,
+        )
+        self._append_log(f"PNG summary saved: {path}")
+
     @Slot()
     def _clear_worker(self) -> None:
         if self.sender() is not self._thread:
@@ -7046,6 +10161,13 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: QShowEvent) -> None:
         super().showEvent(event)
+        if self._background_hidden:
+            self._background_hidden = False
+            self._record_journal_event(
+                "app.background_left",
+                subject="application",
+                template="Приложение возвращено из фонового режима",
+            )
         if self._latency_thread is None:
             try:
                 target = parse_target(self.target_input.text(), self.port_input.value())
@@ -7056,6 +10178,7 @@ class MainWindow(QMainWindow):
     def _start_latency_monitor(self, host: str, port: int) -> None:
         if self._closing:
             return
+        self._publish_monitor_scope()
         self._stop_latency_monitor()
         worker = LatencyMonitorWorker(host, port)
         worker.sample.connect(self._on_latency_sample, Qt.ConnectionType.QueuedConnection)
@@ -7063,6 +10186,143 @@ class MainWindow(QMainWindow):
         thread.finished.connect(self._clear_latency_monitor)
         self._latency_thread = thread
         self._latency_worker = worker
+
+        route = (
+            self._report.system.default_routes[0]
+            if self._report is not None and self._report.system.default_routes
+            else None
+        )
+        self._start_wifi_monitor(route)
+
+    def _start_wifi_monitor(self, route: DefaultRoute | None) -> None:
+        self._stop_wifi_monitor()
+        self._wifi_snapshot = None
+        self._wifi_signal_low = False
+        self._wifi_signal_tracker.reset()
+        self._wifi_probe_state = None
+        if route is None or not route.interface:
+            self._set_wifi_status("Wi-Fi: активный маршрут ещё не определён")
+            return
+        worker = WifiMonitorWorker(route.interface, route.gateway, th=self._thresholds)
+        worker.snapshot.connect(self._on_wifi_snapshot, Qt.ConnectionType.QueuedConnection)
+        thread = self._worker_registry.start(worker)
+        thread.finished.connect(self._clear_wifi_monitor)
+        self._wifi_thread = thread
+        self._wifi_worker = worker
+
+    def _stop_wifi_monitor(self) -> None:
+        thread = self._wifi_thread
+        self._worker_registry.stop(thread)
+        if thread is self._wifi_thread:
+            self._wifi_thread = None
+            self._wifi_worker = None
+
+    @Slot(object, str)
+    def _on_wifi_snapshot(self, value: object, state: str) -> None:
+        if self.sender() is not None and self.sender() is not self._wifi_worker:
+            return
+        snapshot = value if isinstance(value, WifiSnapshot) else None
+        if state != "ok":
+            self._set_wifi_status(
+                "Wi-Fi недоступен: проверьте разрешение «Расположение» в Windows 11"
+                if state == "unavailable"
+                else "Wi-Fi активного маршрута не распознан"
+            )
+            if self._wifi_probe_state != state:
+                self._record_journal_event(
+                    "wifi.probe_failed",
+                    severity="warning",
+                    subject="Wi-Fi",
+                    template="Wi-Fi: {reason}",
+                    values={"reason": state},
+                )
+            self._wifi_probe_state = state
+            return
+
+        previous = self._wifi_snapshot
+        self._wifi_probe_state = None
+        self._wifi_snapshot = snapshot
+        if snapshot is None:
+            return
+        self._set_wifi_status(_format_wifi_snapshot(snapshot))
+        if previous is not None and _wifi_roamed(previous, snapshot):
+            self._record_journal_event(
+                "wifi.roam",
+                severity="warning",
+                subject=snapshot.interface_name,
+                template="Wi-Fi roaming: {from_value} -> {to_value}",
+                values={
+                    "from_value": _wifi_route_signature(previous),
+                    "to_value": _wifi_route_signature(snapshot),
+                },
+            )
+
+        signal = snapshot.signal_pct
+        if signal is None:
+            return
+        signal_transition = self._wifi_signal_tracker.update(
+            signal,
+            self._thresholds.wifi_signal_warn_pct,
+            self._thresholds.wifi_signal_hysteresis_pct,
+        )
+        if signal_transition == "entered":
+            self._wifi_signal_low = True
+            self._record_journal_event(
+                "wifi.signal_low",
+                severity="warning",
+                subject=snapshot.interface_name,
+                template="Wi-Fi signal low: {signal}%",
+                values={"state": "entered", "signal": signal},
+            )
+        elif signal_transition == "cleared":
+            self._wifi_signal_low = False
+            self._record_journal_event(
+                "wifi.signal_low",
+                subject=snapshot.interface_name,
+                template="Wi-Fi signal restored: {signal}%",
+                values={"state": "cleared", "signal": signal},
+            )
+        if self._report is not None:
+            self._update_root_cause_analysis(self._report)
+
+    @Slot()
+    def _clear_wifi_monitor(self) -> None:
+        if self.sender() is not self._wifi_thread:
+            return
+        self._wifi_thread = None
+        self._wifi_worker = None
+
+    def _set_wifi_status(self, text: str) -> None:
+        if not hasattr(self, "wifi_status_label"):
+            return
+        self.wifi_status_label.setText(text)
+        self.wifi_status_label.setToolTip(
+            f"{text}\nВ Windows 11 для данных Wi-Fi может потребоваться разрешение «Расположение»."
+        )
+
+    def _record_wifi_correlation(self, trigger: str) -> None:
+        recent = self._journal.recent(
+            "wifi.",
+            since_s=self._thresholds.correlation_window_s,
+        )
+        snapshot = self._wifi_snapshot
+        confirmed, evidence = _wifi_correlation_evidence(
+            snapshot,
+            self._wifi_signal_low,
+            {event.kind for event in recent},
+            self._thresholds,
+        )
+        self._record_journal_event(
+            "wifi.suspected_cause",
+            severity="warning" if confirmed else "info",
+            subject=self.target_input.text().strip(),
+            template="Wi-Fi {status} для {trigger}",
+            values={
+                "status": "подтверждён" if confirmed else "не подтверждён",
+                "trigger": trigger,
+                "evidence": evidence,
+            },
+        )
 
     @Slot(object, bool)
     def _on_latency_sample(self, latency_ms: object, success: bool) -> None:
@@ -7073,18 +10333,39 @@ class MainWindow(QMainWindow):
         self._latency_window.append(value if success else None)
         if len(self._latency_window) > 60:
             del self._latency_window[:-60]
-        if value is not None and value >= 100:
-            event = f"[{datetime.now():%H:%M:%S}] Пик задержки: {value:.1f} ms"
-            self._ping_spike_events.append(event)
-            self._ping_spike_events = self._ping_spike_events[-80:]
-        elif not success:
-            event = f"[{datetime.now():%H:%M:%S}] Потеря ответа / timeout"
-            self._ping_spike_events.append(event)
-            self._ping_spike_events = self._ping_spike_events[-80:]
+        step, episode = self._rtt_episode_tracker.update(
+            value if success else None,
+            datetime.now(),
+        )
+        self._sync_rtt_episode_log(step, episode)
+        if step == "opened":
+            if episode is not None:
+                self._record_journal_event(
+                    "jitter.episode",
+                    severity="warning",
+                    subject=self._jitter_endpoint(),
+                    template="Высокий ping: {latency:.1f} мс",
+                    values={"latency": episode.peak},
+                    refs={"kind": "spike", "started_at": episode.started_at.isoformat()},
+                    at=episode.started_at,
+                )
+            self._record_wifi_correlation("rtt")
         self.latency_chart.add_sample(value, success)
         loss_snapshot, loss_event = self._loss_analyzer.observe(success, value)
         self._set_loss_snapshot(loss_snapshot)
         if loss_event is not None:
+            self._record_journal_event(
+                "loss.episode",
+                severity="error" if loss_event.kind in {"burst", "burst_end"} else "warning",
+                subject=self.target_input.text().strip(),
+                template="Потери: {message}",
+                values={"message": loss_event.message, "lost": loss_event.lost},
+                refs={
+                    "kind": loss_event.kind,
+                    "started_at": loss_event.started_at.isoformat() if loss_event.started_at else "",
+                },
+                at=loss_event.observed_at,
+            )
             self.loss_events_log.setPlainText(
                 "\n".join(
                     f"[{event.observed_at:%H:%M:%S}] {event.message}"
@@ -7094,18 +10375,58 @@ class MainWindow(QMainWindow):
             self.loss_detector_status.setText(
                 f"{loss_event.snapshot.status} · событий: {len(self._loss_analyzer.events)}"
             )
+            if loss_event.kind == "drop":
+                self._record_wifi_correlation("loss")
         elif loss_snapshot.sent:
             self.loss_detector_status.setText(loss_snapshot.status)
         self._set_ping_statistics(
             latency_statistics(
                 [sample for sample in self._latency_window if sample is not None],
                 sent=len(self._latency_window),
+                th=self._thresholds,
             )
         )
         if self._ping_spike_events:
             self.ping_spike_log.setPlainText("\n".join(self._ping_spike_events))
             self.ping_spike_status.setText(f"Зафиксировано событий: {len(self._ping_spike_events)}")
         self._update_live_header_anomaly(value, success, loss_snapshot)
+
+    def _sync_rtt_episode_log(self, step: str | None, episode: Episode | None) -> None:
+        if step == "opened" and episode is not None:
+            self._ping_spike_events.append(
+                f"[{episode.started_at:%H:%M:%S}] Пик задержки: {episode.peak:.1f} ms · отсчётов: 1"
+            )
+            self._ping_spike_events = self._ping_spike_events[-80:]
+            self._rtt_episode_log_index = len(self._ping_spike_events) - 1
+        if episode is None or self._rtt_episode_log_index is None:
+            return
+        row_index = self._rtt_episode_log_index
+        if row_index >= len(self._ping_spike_events):
+            self._rtt_episode_log_index = None
+            return
+        suffix = " · стабилизировалось" if step == "closed" else ""
+        self._ping_spike_events[row_index] = (
+            f"[{episode.started_at:%H:%M:%S}] Пик задержки: {episode.peak:.1f} ms"
+            f" · отсчётов: {episode.samples_over}{suffix}"
+        )
+        if step == "closed":
+            self._rtt_episode_log_index = None
+
+    def _save_network_alarm_settings(self, _value: object = True) -> None:
+        if not hasattr(self, "network_alarm_checkbox"):
+            return
+        self._network_alarm_enabled = self.network_alarm_checkbox.isChecked()
+        self._network_ping_alarm_threshold = self.network_ping_alarm_spin.value()
+        self._network_loss_alarm_threshold = self.network_loss_alarm_spin.value()
+        self._alarm_settings.setValue(
+            "network_health/alarms_enabled", self._network_alarm_enabled
+        )
+        self._alarm_settings.setValue(
+            "network_health/ping_threshold_ms", self._network_ping_alarm_threshold
+        )
+        self._alarm_settings.setValue(
+            "network_health/loss_threshold_percent", self._network_loss_alarm_threshold
+        )
 
     def _update_live_header_anomaly(
         self,
@@ -7131,23 +10452,25 @@ class MainWindow(QMainWindow):
                 loss=loss_snapshot.loss_percent,
             )
             return
-        if latency_ms is not None and latency_ms >= 150:
+        episode = self._rtt_episode_tracker.active
+        if episode is not None and episode.peak >= self._thresholds.rtt_peak_ms:
             self._set_header_anomaly(
                 "error",
                 "Пик пинга > {latency:.0f} мс",
-                latency=latency_ms,
+                latency=episode.peak,
             )
             return
-        if latency_ms is not None and latency_ms >= 100:
+        if episode is not None:
             self._set_header_anomaly(
                 "warning",
                 "Высокий пинг: {latency:.0f} мс",
-                latency=latency_ms,
+                latency=episode.peak,
             )
             return
         self._set_header_anomaly("good", "Связь стабильна")
 
     def _stop_latency_monitor(self) -> None:
+        self._stop_wifi_monitor()
         thread = self._latency_thread
         self._worker_registry.stop(thread)
         if thread is self._latency_thread:
@@ -7162,47 +10485,280 @@ class MainWindow(QMainWindow):
         self._latency_thread = None
         self._latency_worker = None
 
+    @Slot(bool)
+    def _toggle_game_launch_monitor(self, enabled: bool) -> None:
+        self._background_auto_monitor = enabled
+        self._alarm_settings.setValue("background/auto_monitor", enabled)
+        if not enabled:
+            self._stop_auto_monitors("выключено пользователем")
+            self._stop_game_launch_monitor()
+            self.game_monitor_status.setText(self._tr("Мониторинг игры выключен"))
+            return
+        if self._game_monitor_thread and self._game_monitor_thread.isRunning():
+            return
+        scope = self._publish_monitor_scope()
+        process_names = (scope.process_name,) if scope.process_name else ("HuntGame.exe",)
+        self.game_monitor_status.setText(
+            self._tr("Ожидание запуска HuntGame.exe")
+            if scope.process_name is None
+            else self._translator.format("Ожидание запуска {process}", process=scope.process_name)
+        )
+        worker = GameLaunchMonitorWorker(process_names, (scope.host, scope.port))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.event.connect(self._on_game_monitor_event)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_game_launch_monitor)
+        self._game_monitor_worker = worker
+        self._game_monitor_thread = thread
+        thread.start()
+        self._append_log("Мониторинг запуска игры включён")
+
+    @Slot(bool)
+    def _sync_tray_game_monitor(self, enabled: bool) -> None:
+        action = getattr(self, "_tray_game_monitor_action", None)
+        if action is None or action.isChecked() == enabled:
+            return
+        action.blockSignals(True)
+        action.setChecked(enabled)
+        action.blockSignals(False)
+
+    def _stop_game_launch_monitor(self) -> None:
+        worker = self._game_monitor_worker
+        if worker is not None:
+            worker.stop()
+
+    @Slot(object)
+    def _on_game_monitor_event(self, value: object) -> None:
+        if not isinstance(value, GameMonitorEvent):
+            return
+        if value.kind == "started":
+            baseline = _ms(value.baseline_latency_ms)
+            message = self._translator.format(
+                "Игра запущена: {process} (PID {pid}) · базовый ping: {latency}",
+                process=value.process_name,
+                pid=value.pid,
+                latency=baseline,
+            )
+            self.game_monitor_status.setText(message)
+            self._set_header_anomaly("info", "Игровая сессия начата")
+            self._append_log(message)
+            if self._background_auto_monitor:
+                self._start_auto_monitor_probe(value.process_name, value.pid)
+            return
+        if value.kind == "spike":
+            message = self._translator.format(
+                "Игровая сессия: всплеск RTT {latency}",
+                latency=_ms(value.latency_ms),
+            )
+            self.game_monitor_status.setText(message)
+            self._set_header_anomaly("warning", "Игровая сессия: всплеск RTT {latency}", latency=_ms(value.latency_ms))
+            self._append_log(message)
+            return
+        if value.kind != "ended" or value.summary is None:
+            return
+        summary = value.summary
+        message = self._translator.format(
+            "Игровая сессия завершена: потери {loss}% · всплесков RTT: {spikes}",
+            loss=f"{summary.loss_percent:.1f}",
+            spikes=summary.spike_count,
+        )
+        self.game_monitor_status.setText(message)
+        self._set_header_anomaly(
+            "warning" if summary.loss_percent > 0 or summary.spike_count else "good",
+            "Игровая сессия завершена: потери {loss}% · всплесков RTT: {spikes}",
+            loss=f"{summary.loss_percent:.1f}",
+            spikes=summary.spike_count,
+        )
+        self._append_log(message)
+        auto_was_active = self._auto_monitor_active
+        self._stop_auto_monitors("game_ended")
+        if auto_was_active:
+            self._record_journal_event(
+                "monitor.auto_stopped",
+                subject=value.process_name,
+                template="Автомониторинг остановлен: {reason}",
+                values={"reason": "игровая сессия завершена", "pid": value.pid},
+            )
+        self._record_journal_event(
+            "game.session_ended",
+            severity="warning" if summary.loss_percent or summary.spike_count else "info",
+            subject=value.process_name,
+            template="Игровая сессия завершена: потери {loss}% · всплесков RTT: {spikes}",
+            values={
+                "loss": f"{summary.loss_percent:.1f}",
+                "spikes": summary.spike_count,
+            },
+            refs={"pid": value.pid},
+        )
+
+    def _start_auto_monitor_probe(self, process_name: str, pid: int) -> None:
+        if self._auto_monitor_thread and self._auto_monitor_thread.isRunning():
+            return
+        thread = QThread(self)
+        worker = GameAutoCheckWorker(process_name)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(lambda result, pid=pid: self._on_auto_monitor_probe_completed(result, pid))
+        worker.completed.connect(thread.quit)
+        self._worker_registry.retain(thread, worker)
+        thread.finished.connect(self._clear_auto_monitor_probe)
+        self._auto_monitor_thread = thread
+        self._auto_monitor_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_auto_monitor_probe_completed(self, value: object, pid: int) -> None:
+        if not isinstance(value, GameAutoCheckResult):
+            return
+        connection = value.selected_connection
+        process = value.process
+        if process is None or connection is None or not connection.remote_address:
+            self._append_log("Автомониторинг: endpoint игры не найден")
+            return
+        self._selected_process = process
+        self._selected_connection = connection
+        self.target_input.setText(connection.remote_address)
+        self.port_input.setValue(connection.remote_port)
+        self._start_latency_monitor(connection.remote_address, connection.remote_port)
+        if connection.protocol == "UDP":
+            self._start_udp_port_monitor(pid)
+        self._auto_monitor_active = True
+        self._record_journal_event(
+            "monitor.auto_started",
+            subject=process.name,
+            template="Автомониторинг запущен: {endpoint}",
+            values={
+                "actor": "auto",
+                "endpoint": connection.remote_endpoint,
+                "process": process.name,
+                "pid": pid,
+            },
+            refs={"actor": "auto", "pid": pid, "protocol": connection.protocol},
+        )
+        self._append_log(f"Автомониторинг: {connection.remote_endpoint}")
+
+    def _stop_auto_monitors(self, reason: str) -> None:
+        if not self._auto_monitor_active:
+            return
+        self._stop_latency_monitor()
+        self._stop_udp_port_monitor()
+        self._auto_monitor_active = False
+        self._append_log(f"Автомониторинг остановлен: {reason}")
+
+    @Slot()
+    def _clear_auto_monitor_probe(self) -> None:
+        if self.sender() is not self._auto_monitor_thread:
+            return
+        self._auto_monitor_thread = None
+        self._auto_monitor_worker = None
+
+    @Slot()
+    def _clear_game_launch_monitor(self) -> None:
+        if self.sender() is not self._game_monitor_thread:
+            return
+        self._game_monitor_thread = None
+        self._game_monitor_worker = None
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        action_running = any(thread.isRunning() for thread in self._system_action_threads)
-        process_scan_running = bool(
-            self._process_scan_thread and self._process_scan_thread.isRunning()
-        )
-        network_boost_scan_running = bool(
-            self._network_boost_scan_thread and self._network_boost_scan_thread.isRunning()
-        )
-        network_boost_termination_running = bool(
-            self._network_boost_terminate_thread and self._network_boost_terminate_thread.isRunning()
-        )
-        quality_running = bool(self._quality_thread and self._quality_thread.isRunning())
-        dns_benchmark_running = bool(
-            self._dns_benchmark_thread and self._dns_benchmark_thread.isRunning()
-        )
-        dns_configuration_running = bool(
-            self._dns_config_thread and self._dns_config_thread.isRunning()
-        )
-        ping_benchmark_running = bool(
-            self._ping_benchmark_thread and self._ping_benchmark_thread.isRunning()
-        )
-        tcp_diagnostics_running = bool(
-            self._tcp_diagnostics_thread and self._tcp_diagnostics_thread.isRunning()
-        )
-        tls_audit_running = bool(self._tls_audit_thread and self._tls_audit_thread.isRunning())
-        loss_analysis_running = bool(
-            self._loss_test_thread and self._loss_test_thread.isRunning()
-        )
-        if (
-            (self._thread and self._thread.isRunning())
-            or action_running
+        action_running = any(_is_thread_alive(thread) for thread in self._system_action_threads)
+        if action_running:
+            event.ignore()
+            QMessageBox.information(
+                self,
+                "Операция выполняется",
+                "Дождитесь завершения текущего системного действия перед закрытием NetVision.",
+            )
+            return
+        process_scan_running = _is_thread_alive(self._process_scan_thread)
+        process_sockets_running = _is_thread_alive(self._process_sockets_thread)
+        network_boost_scan_running = _is_thread_alive(self._network_boost_scan_thread)
+        network_boost_termination_running = _is_thread_alive(self._network_boost_terminate_thread)
+        quality_running = _is_thread_alive(self._quality_thread)
+        dns_benchmark_running = _is_thread_alive(self._dns_benchmark_thread)
+        dns_configuration_running = _is_thread_alive(self._dns_config_thread)
+        ping_benchmark_running = _is_thread_alive(self._ping_benchmark_thread)
+        mtu_optimizer_running = _is_thread_alive(self._mtu_optimizer_thread)
+        tcp_diagnostics_running = _is_thread_alive(self._tcp_diagnostics_thread)
+        tls_audit_running = _is_thread_alive(self._tls_audit_thread)
+        loss_analysis_running = _is_thread_alive(self._loss_test_thread)
+        udp_stress_running = _is_thread_alive(self._udp_stress_thread)
+        traceroute_running = _is_thread_alive(self._traceroute_thread)
+        blocking_operation = (
+            _is_thread_alive(self._thread)
             or process_scan_running
+            or process_sockets_running
             or network_boost_scan_running
             or network_boost_termination_running
             or quality_running
             or dns_benchmark_running
             or dns_configuration_running
             or ping_benchmark_running
+            or mtu_optimizer_running
             or tcp_diagnostics_running
             or tls_audit_running
             or loss_analysis_running
+            or udp_stress_running
+            or traceroute_running
+        )
+        monitor_active = any(
+            _is_thread_alive(thread)
+            for thread in (
+                self._latency_thread,
+                self._udp_monitor_thread,
+                self._game_monitor_thread,
+                self._mtr_thread,
+                self._wifi_thread,
+            )
+        )
+        tray = getattr(self, "_network_health_tray", None)
+        if (
+            self._background_enabled
+            and tray is not None
+            and tray.isSystemTrayAvailable()
+            and not self._quit_requested
+            and monitor_active
+            and not blocking_operation
+        ):
+            event.ignore()
+            first_background_hide = not self._background_hidden
+            self._background_hidden = True
+            self.hide()
+            if first_background_hide:
+                self._record_journal_event(
+                    "app.background_entered",
+                    subject="application",
+                    template="Приложение продолжает мониторинг в фоне",
+                )
+                if not self._notifications_paused:
+                    tray.showMessage(
+                        "NetVision",
+                        "Мониторинг продолжается в системном трее",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        4000,
+                    )
+            return
+        if self._bufferbloat_worker is not None:
+            self._bufferbloat_worker.stop()
+        self.stop_mtr_monitor("shutdown")
+        if (
+            _is_thread_alive(self._thread)
+            or process_scan_running
+            or process_sockets_running
+            or network_boost_scan_running
+            or network_boost_termination_running
+            or quality_running
+            or dns_benchmark_running
+            or dns_configuration_running
+            or ping_benchmark_running
+            or mtu_optimizer_running
+            or tcp_diagnostics_running
+            or tls_audit_running
+            or loss_analysis_running
+            or udp_stress_running
+            or traceroute_running
         ):
             event.ignore()
             QMessageBox.information(
@@ -7213,8 +10769,17 @@ class MainWindow(QMainWindow):
             return
         self._closing = True
         self._session_timer.stop()
+        self._sync_jitter_episode(
+            "closed",
+            self._jitter_episode_tracker.close("shutdown"),
+        )
+        self._sync_rtt_episode_log(
+            "closed",
+            self._rtt_episode_tracker.close("shutdown"),
+        )
         self._stop_latency_monitor()
         self._stop_udp_port_monitor()
+        self._stop_game_launch_monitor()
         self._worker_registry.stop_all()
         if self._worker_registry.busy:
             self.setEnabled(False)
@@ -7222,6 +10787,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         event.accept()
+        QApplication.quit()
 
     @Slot()
     def _finish_monitor_shutdown(self) -> None:
@@ -7230,17 +10796,19 @@ class MainWindow(QMainWindow):
 
 
 def _is_background_cdn(address: str) -> bool:
-    normalized = address.strip().casefold()
-    return normalized.startswith(
-        (
-            "104.18.",
-            "104.19.",
-            "172.64.",
-            "172.65.",
-            "162.158.",
-            "162.159.",
-        )
+    """Exclude Cloudflare edge endpoints before selecting a game target."""
+    try:
+        candidate = ipaddress.ip_address(address.strip())
+    except ValueError:
+        return False
+    cloudflare_ranges = (
+        ipaddress.ip_network("104.16.0.0/12"),
+        ipaddress.ip_network("172.64.0.0/13"),
+        ipaddress.ip_network("162.158.0.0/15"),
+        ipaddress.ip_network("188.114.96.0/20"),
+        ipaddress.ip_network("2606:4700::/32"),
     )
+    return any(candidate in network for network in cloudflare_ranges)
 
 
 def _is_game_remote_port(port: int) -> bool:
@@ -7257,13 +10825,59 @@ def _is_game_remote_port(port: int) -> bool:
     )
 
 
-def _game_connection_key(connection: ProcessConnection) -> tuple[int, int, int, str]:
-    return (
-        0 if _is_game_remote_port(connection.remote_port) else 1,
-        0 if connection.protocol == "UDP" else 1,
-        0 if connection.status == "ESTABLISHED" else 1,
-        connection.remote_address,
+_GAME_RULES: tuple[tuple[str, Callable[[ProcessConnection], bool]], ...] = (
+    (
+        "UDP + игровой порт",
+        lambda connection: connection.protocol == "UDP"
+        and _is_game_remote_port(connection.remote_port),
+    ),
+    (
+        "UDP + известный удалённый порт",
+        lambda connection: connection.protocol == "UDP" and connection.remote_port > 0,
+    ),
+    ("Игровой удалённый порт", lambda connection: _is_game_remote_port(connection.remote_port)),
+    ("Установленное соединение", lambda connection: connection.status == "ESTABLISHED"),
+    ("Известный удалённый порт", lambda connection: connection.remote_port > 0),
+)
+
+
+def _game_connection_key(connection: ProcessConnection) -> tuple[int, int, int, int, int, str]:
+    """Rank likely in-match sockets before generic client connections."""
+    priorities = tuple(
+        0 if predicate(connection) else 1
+        for _, predicate in _GAME_RULES
     )
+    return (*priorities, connection.remote_address)
+
+
+def _explain_game_connection(
+    selected: ProcessConnection | None,
+    candidates: tuple[ProcessConnection, ...],
+) -> EndpointChoice | None:
+    if selected is None:
+        return None
+    remote_candidates = tuple(item for item in candidates if item.remote_address)
+    non_cdn_candidates = tuple(
+        item for item in remote_candidates if not _is_background_cdn(item.remote_address)
+    )
+    for rule, predicate in _GAME_RULES:
+        if predicate(selected):
+            return EndpointChoice(
+                connection=selected,
+                rule=rule,
+                candidates=len(non_cdn_candidates),
+                excluded_cdn=len(remote_candidates) - len(non_cdn_candidates),
+            )
+    return EndpointChoice(
+        connection=selected,
+        rule="Известный удалённый порт",
+        candidates=len(non_cdn_candidates),
+        excluded_cdn=len(remote_candidates) - len(non_cdn_candidates),
+    )
+
+
+def _optional_rounded(value: object) -> float | None:
+    return round(float(value), 1) if isinstance(value, (int, float)) else None
 
 
 def _ms(value: float | None) -> str:
@@ -7272,6 +10886,10 @@ def _ms(value: float | None) -> str:
 
 def _speed(value: float | None) -> str:
     return "--" if value is None else f"{value:.1f} Мбит/с"
+
+
+def _bufferbloat_speed(value: float | None) -> str:
+    return "--" if value is None else f"{value:.1f} Mbps"
 
 
 def _tls_datetime(value: datetime | None) -> str:
@@ -7296,46 +10914,50 @@ def _tls_state_color(state: str) -> QColor:
     }.get(state, QColor("#8A99AD"))
 
 
-def _jitter_state(value: float | None) -> str:
+def _jitter_state(value: float | None, th: Thresholds = DEFAULT_THRESHOLDS) -> str:
     if value is None:
         return "neutral"
-    if value > 30:
+    if value > th.jitter_bad_ms:
         return "bad"
-    if value > 15:
+    if value > th.jitter_spike_ms:
         return "warning"
     return "good"
 
 
-def _voice_jitter_rating(value: float | None) -> str:
+def _voice_jitter_rating(value: float | None, th: Thresholds = DEFAULT_THRESHOLDS) -> str:
     if value is None:
         return "N/A"
     if value <= 5:
         return "Отлично"
-    if value <= 15:
+    if value <= th.jitter_spike_ms:
         return "Допустимо"
-    if value <= 30:
+    if value <= th.jitter_bad_ms:
         return "Рывки"
     return "Плохо"
 
 
-def _gaming_jitter_rating(value: float | None) -> str:
+def _gaming_jitter_rating(value: float | None, th: Thresholds = DEFAULT_THRESHOLDS) -> str:
     if value is None:
         return "N/A"
     if value <= 5:
         return "Стабильно"
-    if value <= 15:
+    if value <= th.jitter_spike_ms:
         return "Играбельно"
-    if value <= 30:
+    if value <= th.jitter_bad_ms:
         return "Микрофризы"
     return "Нестабильно"
 
 
-def _jitter_stability_rating(value: float | None, spike_count: int) -> str:
+def _jitter_stability_rating(
+    value: float | None,
+    spike_count: int,
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> str:
     if value is None:
         return "Нестабильно" if spike_count else "Ожидание"
-    if value > 30 or spike_count >= 3:
+    if value > th.jitter_bad_ms or spike_count >= th.episode_quiet_samples:
         return "Критично"
-    if value > 15 or spike_count:
+    if value > th.jitter_spike_ms or spike_count:
         return "Есть колебания"
     return "Стабильно"
 
@@ -7350,6 +10972,14 @@ def _udp_event_color(event: UdpEventRow) -> QColor:
     return QColor("#8A99AD")
 
 
+def _journal_event_color(severity: str) -> QColor:
+    if severity == "error":
+        return QColor("#FF4757")
+    if severity == "warning":
+        return QColor("#FFB800")
+    return QColor("#00E5A3")
+
+
 def _latency(value: float | None) -> str:
     return "--" if value is None else f"{value:.1f} мс"
 
@@ -7360,14 +10990,14 @@ def _latency_state(value: float | None, warning_threshold: float) -> str:
     return "good" if value <= warning_threshold else "bad"
 
 
-def _ping_verdict(value: float | None) -> str:
+def _ping_verdict(value: float | None, th: Thresholds = DEFAULT_THRESHOLDS) -> str:
     if value is None:
         return "Нет ответа от сервера"
-    if value < 30:
+    if value < th.jitter_bad_ms:
         return "Отлично для игр и звонков"
-    if value <= 80:
+    if value <= th.rtt_normal_ms:
         return "Нормально для веб-серфинга"
-    if value > 100:
+    if value > th.rtt_high_ms:
         return "Высокая задержка"
     return "Задержка выше комфортной"
 
@@ -7376,12 +11006,12 @@ def _loss_verdict(loss_percent: float) -> str:
     return "Связь стабильная" if loss_percent == 0 else "Возможны фризы и задержки"
 
 
-def _jitter_verdict(value: float | None) -> str:
+def _jitter_verdict(value: float | None, th: Thresholds = DEFAULT_THRESHOLDS) -> str:
     if value is None:
         return "Стабильность не удалось оценить"
-    if value <= 10:
+    if value <= th.jitter_clear_ms:
         return "Связь ровная, без заметных скачков"
-    if value <= 20:
+    if value <= th.jitter_critical_ms:
         return "Небольшие колебания связи"
     return "Задержка заметно скачет"
 
@@ -7391,10 +11021,10 @@ def _lite_summary_cards(report: DiagnosticReport) -> tuple[tuple[str, str, str],
     if report.dns.status == ProbeStatus.SUCCESS and dns_latency is not None:
         dns_value = (
             f"{dns_latency:.1f} мс (Быстрый отклик)"
-            if dns_latency <= 30
+            if dns_latency <= DEFAULT_THRESHOLDS.dns_good_ms
             else f"{dns_latency:.1f} мс (Медленный отклик)"
         )
-        dns_state = "good" if dns_latency <= 80 else "bad"
+        dns_state = "good" if dns_latency <= DEFAULT_THRESHOLDS.dns_ok_ms else "bad"
     else:
         dns_value = "Нет ответа"
         dns_state = "bad"
@@ -7430,4 +11060,49 @@ def _severity_label(severity: object) -> str:
         "warning": "ПРЕДУПРЕЖДЕНИЕ",
         "info": "ИНФОРМАЦИЯ",
     }.get(str(severity), "РЕЗУЛЬТАТ")
+
+
+def _wifi_roamed(previous: WifiSnapshot, current: WifiSnapshot) -> bool:
+    return any(
+        getattr(previous, field) != getattr(current, field)
+        for field in ("bssid", "channel", "band")
+    )
+
+
+def _wifi_route_signature(snapshot: WifiSnapshot) -> str:
+    return " / ".join(
+        value or "--"
+        for value in (snapshot.bssid, snapshot.band, snapshot.channel)
+    )
+
+
+def _format_wifi_snapshot(snapshot: WifiSnapshot) -> str:
+    signal = "--" if snapshot.signal_pct is None else f"{snapshot.signal_pct}%"
+    gateway = _ms(snapshot.gateway_rtt_ms)
+    return (
+        f"Wi-Fi: {snapshot.interface_name} · {snapshot.ssid or '--'} · "
+        f"сигнал {signal} · {snapshot.band or '--'} · канал {snapshot.channel or '--'} · "
+        f"RX {snapshot.rx_mbps or 0:.1f} / TX {snapshot.tx_mbps or 0:.1f} Мбит/с · "
+        f"шлюз {gateway}"
+    )
+
+
+def _wifi_correlation_evidence(
+    snapshot: WifiSnapshot | None,
+    signal_low: bool,
+    event_kinds: set[str],
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> tuple[bool, list[str]]:
+    evidence: list[str] = []
+    if "wifi.roam" in event_kinds:
+        evidence.append("roaming")
+    if signal_low or "wifi.signal_low" in event_kinds:
+        evidence.append("низкий сигнал")
+    if (
+        snapshot is not None
+        and snapshot.gateway_rtt_ms is not None
+        and snapshot.gateway_rtt_ms > th.wifi_gateway_rtt_warn_ms
+    ):
+        evidence.append(f"шлюз {snapshot.gateway_rtt_ms:.1f} мс")
+    return bool(evidence), evidence
 

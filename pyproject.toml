@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netvision"
-version = "0.8.0"
+dynamic = ["version"]
 description = "Visual network diagnostics for Windows"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.8,<7",
     "psutil>=6.1,<8",
+    "cryptography>=43,<47",
 ]
 
 [project.gui-scripts]
@@ -18,4 +19,7 @@ netvision = "netvision.app:main"
 
 [tool.setuptools.packages.find]
 include = ["netvision*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "netvision.version.__version__"}
 

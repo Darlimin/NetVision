@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from netvision.models import DiagnosticReport, ProbeStatus
+from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,18 +719,18 @@ def _marker_gradient(color: QColor, center: QPointF, radius: float) -> QRadialGr
     return gradient
 
 
-def _latency_color(sample: LatencySample) -> QColor:
-    if not sample.success or sample.latency_ms is None or sample.latency_ms > 100:
+def _latency_color(sample: LatencySample, th: Thresholds = DEFAULT_THRESHOLDS) -> QColor:
+    if not sample.success or sample.latency_ms is None or sample.latency_ms > th.rtt_high_ms:
         return QColor("#FF4757")
     if sample.latency_ms > 50:
         return QColor("#FFB800")
     return QColor("#00E5A3")
 
 
-def _jitter_color(value: float) -> QColor:
-    if value > 30:
+def _jitter_color(value: float, th: Thresholds = DEFAULT_THRESHOLDS) -> QColor:
+    if value > th.jitter_bad_ms:
         return QColor("#FF4757")
-    if value > 15:
+    if value > th.jitter_spike_ms:
         return QColor("#FFB800")
     return QColor("#00E5A3")
 

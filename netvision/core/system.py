@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 import psutil
 
-from netvision.models import DefaultRoute, GatewayInfo, NetworkInterface, SystemSnapshot
+from netvision.core.probes import _oem_encoding
+from netvision.models import DefaultRoute, GatewayInfo, NetworkInterface, SystemSnapshot, WifiSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,92 @@ def collect_dns_configuration() -> DnsConfiguration:
         if interface.is_up and interface.kind != "Loopback"
     )
     return DnsConfiguration(adapters, _collect_dns_servers())
+
+
+def parse_wifi_interfaces_output(text: str) -> list[WifiSnapshot]:
+    """Parse ``netsh wlan show interfaces`` in English and Russian Windows locales."""
+    snapshots: list[WifiSnapshot] = []
+    current: dict[str, str] = {}
+    aliases = {
+        "name": "interface_name",
+        "имя": "interface_name",
+        "state": "state",
+        "состояние": "state",
+        "ssid": "ssid",
+        "bssid": "bssid",
+        "radio type": "radio_type",
+        "тип радиосети": "radio_type",
+        "band": "band",
+        "диапазон": "band",
+        "channel": "channel",
+        "канал": "channel",
+        "signal": "signal_pct",
+        "сигнал": "signal_pct",
+        "receive rate (mbps)": "rx_mbps",
+        "скорость приёма (мбит/с)": "rx_mbps",
+        "скорость приема (мбит/с)": "rx_mbps",
+        "transmit rate (mbps)": "tx_mbps",
+        "скорость передачи (мбит/с)": "tx_mbps",
+    }
+
+    def flush() -> None:
+        if current.get("state", "").casefold() not in {"connected", "подключено"}:
+            current.clear()
+            return
+        interface_name = current.get("interface_name")
+        if not interface_name:
+            current.clear()
+            return
+        snapshots.append(
+            WifiSnapshot(
+                interface_name=interface_name,
+                ssid=_optional_text(current.get("ssid")),
+                bssid=_optional_text(current.get("bssid")),
+                radio_type=_optional_text(current.get("radio_type")),
+                band=_optional_text(current.get("band")),
+                channel=_optional_text(current.get("channel")),
+                signal_pct=_parse_percent(current.get("signal_pct")),
+                rx_mbps=_parse_rate_mbps(current.get("rx_mbps")),
+                tx_mbps=_parse_rate_mbps(current.get("tx_mbps")),
+            )
+        )
+        current.clear()
+
+    for line in text.splitlines():
+        match = re.match(r"^\s*([^:]+?)\s*:\s*(.*?)\s*$", line)
+        if match is None:
+            continue
+        key, value = match.groups()
+        field = aliases.get(key.casefold())
+        if field is None:
+            continue
+        if field == "interface_name":
+            flush()
+        current[field] = value.strip()
+    flush()
+    return snapshots
+
+
+def collect_wifi_snapshot(route_interface: str | None) -> WifiSnapshot | None:
+    """Return Wi-Fi data only when it belongs to the active route interface."""
+    if not route_interface:
+        return None
+    completed = subprocess.run(
+        ["netsh", "wlan", "show", "interfaces"],
+        capture_output=True,
+        text=False,
+        timeout=8,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = _decode_oem_output(completed.stderr).strip()
+        raise OSError(message or "netsh wlan недоступен")
+    snapshots = parse_wifi_interfaces_output(_decode_oem_output(completed.stdout))
+    return next(
+        (snapshot for snapshot in snapshots if snapshot.interface_name == route_interface),
+        None,
+    )
 
 
 def collect_system_snapshot() -> SystemSnapshot:
@@ -338,4 +425,26 @@ def _is_vpn_name(name: str) -> bool:
 
 def _optional_text(value: object) -> str | None:
     return str(value) if value not in (None, "") else None
+
+
+def _parse_percent(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.search(r"\d+", value)
+    if match is None:
+        return None
+    return max(0, min(100, int(match.group())))
+
+
+def _parse_rate_mbps(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = re.search(r"\d+(?:[.,]\d+)?", value)
+    return float(match.group().replace(",", ".")) if match else None
+
+
+def _decode_oem_output(value: bytes | str | None) -> str:
+    if isinstance(value, str):
+        return value
+    return (value or b"").decode(_oem_encoding(), errors="replace")
 
