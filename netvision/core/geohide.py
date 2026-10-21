@@ -9,6 +9,8 @@ import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from netvision.version import __version__
+
 
 GEOHIDE_URL = "https://geohide.ru/"
 _IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
@@ -204,7 +206,7 @@ def fetch_geohide_dns(timeout: float = 12.0) -> GeoHideResult:
     request = Request(
         GEOHIDE_URL,
         headers={
-            "User-Agent": "NetVision/0.8.0 (Windows; network diagnostics)",
+            "User-Agent": f"NetVision/{__version__} (Windows; network diagnostics)",
             "Accept": "text/html,application/xhtml+xml",
         },
     )
