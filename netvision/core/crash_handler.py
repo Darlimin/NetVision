@@ -18,7 +18,6 @@ from typing import Callable
 
 from netvision.version import display_version
 
-
 _write_lock = threading.Lock()
 _handling = threading.local()
 _installed = False
@@ -145,8 +144,7 @@ def _create_qt_notifier(app: object, qt_core: object, qt_widgets: object) -> obj
                 dialog.setIcon(qt_widgets.QMessageBox.Icon.Critical)  # type: ignore[attr-defined]
                 dialog.setWindowTitle("Ошибка NetVision")
                 dialog.setText(
-                    "Произошла непредвиденная ошибка. "
-                    f"Логи сохранены в {report_path}"
+                    "Произошла непредвиденная ошибка. " f"Логи сохранены в {report_path}"
                 )
                 dialog.setDetailedText(details)
                 copy_button = dialog.addButton(

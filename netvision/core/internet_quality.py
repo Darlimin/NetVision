@@ -6,14 +6,14 @@ import socket
 import time
 from urllib.error import URLError
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from threading import Event
 
 import psutil
 
 from netvision.models import NetworkInterface, SystemSnapshot
-
 
 DOWNLOAD_URLS = (
     "https://speed.cloudflare.com/__down?bytes=10000000",
@@ -180,7 +180,9 @@ def measure_tcp_latency(
                 server_name=target_name,
                 tool="Python TCP connect",
             )
-    return SpeedtestResult(tool="Python TCP connect", error="Не удалось измерить TCP-пинг: " + " | ".join(errors))
+    return SpeedtestResult(
+        tool="Python TCP connect", error="Не удалось измерить TCP-пинг: " + " | ".join(errors)
+    )
 
 
 def measure_upload_and_loaded_ping(
@@ -298,11 +300,15 @@ def fetch_public_network_info(
     )
 
 
-def fetch_public_ip_addresses(timeout: int = 5) -> PublicIpAddresses:
+def fetch_public_ip_addresses(
+    timeout: int = 5, *, cancel_event: Event | None = None
+) -> PublicIpAddresses:
     """Resolve public IPv4 and IPv6 independently without Geo API parsing."""
     values: dict[int, str] = {}
     errors: list[str] = []
     for version, url in PUBLIC_IP_URLS:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         request = urllib.request.Request(url, headers=REQUEST_HEADERS)
         try:
             with _open_request(request, timeout) as response:
@@ -326,7 +332,9 @@ def parse_public_network_json(payload: object, source: str = "Geo API") -> Publi
     if not isinstance(payload, dict):
         return PublicNetworkInfo(source=source, error="Geo API вернул не JSON-объект")
     if payload.get("success") is False or payload.get("status") == "fail":
-        return PublicNetworkInfo(source=source, error=_text(payload.get("message")) or "Geo API отклонил запрос")
+        return PublicNetworkInfo(
+            source=source, error=_text(payload.get("message")) or "Geo API отклонил запрос"
+        )
 
     connection = payload.get("connection") if isinstance(payload.get("connection"), dict) else {}
     location = payload.get("location") if isinstance(payload.get("location"), dict) else {}
@@ -371,10 +379,7 @@ def collect_local_network_context(snapshot: SystemSnapshot | None = None) -> Loc
     active = physical[0] if physical else (candidates[0] if candidates else None)
     primary_ipv4 = _pick_ipv4(active.ipv4 if active else ())
     vpn_ipv4 = _pick_vpn_ipv4(
-        address
-        for interface in candidates
-        if interface.kind == "VPN"
-        for address in interface.ipv4
+        address for interface in candidates if interface.kind == "VPN" for address in interface.ipv4
     )
     visible_ipv4 = tuple(dict.fromkeys(address for address in (primary_ipv4, vpn_ipv4) if address))
     all_ipv4 = tuple(address for interface in interfaces for address in interface.ipv4)
@@ -417,9 +422,8 @@ def run_internet_quality_check(
         loaded_ping_ms=upload.loaded_ping_ms,
         server_name=latency.server_name or upload.server_name,
         tool=f"{download.tool}; {latency.tool}; {upload.tool}",
-        error=" | ".join(
-            error for error in (download.error, latency.error, upload.error) if error
-        ) or None,
+        error=" | ".join(error for error in (download.error, latency.error, upload.error) if error)
+        or None,
     )
     errors = tuple(error for error in (speedtest.error, network.error) if error)
     return InternetQualityReport(speedtest=speedtest, network=network, local=local, errors=errors)
@@ -433,15 +437,24 @@ def build_smart_report(
     speed = report.speedtest
     network = report.network
     local = report.local
-    location = ", ".join(value for value in (network.city, network.region) if value) or tr("не определён")
-    if local.vpn_detected or local.proxy_detected or network.vpn_detected is True or network.proxy_detected is True:
+    location = ", ".join(value for value in (network.city, network.region) if value) or tr(
+        "не определён"
+    )
+    if (
+        local.vpn_detected
+        or local.proxy_detected
+        or network.vpn_detected is True
+        or network.proxy_detected is True
+    ):
         vpn_proxy = tr("обнаружен VPN/прокси")
     elif network.vpn_detected is False and network.proxy_detected is False:
         vpn_proxy = tr("не обнаружен")
     else:
         vpn_proxy = tr("не определён")
+
     def format_speed(value: float | int | None) -> str:
         return _format_speed(value) if value is not None else tr("не измерена")
+
     lines = [
         tr("Скорость скачивания: {speed}.").format(speed=format_speed(speed.download_mbps)),
         tr("Скорость отдачи: {speed}.").format(speed=format_speed(speed.upload_mbps)),
@@ -487,8 +500,12 @@ def _merge_network_info(results: Sequence[PublicNetworkInfo]) -> PublicNetworkIn
         isp=next((item.isp for item in results if item.isp), None),
         region=next((item.region for item in results if item.region), None),
         city=next((item.city for item in results if item.city), None),
-        vpn_detected=next((item.vpn_detected for item in results if item.vpn_detected is not None), None),
-        proxy_detected=next((item.proxy_detected for item in results if item.proxy_detected is not None), None),
+        vpn_detected=next(
+            (item.vpn_detected for item in results if item.vpn_detected is not None), None
+        ),
+        proxy_detected=next(
+            (item.proxy_detected for item in results if item.proxy_detected is not None), None
+        ),
         source=" + ".join(dict.fromkeys(item.source for item in results)),
     )
 
@@ -499,7 +516,11 @@ def _collect_interfaces() -> tuple[NetworkInterface, ...]:
     result: list[NetworkInterface] = []
     for name, addresses in addresses_by_name.items():
         ipv4 = tuple(address.address for address in addresses if address.family == socket.AF_INET)
-        ipv6 = tuple(address.address.split("%", 1)[0] for address in addresses if address.family == socket.AF_INET6)
+        ipv6 = tuple(
+            address.address.split("%", 1)[0]
+            for address in addresses
+            if address.family == socket.AF_INET6
+        )
         stats = statistics.get(name)
         result.append(
             NetworkInterface(
@@ -518,7 +539,22 @@ def _interface_kind(name: str) -> str:
     normalized = name.casefold()
     if any(token in normalized for token in ("wi-fi", "wifi", "wireless", "wlan")):
         return "Wi-Fi"
-    if any(token in normalized for token in ("vpn", "tap", "tun", "wireguard", "wintun", "happ", "xray", "clash", "tailscale", "zerotier", "nordlynx")):
+    if any(
+        token in normalized
+        for token in (
+            "vpn",
+            "tap",
+            "tun",
+            "wireguard",
+            "wintun",
+            "happ",
+            "xray",
+            "clash",
+            "tailscale",
+            "zerotier",
+            "nordlynx",
+        )
+    ):
         return "VPN"
     if any(token in normalized for token in ("ethernet", "lan")):
         return "Ethernet"
@@ -534,7 +570,12 @@ def _pick_ipv4(addresses: Iterable[str]) -> str | None:
             address = ipaddress.ip_address(value)
         except ValueError:
             continue
-        if isinstance(address, ipaddress.IPv4Address) and not (address.is_loopback or address.is_link_local or address.is_unspecified or address.is_multicast):
+        if isinstance(address, ipaddress.IPv4Address) and not (
+            address.is_loopback
+            or address.is_link_local
+            or address.is_unspecified
+            or address.is_multicast
+        ):
             usable.append(str(address))
     return min(usable, key=_ipv4_preference) if usable else None
 
@@ -543,7 +584,11 @@ def _pick_vpn_ipv4(addresses: Iterable[str]) -> str | None:
     usable = tuple(address for address in addresses if _pick_ipv4((address,)) == address)
     if not usable:
         return None
-    vpn = [value for value in usable if ipaddress.ip_address(value) in ipaddress.ip_network("172.16.0.0/12")]
+    vpn = [
+        value
+        for value in usable
+        if ipaddress.ip_address(value) in ipaddress.ip_network("172.16.0.0/12")
+    ]
     return vpn[0] if vpn else usable[0]
 
 

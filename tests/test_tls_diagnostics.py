@@ -24,8 +24,8 @@ class _SecureSocket:
         if binary_form:
             return b"test-certificate"
         return {
-            "subject": ((('commonName', 'example.test'),),),
-            "issuer": ((('commonName', 'NetVision Test CA'),),),
+            "subject": ((("commonName", "example.test"),),),
+            "issuer": ((("commonName", "NetVision Test CA"),),),
             "serialNumber": "01AB",
             "notBefore": "Jan  1 00:00:00 2026 GMT",
             "notAfter": "Jan  1 00:00:00 2099 GMT",
@@ -75,8 +75,8 @@ def test_audit_tls_endpoint_collects_certificate_and_fingerprint() -> None:
 def test_certificate_record_marks_expired_certificate() -> None:
     record = tls_diagnostics._certificate_record(
         {
-            "subject": ((('commonName', 'expired.test'),),),
-            "issuer": ((('commonName', 'Test CA'),),),
+            "subject": ((("commonName", "expired.test"),),),
+            "issuer": ((("commonName", "Test CA"),),),
             "notAfter": "Jan  1 00:00:00 2020 GMT",
         },
         b"expired-certificate",

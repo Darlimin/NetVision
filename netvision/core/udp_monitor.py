@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 import ctypes
 from ctypes import wintypes
@@ -19,7 +19,6 @@ import socket
 from threading import Event, RLock, Thread, current_thread
 
 import psutil
-
 
 AF_INET = 2
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -81,9 +80,11 @@ class UdpPortHistory:
     ) -> UdpPortActivity:
         """Record a snapshot and return opened/closed ports with any anomaly."""
 
-        timestamp = observed_at or datetime.now(timezone.utc)
+        timestamp = observed_at or datetime.now().astimezone()
         if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
+            timestamp = timestamp.astimezone()
+        else:
+            timestamp = timestamp.astimezone()
         current_ports = frozenset(snapshot.ports)
         opened: tuple[int, ...] = ()
         closed: tuple[int, ...] = ()
@@ -95,7 +96,11 @@ class UdpPortHistory:
             closed = tuple(sorted(self._previous_ports - current_ports))
             if self._previous_ports and not current_ports:
                 anomaly = UdpPortAnomaly.ALL_PORTS_LOST
-            elif self._previous_ports and current_ports and not (current_ports & self._previous_ports):
+            elif (
+                self._previous_ports
+                and current_ports
+                and not (current_ports & self._previous_ports)
+            ):
                 anomaly = UdpPortAnomaly.FULL_PORT_ROTATION
 
         activity = UdpPortActivity(snapshot, timestamp, opened, closed, anomaly)

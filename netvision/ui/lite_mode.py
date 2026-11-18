@@ -36,8 +36,7 @@ def summarize_report(
 
     has_warning = (
         report.dns.status != ProbeStatus.SUCCESS
-        or
-        report.ping.status != ProbeStatus.SUCCESS
+        or report.ping.status != ProbeStatus.SUCCESS
         or report.ping.loss_percent > 0
         or report.ping.jitter_ms is None
         or report.ping.jitter_ms > th.jitter_critical_ms

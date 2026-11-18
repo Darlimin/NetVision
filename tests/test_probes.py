@@ -15,6 +15,14 @@ from netvision.reporting import _redact_proxy_credentials
 
 
 class TracertParserTests(unittest.TestCase):
+    def test_tracert_uses_native_rows_when_available(self) -> None:
+        import sys
+        from types import SimpleNamespace
+
+        parser = SimpleNamespace(parse_tracert_rows=lambda _lines: [("2", "* timeout", [])])
+        with patch.dict(sys.modules, {"netvision_rs": parser}):
+            self.assertTrue(parse_tracert_output("arbitrary")[0].timed_out)
+
     def test_parses_hops_and_average_latency(self) -> None:
         output = """
           1    <1 ms     1 ms     2 ms  192.168.1.1
@@ -51,6 +59,15 @@ class TracertParserTests(unittest.TestCase):
 
 
 class PingParserTests(unittest.TestCase):
+    def test_native_parser_is_used_when_available(self) -> None:
+        from types import SimpleNamespace
+        import sys
+
+        with patch.dict(
+            sys.modules, {"netvision_rs": SimpleNamespace(parse_ping_output=lambda _text: [3.5])}
+        ):
+            self.assertEqual(parse_ping_samples("input"), (3.5,))
+
     def test_parses_english_and_russian_ping_responses(self) -> None:
         output = "Reply time=12ms\nОтвет время<1мс\ntime=15.5 ms"
         self.assertEqual(parse_ping_samples(output), (12.0, 0.5, 15.5))
@@ -158,4 +175,3 @@ class DnsServerNormalizerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

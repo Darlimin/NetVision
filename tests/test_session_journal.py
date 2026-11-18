@@ -8,10 +8,17 @@ from netvision.core.session_journal import (
     JournalStore,
     Layer,
     SessionJournal,
+    _as_aware,
 )
 
 
 class SessionJournalTests(unittest.TestCase):
+    def test_naive_timestamp_is_interpreted_as_local_time(self) -> None:
+        localized = _as_aware(datetime(2026, 10, 20, 12, 0, 0))
+
+        self.assertIsNotNone(localized.tzinfo)
+        self.assertEqual(localized.hour, 12)
+
     def test_records_are_persisted_and_loaded_with_aware_time(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "event_journal.jsonl"

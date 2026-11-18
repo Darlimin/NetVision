@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=75", "maturin>=1.7,<2"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,8 +18,33 @@ dependencies = [
 netvision = "netvision.app:main"
 
 [tool.setuptools.packages.find]
-include = ["netvision*"]
+include = ["netvision", "netvision.*"]
+
+# Build the optional Rust extension from netvision_rs/ with:
+# ..\.venv\Scripts\maturin.exe develop
 
 [tool.setuptools.dynamic]
 version = {attr = "netvision.version.__version__"}
 
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["backups", "release"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 9
+
+[tool.black]
+target-version = ["py311"]
+line-length = 100
+extend-exclude = "(^/backups/|^/release/)"
+
+
+[tool.pytest.ini_options]
+addopts = "--basetemp=.pytest-temp"
+testpaths = ["tests"]
+python_files = ["test_*.py"]

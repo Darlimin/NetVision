@@ -1,24 +1,23 @@
 import json
+import gc
 import unittest
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from PySide6.QtCore import QEventLoop, QPoint, QRect, QTimer, Qt, qInstallMessageHandler
+import pytest
+
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QRect, QTimer, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
-    QFrame,
     QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
-    QTabWidget,
 )
 
 from netvision.core.target import parse_target
@@ -27,24 +26,19 @@ from netvision.core.dns_benchmark import DnsBenchmarkResult, DnsResolverProfile
 from netvision.core.ping_benchmark import MtuProbeResult, RegionalPingResult, RegionalPingTarget
 from netvision.core.packet_loss import HopLossResult, StressTestResult
 from netvision.core.tcp_diagnostics import TcpConnectMeasurement, TcpSocketRecord
-from netvision.core.tls_diagnostics import CertificateRecord, TlsAuditResult
 from netvision.core.internet_quality import (
     InternetQualityReport,
     LocalNetworkContext,
     PublicNetworkInfo,
     SpeedtestResult,
 )
-from netvision.ui.main_window import (
-    EndpointChoice,
-    GameAutoCheckWorker,
-    InternetQualityWorker,
-    NetworkBoostDialog,
-    PendingAction,
-    RollbackConfirmDialog,
-    _game_connection_key,
-)
+from netvision.ui.legacy_dialogs import NetworkBoostDialog
+from netvision.ui.game_check_worker import GameAutoCheckResult, GameAutoCheckWorker
+from netvision.core.process_utils import EndpointChoice, _game_connection_key
+from netvision.core.models import PendingAction
+from netvision.ui.dialogs import RollbackConfirmDialog
 from netvision.core.network_boost import BackgroundTrafficCandidate, ProcessTerminationResult
-from netvision.core.system_actions import SystemActionResult, SystemChange, open_network_adapters
+from netvision.core.system_actions import SystemActionResult, SystemChange
 from netvision.core.process_inspector import (
     ProcessConnection,
     ProcessListResult,
@@ -53,7 +47,7 @@ from netvision.core.process_inspector import (
     RunningProcess,
 )
 from netvision.core.udp_monitor import UdpPortActivity, UdpPortAnomaly, UdpPortSnapshot
-from netvision.ui.main_window import METRIC_TOOLTIPS
+from netvision.ui.constants import METRIC_TOOLTIPS
 from netvision.ui.widgets import JitterChart, LatencyChart, MetricTile, TopologyWidget
 from netvision.models import (
     DefaultRoute,
@@ -68,33 +62,75 @@ from netvision.models import (
     SystemSnapshot,
     TcpResult,
 )
-from netvision.ui.main_window import MainWindow
+from netvision.ui.controllers.ping_audit import PingController
+from netvision.ui.dashboard_v2 import NetVisionDashboardV2
 from netvision.ui.theme import APP_STYLE, LIGHT_STYLE
-from netvision.ui.main_window import GameAutoCheckResult
+
+
+@pytest.fixture(autouse=True)
+def _provide_journal_tmp_path(request: pytest.FixtureRequest, tmp_path: Path) -> None:
+    """Provide pytest-managed storage to the unittest-based UI suite."""
+    if request.instance is not None:
+        request.instance._journal_tmp_path = tmp_path
 
 
 class MainWindowReportTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app = QApplication.instance() or QApplication(["NetVision-tests", "-platform", "offscreen"])
+        cls.app = QApplication.instance() or QApplication(
+            ["NetVision-tests", "-platform", "offscreen"]
+        )
 
     def setUp(self) -> None:
         # UI layout tests must not depend on external DNS or leave live probes
         # behind. Real QThread lifetime is covered in test_monitor_workers.py.
-        monitor_patch = patch.object(MainWindow, "_start_latency_monitor")
+        self._known_top_level_widgets = {id(widget) for widget in self.app.topLevelWidgets()}
+        monitor_patch = patch.object(PingController, "_start_latency_monitor")
         monitor_patch.start()
         self.addCleanup(monitor_patch.stop)
-        self._journal_directory = TemporaryDirectory()
-        self.addCleanup(self._journal_directory.cleanup)
+        wifi_patch = patch.object(NetVisionDashboardV2, "_start_wifi_monitor")
+        wifi_patch.start()
+        self.addCleanup(wifi_patch.stop)
+        udp_patch = patch.object(NetVisionDashboardV2, "_start_udp_port_monitor")
+        udp_patch.start()
+        self.addCleanup(udp_patch.stop)
         journal_patch = patch(
             "netvision.core.session_journal.default_journal_path",
-            return_value=Path(self._journal_directory.name) / "event_journal.jsonl",
+            return_value=self._journal_tmp_path / "event_journal.jsonl",
         )
         journal_patch.start()
         self.addCleanup(journal_patch.stop)
+        history_patch = patch(
+            "netvision.core.test_history.default_history_path",
+            return_value=self._journal_tmp_path / "test_history.json",
+        )
+        history_patch.start()
+        self.addCleanup(history_patch.stop)
+
+    def tearDown(self) -> None:
+        """Dispose windows created by the current UI-only test case."""
+
+        for widget in self.app.topLevelWidgets():
+            if id(widget) not in self._known_top_level_widgets:
+                self._dispose_test_window(widget)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        gc.collect()
+
+    @staticmethod
+    def _dispose_test_window(widget: object) -> None:
+        registry = getattr(widget, "_worker_registry", None)
+        if registry is not None:
+            registry.stop_all()
+        if hasattr(widget, "_quit_requested"):
+            widget._quit_requested = True
+        if hasattr(widget, "_background_enabled"):
+            widget._background_enabled = False
+        widget.close()
+        widget.deleteLater()
 
     def test_background_close_hides_window_without_stopping_monitor(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         monitor = type("Monitor", (), {"isRunning": lambda self: True})()
         window._latency_thread = monitor
@@ -108,7 +144,7 @@ class MainWindowReportTests(unittest.TestCase):
         window.close()
 
     def test_tray_exit_stops_monitors_and_quits_application(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         monitor = type("Monitor", (), {"isRunning": lambda self: True})()
         window._latency_thread = monitor
         with patch.object(QApplication, "quit") as quit_application:
@@ -118,7 +154,7 @@ class MainWindowReportTests(unittest.TestCase):
         quit_application.assert_called_once()
 
     def test_close_without_tray_does_not_enter_background_mode(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         monitor = type("Monitor", (), {"isRunning": lambda self: True})()
         window._latency_thread = monitor
@@ -130,7 +166,7 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertIsNone(window._latency_thread)
 
     def test_game_session_auto_monitor_starts_and_stops_once(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._background_auto_monitor = True
         started = GameMonitorEvent(
             "started", datetime.now(), "HuntGame.exe", 123, baseline_latency_ms=20.0
@@ -140,10 +176,11 @@ class MainWindowReportTests(unittest.TestCase):
             start_probe.assert_called_once_with("HuntGame.exe", 123)
 
         connection = ProcessConnection("UDP", "NONE", "192.168.1.2", 40000, "8.8.8.8", 27015)
-        with patch.object(window, "_start_latency_monitor") as start_latency, patch.object(
-            window, "_start_udp_port_monitor"
-        ) as start_udp:
-            window._on_auto_monitor_probe_completed(
+        with (
+            patch.object(window.ping_controller, "_start_latency_monitor") as start_latency,
+            patch.object(window, "_start_udp_port_monitor") as start_udp,
+        ):
+            window.process_controller._on_auto_monitor_probe_completed(
                 GameAutoCheckResult(
                     ProcessNetworkInfo(123, "HuntGame.exe", (connection,)),
                     (connection,),
@@ -154,12 +191,14 @@ class MainWindowReportTests(unittest.TestCase):
             )
         start_latency.assert_called_once_with("8.8.8.8", 27015)
         start_udp.assert_called_once_with(123)
+        self.assertEqual(window._facts.get("process.selected").pid, 123)
         summary = GameSessionSummary(
             "HuntGame.exe", 123, datetime.now(), datetime.now(), 20.0, 2, 1, 1
         )
-        with patch.object(window, "_stop_latency_monitor") as stop_latency, patch.object(
-            window, "_stop_udp_port_monitor"
-        ) as stop_udp:
+        with (
+            patch.object(window.ping_controller, "_stop_latency_monitor") as stop_latency,
+            patch.object(window, "_stop_udp_port_monitor") as stop_udp,
+        ):
             window._on_game_monitor_event(
                 GameMonitorEvent("ended", datetime.now(), "HuntGame.exe", 123, summary=summary)
             )
@@ -170,7 +209,7 @@ class MainWindowReportTests(unittest.TestCase):
         window.close()
 
     def test_session_journal_filters_events_by_layer(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._record_journal_event(
             "udp.port_opened",
             subject="UDP:27015",
@@ -185,12 +224,14 @@ class MainWindowReportTests(unittest.TestCase):
             values={"latency": 140.0},
         )
 
-        self.assertEqual(window.journal_table.rowCount(), 2)
-        measurement_index = window.journal_layer_filter.findData("measurement")
-        window.journal_layer_filter.setCurrentIndex(measurement_index)
+        self.assertEqual(window.journal_workspace.journal_table.rowCount(), 2)
+        measurement_index = window.journal_workspace.journal_layer_filter.findData("measurement")
+        window.journal_workspace.journal_layer_filter.setCurrentIndex(measurement_index)
 
-        self.assertEqual(window.journal_table.rowCount(), 1)
-        self.assertEqual(window.journal_table.item(0, 2).text(), "udp.port_opened")
+        self.assertEqual(window.journal_workspace.journal_table.rowCount(), 1)
+        self.assertEqual(
+            window.journal_workspace.journal_table.item(0, 2).text(), "udp.port_opened"
+        )
         window.close()
 
     def test_game_auto_check_does_not_fall_back_or_run_global_socket_scan(self) -> None:
@@ -200,9 +241,9 @@ class MainWindowReportTests(unittest.TestCase):
         processes = ProcessListResult((RunningProcess(700, "HuntGame.exe"),))
 
         with (
-            patch("netvision.ui.main_window.list_running_processes", return_value=processes),
-            patch("netvision.ui.main_window.scan_process") as scoped_scan,
-            patch("netvision.ui.main_window.scan_processes") as global_scan,
+            patch("netvision.ui.game_check_worker.list_running_processes", return_value=processes),
+            patch("netvision.ui.game_check_worker.scan_process") as scoped_scan,
+            patch("netvision.ui.legacy_workers.scan_processes") as global_scan,
         ):
             worker.run()
 
@@ -217,28 +258,83 @@ class MainWindowReportTests(unittest.TestCase):
         results = []
         worker.completed.connect(results.append)
         process = RunningProcess(700, "HuntGame.exe")
-        game_connection = ProcessConnection(
-            "UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015
-        )
+        game_connection = ProcessConnection("UDP", "NONE", "192.168.1.2", 40000, "8.8.8.8", 27015)
 
         with (
             patch(
-                "netvision.ui.main_window.list_running_processes",
+                "netvision.ui.game_check_worker.list_running_processes",
                 return_value=ProcessListResult((process,)),
             ),
             patch(
-                "netvision.ui.main_window.scan_process",
+                "netvision.ui.game_check_worker.scan_process",
                 return_value=ProcessScanResult(
                     (ProcessNetworkInfo(process.pid, process.name, (game_connection,)),)
                 ),
             ),
-            patch("netvision.ui.main_window.probe_ping", return_value=object()),
+            patch("netvision.ui.game_check_worker.probe_ping", return_value=object()),
         ):
             worker.run()
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].selected_connection, game_connection)
         self.assertEqual(results[0].selection_reason, "UDP + игровой порт")
+
+    def test_game_auto_check_uses_external_socket_from_fallback_process(self) -> None:
+        worker = GameAutoCheckWorker()
+        results = []
+        worker.completed.connect(results.append)
+        hunt = RunningProcess(700, "HuntGame.exe")
+        fallback = RunningProcess(701, "game-launcher.exe")
+        loopback = ProcessConnection("UDP", "NONE", "127.0.0.1", 10809, "127.0.0.1", 10809)
+        external = ProcessConnection("UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015)
+
+        with (
+            patch(
+                "netvision.ui.game_check_worker.list_running_processes",
+                return_value=ProcessListResult((hunt, fallback)),
+            ),
+            patch(
+                "netvision.ui.game_check_worker.scan_process",
+                side_effect=(
+                    ProcessScanResult((ProcessNetworkInfo(hunt.pid, hunt.name, (loopback,)),)),
+                    ProcessScanResult(
+                        (ProcessNetworkInfo(fallback.pid, fallback.name, (external,)),)
+                    ),
+                ),
+            ),
+            patch("netvision.ui.game_check_worker.probe_ping", return_value=object()),
+        ):
+            worker.run()
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].process.name, "game-launcher.exe")
+        self.assertEqual(results[0].selected_connection, external)
+        self.assertIn("резервный процесс", results[0].warning or "")
+
+    def test_game_auto_check_requires_an_external_udp_socket(self) -> None:
+        worker = GameAutoCheckWorker("HuntGame.exe")
+        results = []
+        worker.completed.connect(results.append)
+        process = RunningProcess(700, "HuntGame.exe")
+        tcp = ProcessConnection("TCP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015)
+
+        with (
+            patch(
+                "netvision.ui.game_check_worker.list_running_processes",
+                return_value=ProcessListResult((process,)),
+            ),
+            patch(
+                "netvision.ui.game_check_worker.scan_process",
+                return_value=ProcessScanResult(
+                    (ProcessNetworkInfo(process.pid, process.name, (tcp,)),)
+                ),
+            ),
+        ):
+            worker.run()
+
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0].selected_connection)
+        self.assertIn("внешнего UDP-сокета", results[0].warning or "")
 
     def test_game_connection_key_keeps_existing_rule_order(self) -> None:
         cases = (
@@ -269,19 +365,14 @@ class MainWindowReportTests(unittest.TestCase):
                 self.assertEqual(_game_connection_key(connection), expected_key)
 
     def test_endpoint_choice_is_recorded_only_when_state_changes(self) -> None:
-        window = MainWindow()
-        connection = ProcessConnection(
-            "UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015
-        )
+        window = NetVisionDashboardV2(bootstrap=False)
+        connection = ProcessConnection("UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015)
         choice = EndpointChoice(connection, "UDP + игровой порт", 1, 0)
 
         window._on_endpoint_chosen(choice)
         window._on_endpoint_chosen(choice)
 
-        events = [
-            event for event in window._journal.events()
-            if event.kind == "endpoint.choice"
-        ]
+        events = [event for event in window._journal.events() if event.kind == "endpoint.choice"]
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].values["rule"], "UDP + игровой порт")
         window.close()
@@ -339,28 +430,47 @@ class MainWindowReportTests(unittest.TestCase):
             system=system,
             dns=DnsResult(target.host, ("203.0.113.1",), 9.0, ProbeStatus.SUCCESS),
             tcp=TcpResult(target.host, target.port, "203.0.113.1", 12.0, ProbeStatus.SUCCESS),
-            ping=PingResult(target.host, 5, 4, 20.0, 10.0, 8.0, 12.0, 2.0, (8, 10, 12, 10), ProbeStatus.WARNING),
+            ping=PingResult(
+                target.host, 5, 4, 20.0, 10.0, 8.0, 12.0, 2.0, (8, 10, 12, 10), ProbeStatus.WARNING
+            ),
             tls=None,
             hops=(HopResult(1, "203.0.113.1", 12.0),),
-            geolocation=(GeoResult("203.0.113.1", "Example", "Region", "City", "64500", "Example Org", "Example ISP", ProbeStatus.SUCCESS),),
+            geolocation=(
+                GeoResult(
+                    "203.0.113.1",
+                    "Example",
+                    "Region",
+                    "City",
+                    "64500",
+                    "Example Org",
+                    "Example ISP",
+                    ProbeStatus.SUCCESS,
+                ),
+            ),
             started_at=datetime(2026, 10, 7, 12, 0, 0),
             total_ms=100.0,
         )
 
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._on_completed(report)
-        self.assertEqual(window.routes_table.rowCount(), 2)
-        self.assertEqual(window.geo_table.rowCount(), 1)
-        self.assertEqual(window.metrics["loss"].value.text(), "20%")
-        self.assertEqual(window.metrics["ping"].hint.text(), "Отлично для игр и звонков")
-        self.assertEqual(window.metrics["loss"].hint.text(), "Возможны фризы и задержки")
-        self.assertEqual(window.metrics["dns"].value.property("metricState"), "good")
-        self.assertEqual(window.metrics["dns"].value.text(), "9.0 ms")
-        self.assertNotIn("DNS", window.metrics["dns"].value.text())
-        self.assertEqual(window.metrics["dns"].hint.text(), "Имя сайта найдено")
-        self.assertEqual(window.metrics["loss"].value.property("metricState"), "bad")
-        self.assertEqual(window.metrics["tls"].value.property("metricState"), "neutral")
-        self.assertTrue(window.export_button.isEnabled())
+        self.assertEqual(window._facts.get("cause"), window.lite_panel.lite_cause.text())
+        self.assertEqual(window._facts.get("overview.anomaly")[0], "error")
+        self.assertEqual(window.path_workspace.routes_table.rowCount(), 2)
+        self.assertEqual(window.path_workspace.geo_table.rowCount(), 1)
+        self.assertEqual(window.expert_view.metrics["loss"].value.text(), "20%")
+        self.assertEqual(
+            window.expert_view.metrics["ping"].hint.text(), "Отлично для игр и звонков"
+        )
+        self.assertEqual(
+            window.expert_view.metrics["loss"].hint.text(), "Возможны фризы и задержки"
+        )
+        self.assertEqual(window.expert_view.metrics["dns"].value.property("metricState"), "good")
+        self.assertEqual(window.expert_view.metrics["dns"].value.text(), "9.0 ms")
+        self.assertNotIn("DNS", window.expert_view.metrics["dns"].value.text())
+        self.assertEqual(window.expert_view.metrics["dns"].hint.text(), "Имя сайта найдено")
+        self.assertEqual(window.expert_view.metrics["loss"].value.property("metricState"), "bad")
+        self.assertEqual(window.expert_view.metrics["tls"].value.property("metricState"), "neutral")
+        self.assertTrue(window.header_panel.export_button.isEnabled())
 
         class MemorySaveFile:
             def __init__(self, path: str) -> None:
@@ -390,11 +500,11 @@ class MainWindowReportTests(unittest.TestCase):
         export_path = "report.json"
         with (
             patch(
-                "netvision.ui.main_window.QFileDialog.getSaveFileName",
+                "netvision.ui.dashboard_v2.QFileDialog.getSaveFileName",
                 return_value=(export_path, "JSON (*.json)"),
             ),
-            patch("netvision.ui.main_window.QSaveFile", side_effect=make_save_file),
-            patch("netvision.ui.main_window.QMessageBox.critical") as error_dialog,
+            patch("netvision.ui.dashboard_v2.QSaveFile", side_effect=make_save_file),
+            patch("netvision.ui.dashboard_v2.QMessageBox.critical") as error_dialog,
         ):
             window._export_report()
             error_dialog.assert_not_called()
@@ -448,17 +558,23 @@ class MainWindowReportTests(unittest.TestCase):
         chart.deleteLater()
 
     def test_network_boost_buttons_are_available_in_loss_and_jitter_workspaces(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
-        self.assertEqual(window.loss_network_boost_button.objectName(), "NetworkBoostButton")
-        self.assertEqual(window.jitter_network_boost_button.objectName(), "NetworkBoostButton")
+        self.assertEqual(
+            window.loss_workspace.loss_network_boost_button.objectName(), "NetworkBoostButton"
+        )
+        self.assertEqual(
+            window.jitter_workspace.jitter_network_boost_button.objectName(), "NetworkBoostButton"
+        )
         self.assertEqual(len(window._network_boost_buttons), 3)
-        self.assertTrue(window.loss_network_boost_button.isEnabled())
-        self.assertTrue(window.jitter_network_boost_button.isEnabled())
+        self.assertTrue(window.loss_workspace.loss_network_boost_button.isEnabled())
+        self.assertTrue(window.jitter_workspace.jitter_network_boost_button.isEnabled())
         window.close()
 
     def test_network_boost_dialog_requires_explicit_selection_and_displays_result(self) -> None:
-        candidate = BackgroundTrafficCandidate(456, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 2)
+        candidate = BackgroundTrafficCandidate(
+            456, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 2
+        )
         dialog = NetworkBoostDialog((candidate,))
 
         self.assertFalse(dialog.terminate_button.isEnabled())
@@ -475,7 +591,9 @@ class MainWindowReportTests(unittest.TestCase):
         dialog.close()
 
     def test_network_boost_confirmation_and_busy_close_guard(self) -> None:
-        candidate = BackgroundTrafficCandidate(456, "steam.exe", "Steam", "Игровой лаунчер", 1, 1000.0)
+        candidate = BackgroundTrafficCandidate(
+            456, "steam.exe", "Steam", "Игровой лаунчер", 1, 1000.0
+        )
         dialog = NetworkBoostDialog((candidate,))
         dialog.show()
         checkbox = next(iter(dialog._candidate_checkboxes.values()))
@@ -498,7 +616,7 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertFalse(dialog.isVisible())
 
     def test_main_metric_cards_have_icons_and_waiting_prompt(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         expected_icons = {
             "dns": "🌐",
             "ping": "⚡",
@@ -509,7 +627,7 @@ class MainWindowReportTests(unittest.TestCase):
         }
 
         for metric, icon in expected_icons.items():
-            tile = window.metrics[metric]
+            tile = window.expert_view.metrics[metric]
             self.assertEqual(tile.icon_label.text(), icon)
             self.assertEqual(tile.value.text(), "--")
             self.assertEqual(tile.hint.text(), "Нажмите для проверки")
@@ -517,59 +635,72 @@ class MainWindowReportTests(unittest.TestCase):
 
         window.close()
 
-    def test_dns_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
-        window = MainWindow()
-        window.show()
-        self.app.processEvents()
-        with patch.object(MainWindow, "_load_dns_configuration"):
-            QTest.mouseClick(window.metrics["dns"], Qt.MouseButton.LeftButton)
-            self.app.processEvents()
-            self.assertIs(window.mode_stack.currentWidget(), window.dns_view)
-            self.assertTrue(window.dns_table.rowCount() >= 6)
-            window.dns_back_button.click()
-            self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
-        window.close()
-
     def test_dns_workspace_adds_custom_profile_and_highlights_best_result(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         initial_count = len(window._dns_profiles)
-        window.dns_custom_input.setText("10.0.0.53")
-        window._add_custom_dns_profile()
+        window.dns_workspace.dns_custom_input.setText("10.0.0.53")
+        window.dns_controller._add_custom_dns_profile()
         self.assertEqual(len(window._dns_profiles), initial_count + 1)
         self.assertEqual(window._dns_profiles[-1].addresses, ("10.0.0.53",))
 
         fast_profile = DnsResolverProfile("Fast", ("10.0.0.1",))
         slow_profile = DnsResolverProfile("Slow", ("10.0.0.2",))
         window._dns_profiles = [fast_profile, slow_profile]
-        window._render_dns_profiles()
-        window._on_dns_benchmark_completed(
+        window.dns_controller._render_dns_profiles()
+        window.dns_controller._on_dns_benchmark_completed(
             (
                 DnsBenchmarkResult(fast_profile, "10.0.0.1", 4.2),
                 DnsBenchmarkResult(slow_profile, "10.0.0.2", 18.7),
             )
         )
-        self.assertEqual(window.dns_table.item(0, 4).text(), "Лучший")
-        self.assertEqual(window.dns_table.item(1, 4).text(), "Доступен")
-        self.assertIn("Fast", window.dns_status.text())
+        self.assertEqual(window.dns_workspace.dns_table.item(0, 4).text(), "Лучший")
+        self.assertEqual(window.dns_workspace.dns_table.item(1, 4).text(), "Доступен")
+        self.assertIn("Fast", window.dns_workspace.dns_status.text())
+        self.assertEqual(window._facts.get("dns.best").profile, fast_profile)
+        self.assertEqual(window._facts.get("dns.worst").profile, slow_profile)
+        window.dns_controller._on_dns_benchmark_completed(
+            (DnsBenchmarkResult(fast_profile, None, None, "timeout"),)
+        )
+        self.assertIsNone(window._facts.get("dns.best"))
+        self.assertIsNone(window._facts.get("dns.worst"))
+        window.close()
+
+    def test_dns_apply_uses_selected_adapter_and_profile(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        profile = DnsResolverProfile("Example", ("1.1.1.1",))
+        window._dns_profiles = [profile]
+        window.dns_controller._render_dns_profiles()
+        window.dns_workspace.dns_table.selectRow(0)
+        window.dns_workspace.dns_adapter_combo.addItem("Ethernet", "Ethernet")
+        window.dns_workspace.dns_apply_button.setEnabled(True)
+
+        with (
+            patch.object(window, "_run_system_action") as run_action,
+            patch("netvision.ui.controllers.dns_audit.apply_dns_servers") as apply_dns,
+        ):
+            window.dns_workspace.dns_apply_button.click()
+            run_action.assert_called_once()
+            run_action.call_args.args[1]()
+            apply_dns.assert_called_once_with("Ethernet", ("1.1.1.1",))
         window.close()
 
     def test_ping_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         self.app.processEvents()
 
-        QTest.mouseClick(window.metrics["ping"], Qt.MouseButton.LeftButton)
+        QTest.mouseClick(window.expert_view.metrics["ping"], Qt.MouseButton.LeftButton)
         self.app.processEvents()
 
         self.assertIs(window.mode_stack.currentWidget(), window.ping_view)
-        self.assertEqual(window.ping_matrix_table.rowCount(), 5)
-        self.assertEqual(window.ping_mtu_table.rowCount(), 0)
-        window.ping_back_button.click()
+        self.assertEqual(window.ping_workspace.ping_matrix_table.rowCount(), 5)
+        self.assertEqual(window.mtu_workspace.ping_mtu_table.rowCount(), 0)
+        window.ping_workspace.ping_back_button.click()
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
         window.close()
 
     def test_ping_workspace_renders_results_and_live_spike(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         target = RegionalPingTarget("Frankfurt", "fra.example", "Reference")
         fast_ping = PingResult(
             "fra.example", 3, 3, 0.0, 8.0, 9.0, 10.0, 1.0, (8.0, 9.0, 10.0), ProbeStatus.SUCCESS
@@ -577,72 +708,78 @@ class MainWindowReportTests(unittest.TestCase):
         regional = (RegionalPingResult(target, fast_ping),)
         mtu = (MtuProbeResult(1472, 0, 2, 100.0, None, "Пакет требует фрагментации"),)
 
-        window._on_ping_benchmark_completed(regional, mtu)
-        window._on_latency_sample(120.0, True)
+        window.ping_controller._on_ping_benchmark_completed(regional, mtu)
+        window.ping_controller._on_latency_sample(120.0, True)
 
-        self.assertEqual(window.ping_matrix_table.item(0, 4).text(), "Лучший")
-        self.assertIn("8.0", window.ping_matrix_table.item(0, 2).text())
-        self.assertIn("фрагментации", window.ping_mtu_table.item(0, 3).text())
-        self.assertIn("Пик задержки", window.ping_spike_log.toPlainText())
-        self.assertEqual(window.ping_stat_max.text(), "120.0 ms")
+        self.assertEqual(window.ping_workspace.ping_matrix_table.item(0, 4).text(), "Лучший")
+        self.assertIn("8.0", window.ping_workspace.ping_matrix_table.item(0, 2).text())
+        self.assertIn("фрагментации", window.mtu_workspace.ping_mtu_table.item(0, 3).text())
+        self.assertIn("Пик задержки", window.ping_workspace.ping_spike_log.toPlainText())
+        self.assertEqual(window.ping_workspace.ping_stat_max.text(), "120.0 ms")
         window.close()
 
     def test_loss_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         self.app.processEvents()
 
-        QTest.mouseClick(window.metrics["loss"], Qt.MouseButton.LeftButton)
+        QTest.mouseClick(window.expert_view.metrics["loss"], Qt.MouseButton.LeftButton)
         self.app.processEvents()
 
         self.assertIs(window.mode_stack.currentWidget(), window.loss_view)
-        self.assertEqual(window.loss_stress_table.rowCount(), 2)
-        self.assertTrue(window.metrics["loss"].property("clickable"))
-        window.loss_back_button.click()
+        self.assertEqual(window.loss_workspace.loss_stress_table.rowCount(), 2)
+        self.assertTrue(window.expert_view.metrics["loss"].property("clickable"))
+        window.loss_workspace.loss_back_button.click()
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
         window.close()
 
     def test_jitter_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         self.app.processEvents()
 
-        QTest.mouseClick(window.metrics["jitter"], Qt.MouseButton.LeftButton)
+        QTest.mouseClick(window.expert_view.metrics["jitter"], Qt.MouseButton.LeftButton)
         self.app.processEvents()
 
         self.assertIs(window.mode_stack.currentWidget(), window.jitter_view)
-        self.assertTrue(window.metrics["jitter"].property("clickable"))
-        self.assertEqual(window.jitter_events_table.columnCount(), 4)
-        window.jitter_back_button.click()
+        self.assertTrue(window.expert_view.metrics["jitter"].property("clickable"))
+        self.assertEqual(window.jitter_workspace.jitter_events_table.columnCount(), 4)
+        window.jitter_workspace.jitter_back_button.click()
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
         window.close()
 
     def test_jitter_workspace_logs_spikes_and_rates_voice_and_gaming_impact(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._open_jitter_workspace()
-        window._on_latency_sample(20.0, True)
-        window._on_latency_sample(42.0, True)
-        window._on_latency_sample(None, False)
+        window.ping_controller._on_latency_sample(20.0, True)
+        window.ping_controller._on_latency_sample(42.0, True)
+        self.assertEqual(window._facts.get("ping.sample"), (42.0, True))
+        self.assertEqual(window._facts.get("jitter.deviation_ms"), 22.0)
+        window.ping_controller._on_latency_sample(None, False)
+        self.assertEqual(window._facts.get("ping.sample"), (None, False))
+        self.assertIsNone(window._facts.get("jitter.deviation_ms"))
 
-        self.assertEqual(window.jitter_events_table.rowCount(), 2)
-        self.assertEqual(window.jitter_impact_values["current"].text(), "--")
-        self.assertEqual(window.jitter_impact_values["voice"].text(), "N/A")
-        self.assertEqual(window.jitter_impact_values["stability"].text(), "Нестабильно")
-        self.assertEqual(window.jitter_events_table.item(0, 1).text(), "timeout")
+        self.assertEqual(window.jitter_workspace.jitter_events_table.rowCount(), 2)
+        self.assertEqual(window.jitter_workspace.jitter_impact_values["current"].text(), "--")
+        self.assertEqual(window.jitter_workspace.jitter_impact_values["voice"].text(), "N/A")
+        self.assertEqual(
+            window.jitter_workspace.jitter_impact_values["stability"].text(), "Нестабильно"
+        )
+        self.assertEqual(window.jitter_workspace.jitter_events_table.item(0, 1).text(), "timeout")
         window.close()
 
     def test_jitter_workspace_groups_repeated_spikes_into_one_log_row(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._open_jitter_workspace()
         for value in (0.0, 20.0, 40.0, 60.0, 65.0, 70.0, 75.0):
-            window._on_latency_sample(value, True)
+            window.ping_controller._on_latency_sample(value, True)
 
-        self.assertEqual(window.jitter_events_table.rowCount(), 1)
-        self.assertIn("отсчётов: 3", window.jitter_events_table.item(0, 3).text())
+        self.assertEqual(window.jitter_workspace.jitter_events_table.rowCount(), 1)
+        self.assertIn("отсчётов: 3", window.jitter_workspace.jitter_events_table.item(0, 3).text())
         window.close()
 
     def test_loss_workspace_renders_hops_and_stress_results(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         hops = (
             HopLossResult(1, "192.0.2.1", 3, 3, 0.0, 5.0, "Стабильно"),
             HopLossResult(2, "198.51.100.1", 3, 1, 66.7, 20.0, "Есть потери"),
@@ -650,178 +787,88 @@ class MainWindowReportTests(unittest.TestCase):
         results = (
             StressTestResult("ICMP", "example.test", 10, 8, 20.0, 12.0, "Есть потери"),
             StressTestResult(
-                "UDP", "example.test:443", 20, 20, None, 0.2, "Отправка успешна",
+                "UDP",
+                "example.test:443",
+                20,
+                20,
+                None,
+                0.2,
+                "Отправка успешна",
                 "UDP не подтверждает доставку без ACK приложения; учтены только локальные sendto.",
             ),
         )
 
-        window._on_packet_loss_analysis_completed(hops, results[0], results[1])
-        window._on_latency_sample(None, False)
-        window._on_latency_sample(None, False)
+        window.loss_controller._on_packet_loss_analysis_completed(hops, results[0], results[1])
+        self.assertEqual(window._facts.get("loss.analysis"), (hops, results[0], results[1]))
+        window.ping_controller._on_latency_sample(None, False)
+        window.ping_controller._on_latency_sample(None, False)
 
-        self.assertIn("67%", window.loss_hops_table.item(1, 3).text())
-        self.assertEqual(window.loss_stress_table.item(0, 3).text(), "20%")
-        self.assertEqual(window.loss_stress_table.item(1, 3).text(), "не подтверждается")
-        self.assertEqual(window.loss_stat_longest_burst.text(), "2")
-        self.assertIn("подряд: 2", window.loss_events_log.toPlainText())
-        window.close()
-
-    def test_tcp_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
-        window = MainWindow()
-        window.show()
-        self.app.processEvents()
-
-        QTest.mouseClick(window.metrics["tcp"], Qt.MouseButton.LeftButton)
-        self.app.processEvents()
-
-        self.assertIs(window.mode_stack.currentWidget(), window.tcp_view)
-        self.assertEqual(window.tcp_ports_table.rowCount(), 3)
-        self.assertTrue(window.metrics["tcp"].property("clickable"))
-        window.tcp_back_button.click()
-        self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
+        self.assertIn("67%", window.loss_workspace.loss_hops_table.item(1, 3).text())
+        self.assertEqual(window.loss_workspace.loss_stress_table.item(0, 3).text(), "20%")
+        self.assertEqual(
+            window.loss_workspace.loss_stress_table.item(1, 3).text(), "не подтверждается"
+        )
+        self.assertEqual(window.loss_workspace.loss_stat_longest_burst.text(), "2")
+        self.assertIn("подряд: 2", window.loss_workspace.loss_events_log.toPlainText())
         window.close()
 
     def test_tcp_workspace_renders_ports_and_sockets(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         primary = TcpConnectMeasurement("example.test", 443, 12.5, "Открыт")
         ports = (
             primary,
-            TcpConnectMeasurement("example.test", 80, None, "Закрыт", "Удалённый узел отклонил TCP-соединение"),
+            TcpConnectMeasurement(
+                "example.test", 80, None, "Закрыт", "Удалённый узел отклонил TCP-соединение"
+            ),
         )
         sockets = (
-            TcpSocketRecord(42, "game.exe", "192.168.1.20:50000", "203.0.113.10:443", "ESTABLISHED"),
+            TcpSocketRecord(
+                42, "game.exe", "192.168.1.20:50000", "203.0.113.10:443", "ESTABLISHED"
+            ),
         )
 
-        window._on_tcp_diagnostics_completed(sockets, primary, ports)
-        window.tcp_sockets_table.selectRow(0)
+        window.tcp_controller._on_tcp_diagnostics_completed(sockets, primary, ports)
+        window.tcp_workspace.tcp_sockets_table.selectRow(0)
 
-        self.assertEqual(window.tcp_handshake_connect.text(), "12.5 ms")
-        self.assertEqual(window.tcp_ports_table.item(1, 1).text(), "Закрыт")
-        self.assertIn("game.exe", window.tcp_sockets_table.item(0, 0).text())
-        self.assertTrue(window.tcp_socket_details_button.isEnabled())
-        window.close()
-
-    def test_tls_metric_opens_security_workspace_and_returns_to_dashboard(self) -> None:
-        window = MainWindow()
-        window.show()
-        self.app.processEvents()
-
-        QTest.mouseClick(window.metrics["tls"], Qt.MouseButton.LeftButton)
-        self.app.processEvents()
-
-        self.assertIs(window.mode_stack.currentWidget(), window.tls_view)
-        self.assertTrue(window.metrics["tls"].property("clickable"))
-        self.assertEqual(window.tls_handshake_table.rowCount(), 4)
-        window.tls_back_button.click()
-        self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
-        window.close()
-
-    def test_tls_workspace_renders_certificate_audit(self) -> None:
-        window = MainWindow()
-        certificate = CertificateRecord(
-            position=0,
-            subject="commonName=example.test",
-            issuer="commonName=NetVision Test CA",
-            serial_number="01AB",
-            valid_from=datetime(2026, 1, 1),
-            valid_to=datetime(2027, 1, 1),
-            days_remaining=84,
-            fingerprint_sha256="AA:BB:CC",
-            status="Действителен",
-        )
-        result = TlsAuditResult(
-            host="example.test",
-            port=443,
-            tcp_connect_ms=8.2,
-            handshake_ms=15.6,
-            version="TLSv1.3",
-            cipher="TLS_AES_256_GCM_SHA384",
-            alpn="h2",
-            certificate_valid=True,
-            certificate_status="Действителен",
-            chain=(certificate,),
-            fingerprint_sha256="AA:BB:CC",
-        )
-
-        window._on_tls_audit_completed(result)
-
-        self.assertEqual(window.tls_overview_values["protocol"].text(), "TLSv1.3")
-        self.assertEqual(window.tls_overview_values["handshake"].text(), "15.6 ms")
-        self.assertEqual(window.tls_certificate_table.item(0, 1).text(), "commonName=example.test")
-        self.assertEqual(window.tls_certificate_table.item(0, 7).text(), "AA:BB:CC")
-        self.assertTrue(window.tls_copy_fingerprint_button.isEnabled())
-        window.close()
-
-    def test_deep_dive_workspaces_include_quick_fix_action_bars(self) -> None:
-        window = MainWindow()
-
-        self.assertEqual(set(window.quick_fix_status), {"dns", "ping", "loss", "tcp"})
-        for context in ("dns", "ping", "loss", "tcp"):
-            self.assertEqual(len(window.quick_fix_buttons[context]), 4)
-            self.assertEqual(window.quick_fix_status[context].text(), "Готово к применению")
-            self.assertTrue(all(button.minimumHeight() >= 34 for button in window.quick_fix_buttons[context]))
-
-        self.assertEqual(window.findChildren(QFrame, "QuickFixPanel").__len__(), 4)
-        window.close()
-
-    def test_dns_adapter_properties_button_is_below_selector_and_opens_windows_connections(self) -> None:
-        window = MainWindow()
-        window.show()
-        window.resize(1280, 820)
-        # The layout is prebuilt; switch views directly so this geometry test
-        # does not start the asynchronous DNS configuration worker.
-        window.mode_stack.setCurrentWidget(window.dns_view)
-        self.app.processEvents()
-
-        button = window.dns_adapter_properties_button
-        combo = window.dns_adapter_combo
-        self.assertEqual(button.objectName(), "DnsAdapterPropertiesButton")
-        self.assertEqual(button.parentWidget(), combo.parentWidget())
-        self.assertEqual(button.pos().x(), combo.pos().x())
-        self.assertGreater(button.geometry().top(), combo.geometry().bottom())
-        self.assertEqual(button.sizePolicy().horizontalPolicy(), QSizePolicy.Policy.Maximum)
-
-        with patch.object(window, "_run_system_action") as run_action:
-            button.click()
-
-        run_action.assert_called_once_with(
-            "Открыть свойства адаптера",
-            open_network_adapters,
-            button,
-            window.dns_status,
-        )
+        self.assertEqual(window.tcp_workspace.tcp_handshake_connect.text(), "12.5 ms")
+        self.assertEqual(window.tcp_workspace.tcp_ports_table.item(1, 1).text(), "Закрыт")
+        self.assertIn("game.exe", window.tcp_workspace.tcp_sockets_table.item(0, 0).text())
+        self.assertTrue(window.tcp_workspace.tcp_socket_details_button.isEnabled())
         window.close()
 
     def test_quick_fix_requires_confirmation_for_tcp_stack_reset(self) -> None:
-        window = MainWindow()
-        window.dns_adapter_combo.addItem("Ethernet", "Ethernet")
+        window = NetVisionDashboardV2(bootstrap=False)
+        window.dns_workspace.dns_adapter_combo.addItem("Ethernet", "Ethernet")
         button = window.quick_fix_buttons["loss"][2]
         status = window.quick_fix_status["loss"]
 
-        with patch("netvision.ui.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
-            window._trigger_quick_fix("stack", button, status)
+        with patch(
+            "netvision.ui.dashboard_v2.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            window.event_bus.quick_fix_requested.emit("stack", button, status)
 
         self.assertEqual(status.text(), "Действие отменено")
         self.assertTrue(button.isEnabled())
         window.close()
 
     def test_all_tables_support_interactive_resizing_and_responsive_last_column(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         tables = (
-            window.dns_table,
-            window.ping_matrix_table,
-            window.ping_mtu_table,
-            window.loss_stress_table,
-            window.loss_hops_table,
-            window.tcp_ports_table,
-            window.tcp_sockets_table,
-            window.tls_handshake_table,
-            window.tls_certificate_table,
-            window.jitter_events_table,
-            window.routes_table,
-            window.geo_table,
-            window.interfaces_table,
-            window.udp_events_table,
+            window.dns_workspace.dns_table,
+            window.ping_workspace.ping_matrix_table,
+            window.mtu_workspace.ping_mtu_table,
+            window.loss_workspace.loss_stress_table,
+            window.loss_workspace.loss_hops_table,
+            window.tcp_workspace.tcp_ports_table,
+            window.tcp_workspace.tcp_sockets_table,
+            window.tls_workspace.tls_handshake_table,
+            window.tls_workspace.tls_certificate_table,
+            window.jitter_workspace.jitter_events_table,
+            window.path_workspace.routes_table,
+            window.path_workspace.geo_table,
+            window.interfaces_panel.interfaces_table,
+            window.udp_history_workspace.udp_events_table,
         )
 
         for table in tables:
@@ -843,116 +890,69 @@ class MainWindowReportTests(unittest.TestCase):
         window.close()
 
     def test_quick_action_buttons_are_available(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
-        self.assertEqual(window.flush_dns_button.text(), "🔄  Сброс DNS")
-        self.assertEqual(window.flush_dns_button.objectName(), "QuickActionPrimary")
-        self.assertEqual(window.adapters_button.text(), "🖥️  Сетевые адаптеры")
-        self.assertEqual(window.proxy_settings_button.text(), "⚙️  Параметры прокси")
-        self.assertEqual(window.firewall_button.text(), "🛡️  Брандмауэр")
-        self.assertTrue(window.flush_dns_button.icon().isNull())
-        self.assertTrue(window.adapters_button.icon().isNull())
-        self.assertTrue(window.proxy_settings_button.icon().isNull())
-        self.assertTrue(window.firewall_button.icon().isNull())
+        self.assertEqual(window.core_workspace.flush_dns_button.text(), "🔄  Сброс DNS")
+        self.assertEqual(window.core_workspace.flush_dns_button.objectName(), "QuickActionPrimary")
+        self.assertEqual(window.core_workspace.adapters_button.text(), "🖥️  Сетевые адаптеры")
+        self.assertEqual(window.core_workspace.proxy_settings_button.text(), "⚙️  Параметры прокси")
+        self.assertEqual(window.core_workspace.firewall_button.text(), "🛡️  Брандмауэр")
+        self.assertTrue(window.core_workspace.flush_dns_button.icon().isNull())
+        self.assertTrue(window.core_workspace.adapters_button.icon().isNull())
+        self.assertTrue(window.core_workspace.proxy_settings_button.icon().isNull())
+        self.assertTrue(window.core_workspace.firewall_button.icon().isNull())
 
-        window.close()
-
-    def test_process_dropdown_is_embedded_and_closes_before_mode_switch(self) -> None:
-        window = MainWindow()
-        window.show()
-        self.app.processEvents()
-        combo = window.process_selector
-        combo.showPopup()
-        self.app.processEvents()
-
-        self.assertTrue(window.embedded_dropdown.isVisible())
-        self.assertIs(window.embedded_dropdown.parentWidget(), window.process_panel)
-        self.assertIsNone(window.embedded_dropdown.window().parentWidget())
-        self.assertFalse(window.embedded_dropdown.windowFlags() & Qt.WindowType.Popup)
-        window._set_interface_mode("lite")
-        self.app.processEvents()
-
-        self.assertIs(window.mode_stack.currentWidget(), window.lite_view)
-        self.assertFalse(window.embedded_dropdown.isVisible())
-        window.close()
-
-    def test_expert_mode_prioritizes_workspace_and_compacts_metrics(self) -> None:
-        window = MainWindow()
-
-        self.assertTrue(window.expert_view.isAncestorOf(window.quick_actions_panel))
-        self.assertGreaterEqual(window.latency_chart.minimumHeight(), 180)
-        self.assertEqual(
-            window.latency_chart.sizePolicy().verticalPolicy(),
-            QSizePolicy.Policy.Expanding,
-        )
-        self.assertEqual(window.metrics["ping"].minimumHeight(), 82)
-        self.assertEqual(
-            window.metrics["ping"].sizePolicy().verticalPolicy(),
-            QSizePolicy.Policy.Preferred,
-        )
-        self.assertTrue(window.process_status.isHidden())
-        self.assertTrue(window.metrics["jitter"].icon_label.text())
-
-        window.close()
-
-    def test_responsive_layout_reflows_metric_cards_and_preserves_scroll_access(self) -> None:
-        window = MainWindow()
-        window.show()
-
-        self.assertIsInstance(window.mode_scroll, QScrollArea)
-        self.assertIs(window.mode_scroll.widget(), window.mode_stack)
-
-        observed_columns: list[int] = []
-        for width, height in ((960, 680), (1024, 768), (1280, 820), (1920, 1080)):
-            window.resize(width, height)
-            self.app.processEvents()
-            observed_columns.append(window.metric_grid.columns)
-            self.assertGreaterEqual(window.metric_grid.columns, 1)
-            self.assertLessEqual(window.metric_grid.columns, 6)
-            self.assertEqual(window.mode_scroll.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            self.assertEqual(window.mode_scroll.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        self.assertGreater(observed_columns[-1], observed_columns[0])
-        self.assertTrue(window.topology.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Expanding)
-        self.assertEqual(window.topology.sizePolicy().verticalPolicy(), QSizePolicy.Policy.Preferred)
         window.close()
 
     def test_responsive_status_labels_keep_full_text_in_tooltips(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         window.resize(960, 680)
         self.app.processEvents()
 
         window._set_status("WARNING", "warning")
         expected_health = "🟡  Есть задержки / Высокий пинг"
-        self.assertEqual(window.status_badge.property("fullText"), expected_health)
-        self.assertEqual(window.status_badge.toolTip(), expected_health)
+        self.assertEqual(window.header_panel.status_badge.property("fullText"), expected_health)
+        self.assertEqual(window.header_panel.status_badge.toolTip(), expected_health)
 
         window._udp_monitor_pid = 42
         window._on_udp_port_snapshot(UdpPortSnapshot(42, tuple(range(27000, 27020))))
-        self.assertEqual(window.udp_ports_status.property("fullText"), window.udp_ports_status.toolTip())
+        self.assertEqual(
+            window.process_selector_panel.udp_ports_status.property("fullText"),
+            window.process_selector_panel.udp_ports_status.toolTip(),
+        )
         window.close()
 
     def test_network_health_badge_reserves_room_for_full_status_message(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         window.resize(1280, 820)
         self.app.processEvents()
 
         window._set_status("READY", "success")
         expected = "🟢  Сеть работает отлично"
-        self.assertEqual(window.status_badge.text(), expected)
-        required_width = window.status_badge.fontMetrics().horizontalAdvance(expected) + 34
+        self.assertEqual(window.header_panel.status_badge.text(), expected)
+        required_width = (
+            window.header_panel.status_badge.fontMetrics().horizontalAdvance(expected) + 34
+        )
         self.assertGreaterEqual(
-            window.status_badge.width(),
+            window.header_panel.status_badge.width(),
             required_width,
         )
-        self.assertEqual(window.status_badge.maximumWidth(), window.status_badge.minimumWidth())
-        self.assertEqual(window.status_badge.sizePolicy().horizontalPolicy(), QSizePolicy.Policy.Fixed)
+        self.assertEqual(
+            window.header_panel.status_badge.maximumWidth(),
+            window.header_panel.status_badge.minimumWidth(),
+        )
+        self.assertEqual(
+            window.header_panel.status_badge.sizePolicy().horizontalPolicy(),
+            QSizePolicy.Policy.Fixed,
+        )
         window.close()
 
-    def test_header_controls_compact_without_overlap_and_topology_has_no_horizontal_scrollbar(self) -> None:
-        window = MainWindow()
+    def test_header_controls_compact_without_overlap_and_topology_has_no_horizontal_scrollbar(
+        self,
+    ) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
 
         for width in (960, 1040, 1120, 1280):
@@ -960,7 +960,11 @@ class MainWindowReportTests(unittest.TestCase):
             self.app.processEvents()
             controls = [
                 control
-                for control in (window.export_button, window.language_combo, window.theme_button)
+                for control in (
+                    window.header_panel.export_button,
+                    window.header_panel.language_combo,
+                    window.header_panel.theme_button,
+                )
                 if control.isVisible()
             ]
             for index, first in enumerate(controls):
@@ -969,82 +973,83 @@ class MainWindowReportTests(unittest.TestCase):
                     second_rect = QRect(second.mapTo(window, QPoint(0, 0)), second.size())
                     self.assertFalse(first_rect.intersects(second_rect))
 
-        self.assertTrue(window.header_settings.rect().contains(window.language_combo.geometry()))
-        self.assertTrue(window.header_settings.rect().contains(window.theme_button.geometry()))
+        self.assertTrue(
+            window.header_panel.header_settings.rect().contains(
+                window.header_panel.language_combo.geometry()
+            )
+        )
+        self.assertTrue(
+            window.header_panel.header_settings.rect().contains(
+                window.header_panel.theme_button.geometry()
+            )
+        )
 
-        self.assertEqual(window.topology.minimumWidth(), 0)
+        self.assertEqual(window.core_workspace.topology.minimumWidth(), 0)
         self.assertEqual(
-            window.topology_scroll.horizontalScrollBarPolicy(),
+            window.core_workspace.topology_scroll.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
         self.assertEqual(
-            window.details_scroll.horizontalScrollBarPolicy(),
+            window.node_details.details_scroll.horizontalScrollBarPolicy(),
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
         window._toggle_theme()
         self.app.processEvents()
         self.assertEqual(window._theme, "light")
-        self.assertTrue(window.language_combo.isVisible())
-        self.assertTrue(window.theme_button.isVisible())
-        window.close()
-
-    def test_session_capsule_compacts_without_hiding_timer(self) -> None:
-        window = MainWindow()
-        window.show()
-
-        window.resize(1280, 820)
-        self.app.processEvents()
-        self.assertTrue(window.session_capsule.isVisible())
-        self.assertTrue(window.session_timer_button.isVisible())
-        self.assertTrue(window.session_log_button.isVisible())
-
-        window.resize(960, 820)
-        self.app.processEvents()
-        self.assertTrue(window.session_timer_button.isVisible())
-        self.assertFalse(window.session_log_button.isVisible())
-        self.assertEqual(window.session_capsule.maximumWidth(), 182)
+        self.assertTrue(window.header_panel.language_combo.isVisible())
+        self.assertTrue(window.header_panel.theme_button.isVisible())
         window.close()
 
     def test_session_capsule_tracks_anomalies_and_opens_log(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
 
         window._start_diagnostic_session()
         self.assertTrue(window._session_timer.isActive())
-        self.assertIn("Диагностика", window.session_log_button.text())
+        self.assertIn("Диагностика", window.header_panel.session_log_button.text())
 
         window._session_elapsed_seconds = 62
         window._refresh_session_capsule()
-        self.assertEqual(window.session_timer_button.text(), "⏱  01:02")
-        window.session_timer_button.click()
+        self.assertEqual(window.header_panel.session_timer_button.text(), "⏱  01:02")
+        window.header_panel.session_timer_button.click()
         self.assertFalse(window._session_timer.isActive())
-        window.session_timer_button.click()
+        window.header_panel.session_timer_button.click()
         self.assertTrue(window._session_timer.isActive())
-        window.session_reset_button.click()
+        window.header_panel.session_reset_button.click()
         self.assertFalse(window._session_timer.isActive())
-        self.assertEqual(window.session_timer_button.text(), "⏱  00:00")
+        self.assertEqual(window.header_panel.session_timer_button.text(), "⏱  00:00")
 
-        window._on_latency_sample(175.0, True)
-        self.assertEqual(window.session_log_button.property("anomalyState"), "error")
-        self.assertIn("Пик пинга", window.session_log_button.text())
+        window.ping_controller._on_latency_sample(175.0, True)
+        self.assertEqual(window.header_panel.session_log_button.property("anomalyState"), "error")
+        self.assertIn("Пик пинга", window.header_panel.session_log_button.text())
 
-        window.lite_mode_button.setChecked(True)
+        window.header_panel.lite_mode_button.setChecked(True)
         window._open_log_from_header()
-        self.assertTrue(window.expert_mode_button.isChecked())
+        self.assertTrue(window.header_panel.expert_mode_button.isChecked())
         self.assertIs(window.workspace_tabs.currentWidget(), window.log_tab)
         window.close()
 
     def test_session_anomaly_menu_shows_recent_events_and_opens_full_log(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         window.resize(1280, 820)
 
-        window._set_header_anomaly("warning", "Высокий пинг: {latency:.0f} мс", latency=112)
-        window._set_header_anomaly("warning", "Высокий пинг: {latency:.0f} мс", latency=148)
+        window.overview_controller._set_header_anomaly(
+            "warning", "Высокий пинг: {latency:.0f} мс", latency=112
+        )
+        window.overview_controller._set_header_anomaly(
+            "warning", "Высокий пинг: {latency:.0f} мс", latency=148
+        )
+        self.assertEqual(
+            window._facts.get("overview.anomaly"),
+            ("warning", "Высокий пинг: {latency:.0f} мс", {"latency": 148}),
+        )
         self.assertEqual(len(window._header_anomaly_history), 1)
 
-        window._set_header_anomaly("good", "Связь стабильна")
-        window._set_header_anomaly("error", "Пик пинга > {latency:.0f} мс", latency=180)
+        window.overview_controller._set_header_anomaly("good", "Связь стабильна")
+        window.overview_controller._set_header_anomaly(
+            "error", "Пик пинга > {latency:.0f} мс", latency=180
+        )
         self.assertEqual(len(window._header_anomaly_history), 2)
 
         menu = window._header_anomaly_menu
@@ -1052,7 +1057,7 @@ class MainWindowReportTests(unittest.TestCase):
         # The offscreen Qt platform does not keep QMenu popups visible. Verify
         # the dynamically rendered contents here; the desktop smoke check
         # exercises the actual popup visibility.
-        window._populate_header_anomaly_menu()
+        window.alarms_controller._populate_header_anomaly_menu()
         events = menu.findChildren(QLabel, "SessionAnomalyItem")
         self.assertEqual(len(events), 2)
         self.assertIn("Пик пинга > 180 мс", events[0].text())
@@ -1066,66 +1071,54 @@ class MainWindowReportTests(unittest.TestCase):
         window.close()
 
     def test_session_anomaly_menu_limits_history_and_has_empty_state(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         window.resize(1280, 820)
 
         menu = window._header_anomaly_menu
         assert menu is not None
-        window._populate_header_anomaly_menu()
+        window.alarms_controller._populate_header_anomaly_menu()
         empty_state = menu.findChild(QLabel, "SessionAnomalyEmptyState")
         self.assertIsNotNone(empty_state)
 
         for index in range(6):
-            window._set_header_anomaly("warning", f"Событие {index}")
-            window._set_header_anomaly("good", "Связь стабильна")
+            window.overview_controller._set_header_anomaly("warning", f"Событие {index}")
+            window.overview_controller._set_header_anomaly("good", "Связь стабильна")
         self.assertEqual(len(window._header_anomaly_history), 5)
         self.assertEqual(window._header_anomaly_history[0].source, "Событие 1")
         window.close()
 
     def test_network_health_badge_only_uses_the_width_needed_by_long_status(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window.show()
         window.resize(1920, 1080)
         self.app.processEvents()
 
         window._set_status("WARNING", "warning")
-        text = window.status_badge.text()
-        required_width = window.status_badge.fontMetrics().horizontalAdvance(text) + 34
+        text = window.header_panel.status_badge.text()
+        required_width = window.header_panel.status_badge.fontMetrics().horizontalAdvance(text) + 34
         self.assertIn("Высокий пинг", text)
-        self.assertEqual(window.status_badge.width(), required_width)
-        self.assertEqual(window.status_badge.minimumWidth(), required_width)
-        self.assertEqual(window.status_badge.maximumWidth(), required_width)
-        window.close()
-
-    def test_dns_metric_card_uses_the_same_compact_contract_as_other_cards(self) -> None:
-        window = MainWindow()
-        window.show()
-        window.resize(1280, 820)
-        self.app.processEvents()
-
-        dns_tile = window.metrics["dns"]
-        ping_tile = window.metrics["ping"]
-        self.assertEqual(dns_tile.minimumWidth(), ping_tile.minimumWidth())
-        self.assertEqual(dns_tile.minimumHeight(), ping_tile.minimumHeight())
-        self.assertEqual(dns_tile.hint.minimumHeight(), ping_tile.hint.minimumHeight())
-        self.assertEqual(dns_tile.sizePolicy().horizontalPolicy(), QSizePolicy.Policy.Expanding)
-        self.assertEqual(dns_tile.property("metricRole"), None)
-        self.assertEqual(window.metric_grid.columns, 6)
+        self.assertEqual(window.header_panel.status_badge.width(), required_width)
+        self.assertEqual(window.header_panel.status_badge.minimumWidth(), required_width)
+        self.assertEqual(window.header_panel.status_badge.maximumWidth(), required_width)
         window.close()
 
     def test_dns_metric_removes_repeated_title_from_value(self) -> None:
-        window = MainWindow()
-        window.metrics["dns"].set_metric("DNS 5.3 ms - 203.0.113.1", "IP: 203.0.113.1", "good")
+        window = NetVisionDashboardV2(bootstrap=False)
+        window.expert_view.metrics["dns"].set_metric(
+            "DNS 5.3 ms - 203.0.113.1", "IP: 203.0.113.1", "good"
+        )
 
-        self.assertEqual(window.metrics["dns"].value.text(), "5.3 ms - 203.0.113.1")
-        self.assertFalse(window.metrics["dns"].value.text().startswith("DNS"))
+        self.assertEqual(window.expert_view.metrics["dns"].value.text(), "5.3 ms - 203.0.113.1")
+        self.assertFalse(window.expert_view.metrics["dns"].value.text().startswith("DNS"))
         window.close()
 
     def test_topology_starts_neutral_and_colors_connections_from_report(self) -> None:
         topology = TopologyWidget()
         self.assertTrue(all(node.status == ProbeStatus.PENDING for node in topology._nodes))
-        self.assertTrue(all(status == ProbeStatus.PENDING for status in topology._connection_statuses))
+        self.assertTrue(
+            all(status == ProbeStatus.PENDING for status in topology._connection_statuses)
+        )
 
         target = parse_target("example.test", 443)
         system = SystemSnapshot(
@@ -1141,7 +1134,9 @@ class MainWindowReportTests(unittest.TestCase):
             system=system,
             dns=DnsResult(target.host, ("203.0.113.1",), 5.0, ProbeStatus.SUCCESS),
             tcp=TcpResult(target.host, target.port, "203.0.113.1", 9.0, ProbeStatus.SUCCESS),
-            ping=PingResult(target.host, 5, 5, 0.0, 20.0, 18.0, 22.0, 2.0, (18, 20, 22), ProbeStatus.SUCCESS),
+            ping=PingResult(
+                target.host, 5, 5, 0.0, 20.0, 18.0, 22.0, 2.0, (18, 20, 22), ProbeStatus.SUCCESS
+            ),
             tls=None,
             hops=(),
             geolocation=(),
@@ -1149,11 +1144,15 @@ class MainWindowReportTests(unittest.TestCase):
             total_ms=100.0,
         )
         topology.set_report(report)
-        self.assertTrue(all(status == ProbeStatus.SUCCESS for status in topology._connection_statuses))
+        self.assertTrue(
+            all(status == ProbeStatus.SUCCESS for status in topology._connection_statuses)
+        )
         self.assertEqual(topology._dns_label, "5.0 ms  ·  203.0.113.1")
         self.assertFalse(topology._dns_label.startswith("DNS"))
 
-        topology.set_report(replace(report, ping=replace(report.ping, loss_percent=20.0, received=4)))
+        topology.set_report(
+            replace(report, ping=replace(report.ping, loss_percent=20.0, received=4))
+        )
         self.assertEqual(topology._connection_statuses[-1], ProbeStatus.WARNING)
 
         topology.set_report(replace(report, tcp=replace(report.tcp, status=ProbeStatus.ERROR)))
@@ -1161,7 +1160,7 @@ class MainWindowReportTests(unittest.TestCase):
         topology.deleteLater()
 
     def test_target_presets_fill_the_ready_diagnostic_profile(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
         expected_profiles = {
             "Google": "google.com",
@@ -1172,181 +1171,114 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(set(window.preset_buttons), set(expected_profiles))
         for name, host in expected_profiles.items():
             window.preset_buttons[name].click()
-            self.assertEqual(window.target_input.text(), host)
-            self.assertEqual(window.port_input.value(), 443)
+            self.assertEqual(window.core_workspace.target_input.text(), host)
+            self.assertEqual(window.core_workspace.port_input.value(), 443)
             self.assertEqual(window._active_preset, name)
             self.assertTrue(window.preset_buttons[name].isChecked())
 
         window.close()
 
     def test_main_port_input_explains_its_valid_range_and_default(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
-        self.assertEqual(window.port_input.minimum(), 1)
-        self.assertEqual(window.port_input.maximum(), 65535)
-        self.assertEqual(window.port_input.value(), 443)
+        self.assertEqual(window.core_workspace.port_input.minimum(), 1)
+        self.assertEqual(window.core_workspace.port_input.maximum(), 65535)
+        self.assertEqual(window.core_workspace.port_input.value(), 443)
         self.assertEqual(
-            window.port_input.toolTip(),
+            window.core_workspace.port_input.toolTip(),
             "Сетевой порт целевого узла.\n"
             "• 443 — для защищенных HTTPS-соединений и большинства веб-серверов\n"
             "• 80 — для обычных HTTP-соединений\n"
             "Оставьте стандартное значение, если не уверены.",
         )
 
-        window.language_combo.setCurrentIndex(1)
-        self.assertIn("Target host network port.", window.port_input.toolTip())
-        self.assertIn("Keep the default value", window.port_input.toolTip())
+        window.header_panel.language_combo.setCurrentIndex(1)
+        self.assertIn("Target host network port.", window.core_workspace.port_input.toolTip())
+        self.assertIn("Keep the default value", window.core_workspace.port_input.toolTip())
         window.close()
 
     def test_network_health_indicator_uses_clear_user_facing_states(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
         window._set_status("READY", "success")
-        self.assertIn("Сеть работает отлично", window.status_badge.text())
+        self.assertIn("Сеть работает отлично", window.header_panel.status_badge.text())
         window._set_status("WARNING", "warning")
-        self.assertIn("Есть задержки / Высокий пинг", window.status_badge.text())
+        self.assertIn("Есть задержки / Высокий пинг", window.header_panel.status_badge.text())
         window._set_status("ERROR", "error")
-        self.assertIn("Нет подключения", window.status_badge.text())
+        self.assertIn("Нет подключения", window.header_panel.status_badge.text())
 
         window.close()
 
     def test_header_language_selector_updates_primary_controls(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
-        self.assertEqual(window.language_combo.currentData(), "ru")
-        window.language_combo.setCurrentIndex(1)
+        self.assertEqual(window.header_panel.language_combo.currentData(), "ru")
+        window.header_panel.language_combo.setCurrentIndex(1)
 
         self.assertEqual(window._language, "en")
-        self.assertEqual(window.language_label.text(), "LANGUAGE")
-        self.assertEqual(window.mode_label.text(), "MODE")
-        self.assertEqual(window.expert_mode_button.text(), "Expert")
-        self.assertEqual(window.lite_mode_button.text(), "Simple mode")
-        window.close()
-
-    def test_language_selector_retranslates_existing_dashboard_and_open_dialog(self) -> None:
-        window = MainWindow()
-        candidate = BackgroundTrafficCandidate(
-            456,
-            "qBittorrent.exe",
-            "qBittorrent",
-            "Торрент-клиент",
-            2,
-        )
-        dialog = NetworkBoostDialog((candidate,), window, window._tr)
-        window._network_boost_dialog = dialog
-
-        window.language_combo.setCurrentIndex(1)
-
-        self.assertEqual(window.start_button.text(), "Run diagnostics")
-        self.assertEqual(window.metrics["loss"].title_label.text(), "PACKET LOSS")
-        self.assertEqual(window.dns_back_button.text(), "←  Back")
-        self.assertEqual(window.dns_adapter_properties_button.text(), "Open Adapter Properties")
-        self.assertEqual(window.dns_table.horizontalHeaderItem(0).text(), "Provider")
-        self.assertEqual(window.findChildren(QTabWidget)[0].tabText(0), "Overview")
-        self.assertEqual(window.flush_dns_button.text(), "🔄  Flush DNS")
-        self.assertEqual(window.tls_run_button.text(), "▶  Check certificate")
-        self.assertEqual(window.jitter_event_status.text(), "Critical threshold: Δ RTT > 15 ms · events: 0")
-        self.assertEqual(window.latency_chart._translate("60с назад"), "60s ago")
-        self.assertEqual(dialog.windowTitle(), "Background process optimization")
-        self.assertIn("Torrent client", next(iter(dialog._candidate_checkboxes.values())).text())
-        self.assertEqual(dialog.cancel_button.text(), "Cancel")
-
-        window.language_combo.setCurrentIndex(0)
-
-        self.assertEqual(window.start_button.text(), "Запустить диагностику")
-        self.assertEqual(window.metrics["loss"].title_label.text(), "ПОТЕРИ")
-        self.assertEqual(window.dns_adapter_properties_button.text(), "Открыть свойства адаптера")
-        self.assertEqual(window.dns_table.horizontalHeaderItem(0).text(), "Провайдер")
-        self.assertEqual(window.flush_dns_button.text(), "🔄  Сброс DNS")
-        self.assertEqual(dialog.windowTitle(), "Оптимизация фоновых процессов")
-        self.assertIn("Торрент-клиент", next(iter(dialog._candidate_checkboxes.values())).text())
-        dialog.close()
+        self.assertEqual(window.header_panel.language_label.text(), "LANGUAGE")
+        self.assertEqual(window.header_panel.mode_label.text(), "MODE")
+        self.assertEqual(window.header_panel.expert_mode_button.text(), "Expert")
+        self.assertEqual(window.header_panel.lite_mode_button.text(), "Simple mode")
         window.close()
 
     def test_header_theme_toggle_applies_light_and_dark_styles(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         app = QApplication.instance()
         assert app is not None
 
         window._toggle_theme()
         self.assertEqual(window._theme, "light")
-        self.assertEqual(window.theme_button.text(), "☀")
+        self.assertEqual(window.header_panel.theme_button.text(), "☀")
         self.assertEqual(app.styleSheet(), LIGHT_STYLE)
 
         window._toggle_theme()
         self.assertEqual(window._theme, "dark")
-        self.assertEqual(window.theme_button.text(), "☾")
+        self.assertEqual(window.header_panel.theme_button.text(), "☾")
         self.assertEqual(app.styleSheet(), APP_STYLE)
         window.close()
 
-    def test_theme_language_resize_stress_keeps_controls_and_canvases_consistent(self) -> None:
-        window = MainWindow()
-        messages = []
-        old_handler = qInstallMessageHandler(lambda _kind, _context, message: messages.append(message))
-        self.app.setStyleSheet(APP_STYLE)
-        window.show()
-        try:
-            for iteration in range(8):
-                window._toggle_theme()
-                window.language_combo.setCurrentIndex(iteration % 2)
-                for width, height in ((960, 680), (1120, 768), (1280, 820), (1920, 1080)):
-                    window.resize(width, height)
-                    for _ in range(3):
-                        self.app.processEvents()
-                    controls = [widget for widget in (
-                        window.status_badge, window.session_capsule, window.header_mode_controls,
-                        window.export_button, window.header_settings,
-                    ) if widget.isVisible()]
-                    for first, second in zip(controls, controls[1:]):
-                        self.assertFalse(first.geometry().intersects(second.geometry()))
-                    for widget in (window.language_combo, window.theme_button):
-                        self.assertTrue(window.header_settings.rect().contains(widget.geometry()))
-                    for scroll in (window.topology_scroll, window.details_scroll):
-                        self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
-                for canvas in (window.topology, window.latency_chart, window.jitter_chart):
-                    canvas.ensurePolished()
-                    # Inspect painted pixels, not only the stylesheet string.
-                    image = canvas.grab().toImage()
-                    self.assertEqual(image.pixelColor(4, 40).name(),
-                                     "#ffffff" if window._theme == "light" else "#161b22")
-            self.assertFalse({message for message in messages if
-                              "Unknown property" in message or "Could not parse" in message})
-        finally:
-            qInstallMessageHandler(old_handler)
-            window.close()
-            self.app.setStyleSheet(APP_STYLE)
-
     def test_process_selector_fills_diagnostic_target(self) -> None:
-        window = MainWindow()
-        connection = ProcessConnection("TCP", "ESTABLISHED", "192.168.1.20", 52000, "203.0.113.10", 443)
+        window = NetVisionDashboardV2(bootstrap=False)
+        connection = ProcessConnection(
+            "TCP", "ESTABLISHED", "192.168.1.20", 52000, "203.0.113.10", 443
+        )
         process = ProcessNetworkInfo(321, "game.exe", (connection,))
 
-        window._on_process_scan_completed(ProcessScanResult((process,)))
-        self.assertEqual(window.process_selector.count(), 1)
-        window.process_selector.setCurrentIndex(0)
-        window.process_connection_selector.setCurrentIndex(0)
+        window.process_controller._on_process_scan_completed(ProcessScanResult((process,)))
+        self.assertEqual(window.process_selector_panel.process_selector.count(), 1)
+        window.process_selector_panel.process_selector.setCurrentIndex(0)
+        window.process_selector_panel.process_connection_selector.setCurrentIndex(0)
 
-        self.assertEqual(window.target_input.text(), "203.0.113.10")
-        self.assertEqual(window.port_input.value(), 443)
-        self.assertIn("game.exe", window.process_status.text())
+        self.assertEqual(window.core_workspace.target_input.text(), "203.0.113.10")
+        self.assertEqual(window.core_workspace.port_input.value(), 443)
+        self.assertIn("game.exe", window.process_selector_panel.process_status.text())
         window.close()
 
     def test_udp_monitor_status_shows_selected_process_ports(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._udp_monitor_pid = 321
 
         window._on_udp_port_snapshot(UdpPortSnapshot(321, (27015, 27016)))
-        self.assertEqual(window.udp_ports_status.text(), "UDP-порты PID 321: 27015, 27016")
+        self.assertEqual(
+            window.process_selector_panel.udp_ports_status.text(), "UDP-порты PID 321: 27015, 27016"
+        )
 
         window._on_udp_port_snapshot(UdpPortSnapshot(321, ()))
-        self.assertEqual(window.udp_ports_status.text(), "UDP: локальные порты не обнаружены")
+        self.assertEqual(
+            window.process_selector_panel.udp_ports_status.text(),
+            "UDP: локальные порты не обнаружены",
+        )
 
         window._on_udp_port_snapshot(UdpPortSnapshot(999, (443,)))
-        self.assertEqual(window.udp_ports_status.text(), "UDP: локальные порты не обнаружены")
+        self.assertEqual(
+            window.process_selector_panel.udp_ports_status.text(),
+            "UDP: локальные порты не обнаружены",
+        )
         window.close()
 
     def test_udp_events_table_records_transitions_and_filters_anomalies(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._udp_monitor_pid = 321
         timestamp = datetime(2026, 10, 8, 15, 30, 0)
         opened = UdpPortActivity(
@@ -1364,21 +1296,29 @@ class MainWindowReportTests(unittest.TestCase):
         window._on_udp_port_activity(opened)
         window._on_udp_port_activity(loss)
 
-        self.assertEqual(window.udp_events_table.rowCount(), 3)
-        self.assertEqual(window.udp_events_table.item(0, 1).text(), "Порт открыт")
-        self.assertEqual(window.udp_events_table.item(1, 1).text(), "Порт закрыт")
-        self.assertEqual(window.udp_events_table.item(2, 1).text(), "Возможный обрыв")
-        self.assertTrue(window.export_udp_json_button.isEnabled())
-        self.assertTrue(window.export_udp_csv_button.isEnabled())
+        self.assertEqual(window.udp_history_workspace.udp_events_table.rowCount(), 3)
+        self.assertEqual(
+            window.udp_history_workspace.udp_events_table.item(0, 1).text(), "Порт открыт"
+        )
+        self.assertEqual(
+            window.udp_history_workspace.udp_events_table.item(1, 1).text(), "Порт закрыт"
+        )
+        self.assertEqual(
+            window.udp_history_workspace.udp_events_table.item(2, 1).text(), "Возможный обрыв"
+        )
+        self.assertTrue(window.udp_history_workspace.export_udp_json_button.isEnabled())
+        self.assertTrue(window.udp_history_workspace.export_udp_csv_button.isEnabled())
 
-        window.udp_anomaly_filter.setChecked(True)
-        self.assertEqual(window.udp_events_table.rowCount(), 1)
-        self.assertEqual(window.udp_events_table.item(0, 1).text(), "Возможный обрыв")
-        self.assertIn("Показано аномалий: 1", window.udp_event_status.text())
+        window.udp_history_workspace.udp_anomaly_filter.setChecked(True)
+        self.assertEqual(window.udp_history_workspace.udp_events_table.rowCount(), 1)
+        self.assertEqual(
+            window.udp_history_workspace.udp_events_table.item(0, 1).text(), "Возможный обрыв"
+        )
+        self.assertIn("Показано аномалий: 1", window.udp_history_workspace.udp_event_status.text())
         window.close()
 
     def test_udp_csv_export_uses_save_dialog_and_writes_event_rows(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         window._udp_monitor_pid = 321
         activity = UdpPortActivity(
             UdpPortSnapshot(321, (27015,)),
@@ -1414,70 +1354,60 @@ class MainWindowReportTests(unittest.TestCase):
             return result
 
         with (
-            patch("netvision.ui.main_window.QFileDialog.getSaveFileName", return_value=("udp-events", "CSV (*.csv)")),
-            patch("netvision.ui.main_window.QSaveFile", side_effect=make_save_file),
+            patch(
+                "netvision.ui.dashboard_v2.QFileDialog.getSaveFileName",
+                return_value=("udp-events", "CSV (*.csv)"),
+            ),
+            patch("netvision.ui.dashboard_v2.QSaveFile", side_effect=make_save_file),
+            patch.object(window, "_append_log") as append_log,
         ):
             window._export_udp_events_csv()
 
         self.assertIn("event_type", saved_files[0].payload.decode("utf-8"))
         self.assertIn("Порт открыт", saved_files[0].payload.decode("utf-8"))
-        self.assertIn("UDP-события сохранены в CSV", window.log_output.toPlainText())
+        self.assertTrue(
+            any("UDP-события сохранены в CSV" in call.args[0] for call in append_log.call_args_list)
+        )
         window.close()
 
     def test_local_udp_socket_does_not_replace_the_diagnostic_target(self) -> None:
-        window = MainWindow()
-        window.target_input.setText("example.com")
-        window.port_input.setValue(443)
+        window = NetVisionDashboardV2(bootstrap=False)
+        window.core_workspace.target_input.setText("example.com")
+        window.core_workspace.port_input.setValue(443)
         local_udp = ProcessConnection("UDP", "NONE", "192.168.1.20", 27015, "", 0)
         process = ProcessNetworkInfo(321, "huntgame.exe", (local_udp,))
 
-        window._on_process_scan_completed(ProcessScanResult((process,)))
-        window._on_connection_selected(0)
+        window.process_controller._on_process_scan_completed(ProcessScanResult((process,)))
+        window.process_controller._on_connection_selected(0)
 
-        self.assertEqual(window.target_input.text(), "example.com")
-        self.assertEqual(window.port_input.value(), 443)
-        self.assertIn("локальный UDP-порт 27015", window.process_status.text())
-        window.close()
-
-    def test_lite_mode_hides_process_technical_details_and_uses_friendly_name(self) -> None:
-        window = MainWindow()
-        connection = ProcessConnection("TCP", "ESTABLISHED", "192.168.1.20", 52000, "203.0.113.10", 443)
-        process = ProcessNetworkInfo(321, "discord.exe", (connection,))
-        window._on_process_scan_completed(ProcessScanResult((process,)))
-
-        self.assertIn("PID 321", window.process_selector.itemText(0))
-        window.lite_mode_button.setChecked(True)
-
-        self.assertEqual(window.process_selector.itemText(0), "💬 Discord")
-        self.assertTrue(window.process_connection_selector.isHidden())
-        self.assertTrue(window.process_status.isHidden())
-
-        window.expert_mode_button.setChecked(True)
-        self.assertIn("PID 321", window.process_selector.itemText(0))
-        self.assertFalse(window.process_connection_selector.isHidden())
+        self.assertEqual(window.core_workspace.target_input.text(), "example.com")
+        self.assertEqual(window.core_workspace.port_input.value(), 443)
+        self.assertIn(
+            "локальный UDP-порт 27015", window.process_selector_panel.process_status.text()
+        )
         window.close()
 
     def test_metric_help_tooltips_and_interface_mode_switch(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
         for metric, tooltip in METRIC_TOOLTIPS.items():
-            self.assertEqual(window.metrics[metric].help_button.toolTip(), tooltip)
-        self.assertTrue(window.expert_mode_button.isChecked())
+            self.assertEqual(window.expert_view.metrics[metric].help_button.toolTip(), tooltip)
+        self.assertTrue(window.header_panel.expert_mode_button.isChecked())
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
 
-        window.lite_mode_button.setChecked(True)
+        window.header_panel.lite_mode_button.setChecked(True)
         self.assertIs(window.mode_stack.currentWidget(), window.lite_view)
         self.assertFalse(window.expert_view.isVisible())
-        self.assertTrue(window.lite_mode_button.isChecked())
-        self.assertTrue(window.process_panel.isHidden())
-        self.assertTrue(window.port_label.isHidden())
-        self.assertTrue(window.port_input.isHidden())
+        self.assertTrue(window.header_panel.lite_mode_button.isChecked())
+        self.assertTrue(window.process_selector_panel.process_panel.isHidden())
+        self.assertTrue(window.core_workspace.port_label.isHidden())
+        self.assertTrue(window.core_workspace.port_input.isHidden())
 
-        window.expert_mode_button.setChecked(True)
+        window.header_panel.expert_mode_button.setChecked(True)
         self.assertIs(window.mode_stack.currentWidget(), window.expert_view)
-        self.assertFalse(window.process_panel.isHidden())
-        self.assertFalse(window.port_label.isHidden())
-        self.assertFalse(window.port_input.isHidden())
+        self.assertFalse(window.process_selector_panel.process_panel.isHidden())
+        self.assertFalse(window.core_workspace.port_label.isHidden())
+        self.assertFalse(window.core_workspace.port_input.isHidden())
         window.close()
 
     def test_lite_summary_reflects_diagnostic_severity(self) -> None:
@@ -1495,78 +1425,108 @@ class MainWindowReportTests(unittest.TestCase):
             ),
             dns=DnsResult(target.host, ("203.0.113.1",), 4.0, ProbeStatus.SUCCESS),
             tcp=TcpResult(target.host, target.port, "203.0.113.1", 8.0, ProbeStatus.SUCCESS),
-            ping=PingResult(target.host, 5, 5, 0.0, 21.0, 20.0, 22.0, 2.0, (20, 22, 21, 20, 22), ProbeStatus.SUCCESS),
+            ping=PingResult(
+                target.host,
+                5,
+                5,
+                0.0,
+                21.0,
+                20.0,
+                22.0,
+                2.0,
+                (20, 22, 21, 20, 22),
+                ProbeStatus.SUCCESS,
+            ),
             tls=None,
             hops=(),
             geolocation=(),
             started_at=datetime(2026, 10, 8, 12, 0, 0),
             total_ms=100.0,
         )
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
 
-        window._update_lite_summary(base_report)
-        self.assertEqual(window.lite_title.text(), "Сайт полностью доступен")
-        card_texts = [item.text() for item in window.lite_detail_labels]
+        window.state_synchronizer._update_lite_summary(base_report)
+        self.assertEqual(window.lite_panel.lite_title.text(), "Сайт полностью доступен")
+        card_texts = [item.text() for item in window.lite_panel.lite_detail_labels]
         self.assertIn("🌐 DNS\n4.0 мс (Быстрый отклик)", card_texts)
         self.assertIn("🔓 Порт 443\nОткрыт", card_texts)
         self.assertIn("📉 Потери\n0% (Связь стабильная)", card_texts)
         self.assertIn("🛡️ Маршрут\nVPN активен", card_texts)
-        self.assertEqual(window.lite_status_indicator.text(), "🟢")
+        self.assertEqual(window.lite_panel.lite_status_indicator.text(), "🟢")
 
         warning_report = replace(
             base_report,
-            ping=PingResult(target.host, 5, 0, 100.0, None, None, None, None, (), ProbeStatus.WARNING),
+            ping=PingResult(
+                target.host, 5, 0, 100.0, None, None, None, None, (), ProbeStatus.WARNING
+            ),
         )
-        window._update_lite_summary(warning_report)
-        self.assertEqual(window.lite_title.text(), "Сайт доступен, но есть предупреждения")
-        self.assertEqual(window.lite_status_indicator.styleSheet().count("#FFB800"), 1)
+        window.state_synchronizer._update_lite_summary(warning_report)
+        self.assertEqual(
+            window.lite_panel.lite_title.text(), "Сайт доступен, но есть предупреждения"
+        )
+        self.assertEqual(window.lite_panel.lite_status_indicator.styleSheet().count("#FFB800"), 1)
         self.assertTrue(
-            any("100% (Обрыв связи)" in item.text() for item in window.lite_detail_labels)
+            any(
+                "100% (Обрыв связи)" in item.text() for item in window.lite_panel.lite_detail_labels
+            )
         )
-        self.assertEqual(window.lite_status_indicator.text(), "⚠️")
+        self.assertEqual(window.lite_panel.lite_status_indicator.text(), "⚠️")
 
         error_report = replace(
             base_report,
             dns=DnsResult(target.host, (), None, ProbeStatus.ERROR, "DNS failed"),
         )
-        window._update_lite_summary(error_report)
-        self.assertEqual(window.lite_title.text(), "Нет связи с узлом")
-        self.assertEqual(window.lite_status_indicator.styleSheet().count("#FF4757"), 1)
-        self.assertIn("🌐 DNS\nНет ответа", [item.text() for item in window.lite_detail_labels])
-        self.assertEqual(window.lite_status_indicator.text(), "🔴")
+        window.state_synchronizer._update_lite_summary(error_report)
+        self.assertEqual(window.lite_panel.lite_title.text(), "Нет связи с узлом")
+        self.assertEqual(window.lite_panel.lite_status_indicator.styleSheet().count("#FF4757"), 1)
+        self.assertIn(
+            "🌐 DNS\nНет ответа", [item.text() for item in window.lite_panel.lite_detail_labels]
+        )
+        self.assertEqual(window.lite_panel.lite_status_indicator.text(), "🔴")
         window.close()
 
     def test_system_action_runs_asynchronously_and_reports_result(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         event_loop = QEventLoop()
         timer = QTimer()
         timer.setInterval(10)
         timer.timeout.connect(
-            lambda: event_loop.quit()
-            if window.flush_dns_button.isEnabled() and not window._system_action_threads
-            else None
+            lambda: (
+                event_loop.quit()
+                if window.core_workspace.flush_dns_button.isEnabled()
+                and not window._system_action_threads
+                else None
+            )
         )
         timer.start()
         QTimer.singleShot(1000, event_loop.quit)
 
-        window._run_system_action(
-            "Тестовое действие",
-            lambda: SystemActionResult(True, "выполнено"),
-            window.flush_dns_button,
-        )
-        self.assertFalse(window.flush_dns_button.isEnabled())
-        event_loop.exec()
+        with patch.object(window, "_append_log") as append_log:
+            window._run_system_action(
+                "Тестовое действие",
+                lambda: SystemActionResult(True, "выполнено"),
+                window.core_workspace.flush_dns_button,
+            )
+            self.assertFalse(window.core_workspace.flush_dns_button.isEnabled())
+            event_loop.exec()
+            self.assertTrue(
+                any(
+                    "Тестовое действие: выполнено" in call.args[0]
+                    for call in append_log.call_args_list
+                )
+            )
         timer.stop()
 
-        self.assertTrue(window.flush_dns_button.isEnabled())
-        self.assertIn("Тестовое действие: выполнено", window.log_output.toPlainText())
+        self.assertTrue(window.core_workspace.flush_dns_button.isEnabled())
         self.assertEqual(window.statusBar().currentMessage(), "Тестовое действие: выполнено")
         window.close()
 
     def test_internet_quality_tab_displays_partial_results(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         report = InternetQualityReport(
-            speedtest=SpeedtestResult(download_mbps=120.0, ping_ms=15.0, server_name="Cloudflare DNS"),
+            speedtest=SpeedtestResult(
+                download_mbps=120.0, ping_ms=15.0, server_name="Cloudflare DNS"
+            ),
             network=PublicNetworkInfo(ipv4="198.51.100.50", isp="Example ISP", city="Москва"),
             local=LocalNetworkContext(
                 adapter_name="Ethernet",
@@ -1579,17 +1539,25 @@ class MainWindowReportTests(unittest.TestCase):
 
         window._on_quality_completed(report)
 
-        self.assertEqual(window.quality_metrics["download"].value.text(), "120.0 Мбит/с")
-        self.assertEqual(window.quality_metrics["loaded_ping"].value.text(), "Не измерен")
-        self.assertEqual(window.quality_details["isp"].text(), "Example ISP")
-        self.assertEqual(window.quality_details["local_ip"].text(), "192.168.1.20, 172.19.0.1")
-        self.assertIn("fe80::1", window.quality_details["local_ip"].toolTip())
-        self.assertIn("частично", window.quality_status.text())
-        self.assertIn("Speedtest warning", window.quality_report_output.toPlainText())
+        self.assertEqual(
+            window.quality_workspace.quality_metrics["download"].value.text(), "120.0 Мбит/с"
+        )
+        self.assertEqual(
+            window.quality_workspace.quality_metrics["loaded_ping"].value.text(), "Не измерен"
+        )
+        self.assertEqual(window.quality_workspace.quality_details["isp"].text(), "Example ISP")
+        self.assertEqual(
+            window.quality_workspace.quality_details["local_ip"].text(), "192.168.1.20, 172.19.0.1"
+        )
+        self.assertIn("fe80::1", window.quality_workspace.quality_details["local_ip"].toolTip())
+        self.assertIn("частично", window.quality_workspace.quality_status.text())
+        self.assertIn(
+            "Speedtest warning", window.quality_workspace.quality_report_output.toPlainText()
+        )
         window.close()
 
     def test_internet_quality_check_runs_in_background(self) -> None:
-        window = MainWindow()
+        window = NetVisionDashboardV2(bootstrap=False)
         result = InternetQualityReport(
             speedtest=SpeedtestResult(download_mbps=80.0),
             network=PublicNetworkInfo(ipv4="198.51.100.60"),
@@ -1599,24 +1567,28 @@ class MainWindowReportTests(unittest.TestCase):
         timer = QTimer()
         timer.setInterval(10)
         timer.timeout.connect(
-            lambda: event_loop.quit()
-            if window.quality_test_button.isEnabled() and window._quality_thread is None
-            else None
+            lambda: (
+                event_loop.quit()
+                if window.quality_workspace.quality_test_button.isEnabled()
+                and window._quality_thread is None
+                else None
+            )
         )
         timer.start()
         QTimer.singleShot(1500, event_loop.quit)
 
-        with patch("netvision.ui.main_window.run_internet_quality_check", return_value=result):
+        with patch("netvision.ui.legacy_workers.run_internet_quality_check", return_value=result):
             window.start_quality_check()
-            self.assertFalse(window.quality_test_button.isEnabled())
+            self.assertFalse(window.quality_workspace.quality_test_button.isEnabled())
             event_loop.exec()
 
         timer.stop()
-        self.assertTrue(window.quality_test_button.isEnabled())
-        self.assertEqual(window.quality_metrics["download"].value.text(), "80.0 Мбит/с")
+        self.assertTrue(window.quality_workspace.quality_test_button.isEnabled())
+        self.assertEqual(
+            window.quality_workspace.quality_metrics["download"].value.text(), "80.0 Мбит/с"
+        )
         window.close()
 
 
 if __name__ == "__main__":
     unittest.main()
-

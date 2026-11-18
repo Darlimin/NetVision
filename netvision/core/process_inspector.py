@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import socket
+from collections.abc import Iterable
 
 import psutil
-
-
-ACTIVE_TCP_STATUSES = frozenset({"ESTABLISHED", "SYN_SENT", "SYN_RECV"})
 
 # Background services do not provide an actionable target for end-user diagnostics.
 IGNORED_PROCESS_NAMES = frozenset(
@@ -91,6 +90,14 @@ class ProcessListResult:
     warning: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _ObservedConnection:
+    """A normalized socket together with its owning process identifier."""
+
+    pid: int | None
+    connection: ProcessConnection
+
+
 def list_running_processes() -> ProcessListResult:
     """Return all accessible running processes for the manual selector."""
     processes: list[RunningProcess] = []
@@ -136,29 +143,26 @@ def scan_processes() -> ProcessScanResult:
 
     names: dict[int, str] = {}
     grouped: dict[int, list[ProcessConnection]] = {}
-    for connection in connections:
-        pid = getattr(connection, "pid", None)
-        local = _endpoint(getattr(connection, "laddr", None))
-        if pid is None or local is None:
+    for observed in _collect_inet_connections(connections):
+        if observed.pid is None:
             continue
-
-        parsed_connection = _to_process_connection(connection)
-        if parsed_connection is None:
-            continue
+        pid = observed.pid
 
         if pid not in names:
             names[pid] = _process_name(pid)
         if is_ignored_process(names[pid]):
             continue
-        grouped.setdefault(pid, []).append(parsed_connection)
+        grouped.setdefault(pid, []).append(observed.connection)
 
     processes = tuple(
         ProcessNetworkInfo(
             pid=pid,
             name=names[pid],
-            connections=tuple(sorted(items, key=_connection_sort_key)),
+            connections=tuple(items),
         )
-        for pid, items in sorted(grouped.items(), key=lambda item: (names[item[0]].lower(), item[0]))
+        for pid, items in sorted(
+            grouped.items(), key=lambda item: (names[item[0]].lower(), item[0])
+        )
     )
     return ProcessScanResult(processes)
 
@@ -176,6 +180,7 @@ def scan_process(pid: int) -> ProcessScanResult:
         return ProcessScanResult((), f"Не удалось открыть процесс: {exc}")
 
     try:
+        # ``inet`` explicitly includes IPv4/IPv6 TCP and UDP sockets.
         connections = process.net_connections(kind="inet")
     except psutil.NoSuchProcess:
         return ProcessScanResult((), "Выбранный процесс уже завершился")
@@ -188,14 +193,7 @@ def scan_process(pid: int) -> ProcessScanResult:
         return ProcessScanResult((), f"Не удалось получить сокеты выбранного процесса: {exc}")
 
     parsed_connections = tuple(
-        sorted(
-            (
-                parsed
-                for connection in connections
-                if (parsed := _to_process_connection(connection)) is not None
-            ),
-            key=_connection_sort_key,
-        )
+        observed.connection for observed in _collect_inet_connections(connections)
     )
     if not parsed_connections:
         return ProcessScanResult(())
@@ -235,6 +233,26 @@ def is_ignored_process(name: str) -> bool:
     return name.strip().casefold() in IGNORED_PROCESS_NAMES
 
 
+def unresolved_udp_ports(connections: Iterable[ProcessConnection]) -> tuple[int, ...]:
+    """Return local UDP ports whose peer address is unavailable to psutil."""
+    return tuple(
+        sorted(
+            {
+                connection.local_port
+                for connection in connections
+                if connection.protocol == "UDP"
+                and not connection.remote_address
+                and connection.local_port > 0
+            }
+        )
+    )
+
+
+def has_unresolved_udp_socket(connections: Iterable[ProcessConnection]) -> bool:
+    """Return whether packet capture is useful for the selected process."""
+    return bool(unresolved_udp_ports(connections))
+
+
 def _to_process_connection(connection: object) -> ProcessConnection | None:
     """Normalize a psutil socket record used by global and PID-scoped scans."""
     local = _endpoint(getattr(connection, "laddr", None))
@@ -242,8 +260,6 @@ def _to_process_connection(connection: object) -> ProcessConnection | None:
         return None
     protocol = _protocol(getattr(connection, "type", None))
     status = str(getattr(connection, "status", "")) or "ACTIVE"
-    if protocol == "TCP" and status not in ACTIVE_TCP_STATUSES:
-        return None
     remote = _endpoint(getattr(connection, "raddr", None))
     # Windows exposes many UDP sockets without a peer address. They remain
     # useful for selected-process monitoring even without a remote endpoint.
@@ -259,13 +275,78 @@ def _to_process_connection(connection: object) -> ProcessConnection | None:
     )
 
 
+def _collect_inet_connections(connections: object) -> tuple[_ObservedConnection, ...]:
+    """Filter, normalize and order psutil socket records for both scan modes."""
+    observed: list[_ObservedConnection] = []
+    for connection in connections:
+        parsed = _normalize_inet_connection(connection)
+        if parsed is not None:
+            observed.append(
+                _ObservedConnection(
+                    pid=_connection_pid(connection),
+                    connection=parsed,
+                )
+            )
+    return tuple(sorted(observed, key=lambda item: _connection_sort_key(item.connection)))
+
+
+def _normalize_inet_connection(connection: object) -> ProcessConnection | None:
+    if not _is_valid_inet_connection(connection):
+        return None
+    return _to_process_connection(connection)
+
+
+def _connection_pid(connection: object) -> int | None:
+    pid = getattr(connection, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+def _is_valid_inet_connection(connection: object) -> bool:
+    """Keep established TCP and every UDP datagram socket from psutil."""
+    connection_type = getattr(connection, "type", None)
+    is_valid_tcp = (
+        connection_type == socket.SOCK_STREAM
+        and getattr(connection, "status", "") == psutil.CONN_ESTABLISHED
+    )
+    is_valid_udp = connection_type == socket.SOCK_DGRAM
+    return is_valid_tcp or is_valid_udp
+
+
 def _endpoint(value: object) -> tuple[str, int] | None:
-    if not isinstance(value, tuple) or len(value) < 2:
+    address, port = _endpoint_parts(value)
+    normalized_address = _normalize_endpoint_address(address)
+    normalized_port = _normalize_endpoint_port(port)
+    if normalized_address is None or normalized_port is None:
         return None
-    address, port = value[0], value[1]
-    if not address or not isinstance(port, int) or port < 1:
+    return normalized_address, normalized_port
+
+
+def _endpoint_parts(value: object) -> tuple[object | None, object | None]:
+    """Read psutil tuple/namedtuple endpoints and compatible object forms."""
+    if isinstance(value, (tuple, list)) and len(value) >= 2:
+        return value[0], value[1]
+    for address_name in ("ip", "address", "host"):
+        address = getattr(value, address_name, None)
+        if address:
+            return address, getattr(value, "port", None)
+    return None, None
+
+
+def _normalize_endpoint_address(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    return str(address).split("%", 1)[0], port
+    address = value.strip().strip("[]").split("%", 1)[0]
+    return address or None
+
+
+def _normalize_endpoint_port(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if port > 0 else None
 
 
 def _protocol(connection_type: object) -> str:
@@ -274,8 +355,37 @@ def _protocol(connection_type: object) -> str:
     return "TCP"
 
 
-def _connection_sort_key(connection: ProcessConnection) -> tuple[int, int, str]:
+def is_loopback_address(address: object) -> bool:
+    """Return whether an endpoint is a local proxy/listening address."""
+    if not isinstance(address, str):
+        return True
+    if not address or address in {"0.0.0.0", "::"}:
+        return True
+    parsed = _parse_ip_address(address)
+    return parsed.is_loopback if parsed is not None else False
+
+
+def is_public_address(address: object) -> bool:
+    """Return whether an endpoint is a globally routable IP address."""
+    parsed = _parse_ip_address(address)
+    return parsed.is_global if parsed is not None else False
+
+
+def _parse_ip_address(address: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not isinstance(address, str):
+        return None
+    normalized_address = _normalize_endpoint_address(address)
+    if normalized_address is None:
+        return None
+    try:
+        return ipaddress.ip_address(normalized_address)
+    except (TypeError, ValueError):
+        return None
+
+
+def _connection_sort_key(connection: ProcessConnection) -> tuple[int, int, int, str]:
     return (
+        1 if is_loopback_address(connection.remote_address) else 0,
         0 if connection.protocol == "TCP" else 1,
         0 if connection.status == "ESTABLISHED" else 1,
         connection.remote_endpoint,

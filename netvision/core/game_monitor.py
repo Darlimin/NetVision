@@ -1,4 +1,5 @@
 """Lightweight game-process launch monitoring and session statistics."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,7 +11,6 @@ from collections.abc import Sequence
 import psutil
 
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
-
 
 DEFAULT_GAME_PROCESSES: tuple[str, ...] = ("HuntGame.exe", "Hunt.exe")
 DEFAULT_TARGET = ("1.1.1.1", 53)
@@ -87,12 +87,12 @@ class GameLaunchMonitor:
             self._session = _ActiveSession(
                 process_name=name,
                 pid=pid,
-                started_at=datetime.now(),
+                started_at=datetime.now().astimezone(),
                 baseline_latency_ms=baseline,
             )
             return GameMonitorEvent(
                 kind="started",
-                observed_at=datetime.now(),
+                observed_at=datetime.now().astimezone(),
                 process_name=name,
                 pid=pid,
                 baseline_latency_ms=baseline,
@@ -119,10 +119,13 @@ class GameLaunchMonitor:
 
         loss_percent = round(session.failed_samples / session.samples * 100.0, 1)
         return GameMonitorEvent(
-            kind="spike"
-            if latency is not None and _is_spike(latency, session.baseline_latency_ms, self._thresholds)
-            else "sample",
-            observed_at=datetime.now(),
+            kind=(
+                "spike"
+                if latency is not None
+                and _is_spike(latency, session.baseline_latency_ms, self._thresholds)
+                else "sample"
+            ),
+            observed_at=datetime.now().astimezone(),
             process_name=session.process_name,
             pid=session.pid,
             baseline_latency_ms=session.baseline_latency_ms,
@@ -161,7 +164,7 @@ class GameLaunchMonitor:
             process_name=session.process_name,
             pid=session.pid,
             started_at=session.started_at,
-            ended_at=datetime.now(),
+            ended_at=datetime.now().astimezone(),
             baseline_latency_ms=session.baseline_latency_ms,
             samples=session.samples,
             failed_samples=session.failed_samples,

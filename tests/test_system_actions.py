@@ -114,7 +114,16 @@ class SystemActionTests(unittest.TestCase):
         self.assertTrue(restart_result.success)
         self.assertEqual(
             run_mock.call_args_list[0].args[0],
-            ["netsh", "interface", "ipv4", "set", "subinterface", "Wi-Fi", "mtu=1500", "store=active"],
+            [
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "subinterface",
+                "Wi-Fi",
+                "mtu=1500",
+                "store=active",
+            ],
         )
         self.assertEqual(run_mock.call_args_list[1].args[0][-1], "admin=disabled")
         self.assertEqual(run_mock.call_args_list[2].args[0][-1], "admin=enabled")
@@ -127,9 +136,7 @@ class SystemActionTests(unittest.TestCase):
         run_mock,
         capture_mock,
     ) -> None:
-        snapshot = system_actions.DnsAdapterState(
-            "Ethernet", "{guid}", True, "", "192.168.1.1"
-        )
+        snapshot = system_actions.DnsAdapterState("Ethernet", "{guid}", True, "", "192.168.1.1")
         capture_mock.return_value = snapshot
         run_mock.return_value = CompletedProcess(["netsh"], 0, stdout=b"")
 

@@ -83,7 +83,7 @@ class EpisodeTracker:
             return None
         closed = replace(
             self._active,
-            ended_at=at or datetime.now(),
+            ended_at=at or datetime.now().astimezone(),
             closed_by=reason,
         )
         self._active = None

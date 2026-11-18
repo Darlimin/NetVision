@@ -14,7 +14,6 @@ from urllib.request import Request, build_opener, ProxyHandler, urlopen
 from netvision.core.probes import probe_ping
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 
-
 ProgressCallback = Callable[[str], None]
 DEFAULT_TARGETS: tuple[tuple[str, str, int], ...] = (
     ("Cloudflare DNS", "1.1.1.1", 53),
@@ -358,7 +357,9 @@ def _phase_from_samples(
     *,
     speed_mbps: float | None = None,
 ) -> BufferbloatPhase:
-    series = tuple(_series_from_samples(name, samples) for name, samples in values.items() if samples)
+    series = tuple(
+        _series_from_samples(name, samples) for name, samples in values.items() if samples
+    )
     reference = next((item for item in series if item.name == "ref"), None)
     return BufferbloatPhase(
         latency_ms=reference.p50_ms if reference else None,
@@ -501,7 +502,7 @@ def _verdict(grade: str) -> str:
         "A": "Отлично для игр: минимальное влияние нагрузки",
         "B": "Хорошо: небольшое влияние на игровой ping",
         "C": "Есть задержка под нагрузкой: возможны короткие лаги",
-        "D": "Сильное раздутие буфера: заметные лаги в Hunt: Showdown",
+        "D": "Сильное раздутие буфера: заметные лаги в играх",
         "F": "Критично: нагрузка вызывает выраженные лаги и потерю отзывчивости",
     }.get(grade, "Недостаточно данных для оценки bufferbloat")
 

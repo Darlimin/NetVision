@@ -9,7 +9,6 @@ from typing import Iterable
 
 import psutil
 
-
 logger = logging.getLogger("NetVision.NetworkBoost")
 PROTECTED_PIDS = frozenset({0, 4})
 
@@ -154,43 +153,43 @@ def scan_background_traffic_candidates() -> NetworkBoostScanResult:
     except OSError as exc:
         return NetworkBoostScanResult((), f"Не удалось получить сетевые соединения: {exc}")
 
-    connection_counts: dict[int, int] = {}
+    candidates = _traffic_candidates(_active_connection_counts(connections))
+    return NetworkBoostScanResult(tuple(sorted(candidates, key=_candidate_sort_key)))
+
+
+def _active_connection_counts(connections: Iterable[object]) -> dict[int, int]:
+    counts: dict[int, int] = {}
     for connection in connections:
         pid = getattr(connection, "pid", None)
-        if type(pid) is not int or is_protected_process("", pid) or not _is_active_socket(connection):
-            continue
-        connection_counts[pid] = connection_counts.get(pid, 0) + 1
+        if type(pid) is int and not is_protected_process("", pid) and _is_active_socket(connection):
+            counts[pid] = counts.get(pid, 0) + 1
+    return counts
 
-    candidates: list[BackgroundTrafficCandidate] = []
-    for pid, count in connection_counts.items():
-        try:
-            process = psutil.Process(pid)
-            name = process.name() or ""
-            create_time = process.create_time()
-            if not process.is_running():
-                continue
-        except (psutil.Error, OSError):
-            continue
-        if not name or is_protected_process(name, pid):
-            continue
-        profile = TRAFFIC_APP_CATALOG.get(name.strip().casefold())
-        if profile is None:
-            continue
-        category, display_name = profile
-        candidates.append(
-            BackgroundTrafficCandidate(
-                pid=pid,
-                name=name,
-                display_name=display_name,
-                category=category,
-                active_connection_count=count,
-                create_time=create_time,
-            )
-        )
 
-    return NetworkBoostScanResult(
-        tuple(sorted(candidates, key=lambda item: (-item.active_connection_count, item.display_name.casefold(), item.pid)))
-    )
+def _traffic_candidates(counts: dict[int, int]) -> list[BackgroundTrafficCandidate]:
+    return [
+        candidate for pid, count in counts.items() if (candidate := _traffic_candidate(pid, count))
+    ]
+
+
+def _traffic_candidate(pid: int, count: int) -> BackgroundTrafficCandidate | None:
+    try:
+        process = psutil.Process(pid)
+        name = process.name() or ""
+        create_time = process.create_time()
+        if not process.is_running():
+            return None
+    except (psutil.Error, OSError):
+        return None
+    profile = TRAFFIC_APP_CATALOG.get(name.strip().casefold())
+    if not name or is_protected_process(name, pid) or profile is None:
+        return None
+    category, display_name = profile
+    return BackgroundTrafficCandidate(pid, name, display_name, category, count, create_time)
+
+
+def _candidate_sort_key(item: BackgroundTrafficCandidate) -> tuple[int, str, int]:
+    return -item.active_connection_count, item.display_name.casefold(), item.pid
 
 
 def terminate_background_candidates(
@@ -211,54 +210,116 @@ def terminate_background_candidates(
             continue
         handled_pids.add(candidate.pid)
         result = _terminate_candidate(candidate, timeout_s)
-        logger.log(logging.INFO if result.success else logging.WARNING,
-                   "PID %s (%s): %s", result.pid, result.name, result.message)
+        logger.log(
+            logging.INFO if result.success else logging.WARNING,
+            "PID %s (%s): %s",
+            result.pid,
+            result.name,
+            result.message,
+        )
         results.append(result)
     return tuple(results)
 
 
-def _terminate_candidate(candidate: BackgroundTrafficCandidate, timeout_s: float) -> ProcessTerminationResult:
-    if is_protected_process(candidate.name, candidate.pid):
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, "Процесс защищён и не может быть завершён")
-    if candidate.name.strip().casefold() not in TRAFFIC_APP_CATALOG:
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, "Процесс не входит в разрешённый список Network Boost")
-    if candidate.create_time is None or not math.isfinite(candidate.create_time):
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, "Нет данных о времени создания процесса. Повторите сканирование.")
+def _terminate_candidate(
+    candidate: BackgroundTrafficCandidate, timeout_s: float
+) -> ProcessTerminationResult:
+    invalid = _invalid_termination_candidate(candidate)
+    if invalid is not None:
+        return invalid
+    process, current_name, failure = _open_termination_process(candidate)
+    if failure is not None:
+        return failure
+    if not _process_identity_matches(candidate, current_name, process.create_time()):
+        return ProcessTerminationResult(
+            candidate.pid, candidate.name, False, "PID уже принадлежит другому процессу"
+        )
+    if is_protected_process(current_name, candidate.pid):
+        return ProcessTerminationResult(
+            candidate.pid, current_name, False, "Процесс защищён и не может быть завершён"
+        )
+    return _terminate_process(process, candidate.pid, current_name, timeout_s)
 
+
+def _invalid_termination_candidate(
+    candidate: BackgroundTrafficCandidate,
+) -> ProcessTerminationResult | None:
+    if is_protected_process(candidate.name, candidate.pid):
+        return ProcessTerminationResult(
+            candidate.pid, candidate.name, False, "Процесс защищён и не может быть завершён"
+        )
+    if candidate.name.strip().casefold() not in TRAFFIC_APP_CATALOG:
+        return ProcessTerminationResult(
+            candidate.pid,
+            candidate.name,
+            False,
+            "Процесс не входит в разрешённый список Network Boost",
+        )
+    if candidate.create_time is None or not math.isfinite(candidate.create_time):
+        return ProcessTerminationResult(
+            candidate.pid,
+            candidate.name,
+            False,
+            "Нет данных о времени создания процесса. Повторите сканирование.",
+        )
+    return None
+
+
+def _open_termination_process(candidate: BackgroundTrafficCandidate):
     try:
         process = psutil.Process(candidate.pid)
-        current_name = process.name() or ""
-        current_create_time = process.create_time()
+        return process, process.name() or "", None
     except psutil.NoSuchProcess:
-        return ProcessTerminationResult(candidate.pid, candidate.name, True, "Процесс уже завершился")
+        return (
+            None,
+            candidate.name,
+            ProcessTerminationResult(candidate.pid, candidate.name, True, "Процесс уже завершился"),
+        )
     except psutil.AccessDenied:
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, "Нет прав для завершения процесса")
+        return (
+            None,
+            candidate.name,
+            ProcessTerminationResult(
+                candidate.pid, candidate.name, False, "Нет прав для завершения процесса"
+            ),
+        )
     except OSError as exc:
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, f"Не удалось открыть процесс: {exc}")
+        return (
+            None,
+            candidate.name,
+            ProcessTerminationResult(
+                candidate.pid, candidate.name, False, f"Не удалось открыть процесс: {exc}"
+            ),
+        )
 
-    if (current_name.strip().casefold() != candidate.name.strip().casefold()
-            or current_create_time != candidate.create_time):
-        return ProcessTerminationResult(candidate.pid, candidate.name, False, "PID уже принадлежит другому процессу")
-    if is_protected_process(current_name, candidate.pid):
-        return ProcessTerminationResult(candidate.pid, current_name, False, "Процесс защищён и не может быть завершён")
 
+def _process_identity_matches(
+    candidate: BackgroundTrafficCandidate, name: str, create_time: float
+) -> bool:
+    return (
+        name.strip().casefold() == candidate.name.strip().casefold()
+        and create_time == candidate.create_time
+    )
+
+
+def _terminate_process(process, pid: int, name: str, timeout_s: float) -> ProcessTerminationResult:
     try:
         process.terminate()
         process.wait(timeout=timeout_s)
     except psutil.NoSuchProcess:
-        return ProcessTerminationResult(candidate.pid, current_name, True, "Процесс завершён")
+        return ProcessTerminationResult(pid, name, True, "Процесс завершён")
     except psutil.TimeoutExpired:
         return ProcessTerminationResult(
-            candidate.pid,
-            current_name,
+            pid,
+            name,
             False,
             "Завершение не подтверждено за отведённое время; повторный kill не применяется",
         )
     except psutil.AccessDenied:
-        return ProcessTerminationResult(candidate.pid, current_name, False, "Нет прав для завершения процесса")
+        return ProcessTerminationResult(pid, name, False, "Нет прав для завершения процесса")
     except OSError as exc:
-        return ProcessTerminationResult(candidate.pid, current_name, False, f"Не удалось завершить процесс: {exc}")
-    return ProcessTerminationResult(candidate.pid, current_name, True, "Процесс завершён")
+        return ProcessTerminationResult(pid, name, False, f"Не удалось завершить процесс: {exc}")
+    return ProcessTerminationResult(pid, name, True, "Процесс завершён")
 
 
 def _is_active_socket(connection: object) -> bool:
@@ -268,5 +329,3 @@ def _is_active_socket(connection: object) -> bool:
     if connection_type != socket.SOCK_STREAM:
         return False
     return str(getattr(connection, "status", "")).upper() in _ACTIVE_TCP_STATUSES
-
-

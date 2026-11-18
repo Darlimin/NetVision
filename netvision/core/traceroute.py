@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 import ctypes
 import ipaddress
 import locale
@@ -112,60 +112,12 @@ class MtrAccumulator:
         *,
         at: datetime | None = None,
     ) -> MtrSnapshot:
-        timestamp = at or datetime.now(timezone.utc)
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp = (at or datetime.now().astimezone()).astimezone()
         cycle = tuple(probes)
-        events: list[MtrEvent] = []
-        for probe in cycle:
-            if probe.address is None:
-                continue
-            previous = self._last_addresses.get(probe.ttl)
-            if previous is not None and previous != probe.address:
-                events.append(
-                    MtrEvent(
-                        "route_changed",
-                        probe.ttl,
-                        previous_address=previous,
-                        address=probe.address,
-                    )
-                )
-            self._last_addresses[probe.ttl] = probe.address
+        events = self._route_change_events(cycle)
         self._cycles.append(cycle)
-
         hops, destination_reached = self._build_hops(target_ip)
-        real_start = next((hop for hop in hops if hop.real_loss), None)
-        if real_start is not None:
-            if self._candidate_start == real_start.ttl:
-                self._candidate_cycles += 1
-            else:
-                self._candidate_start = real_start.ttl
-                self._candidate_cycles = 1
-            if (
-                self._active_start is None
-                and self._candidate_cycles >= self._thresholds.mtr_confirm_cycles
-            ):
-                self._active_start = real_start.ttl
-                self._active_at = timestamp
-                events.append(MtrEvent("loss_opened", real_start.ttl, real_start.loss_pct))
-        else:
-            self._candidate_start = None
-            self._candidate_cycles = 0
-
-        if self._active_start is not None:
-            active = next((hop for hop in hops if hop.ttl == self._active_start), None)
-            if active is not None and active.loss_pct < self._thresholds.mtr_loss_clear_pct:
-                duration = (
-                    (timestamp - self._active_at).total_seconds()
-                    if self._active_at is not None
-                    else None
-                )
-                events.append(
-                    MtrEvent("loss_closed", active.ttl, active.loss_pct, duration_s=duration)
-                )
-                self._active_start = None
-                self._active_at = None
-
+        events.extend(self._loss_episode_events(hops, timestamp))
         current = next((hop for hop in hops if hop.real_loss), None)
         return MtrSnapshot(
             target_ip=target_ip,
@@ -177,6 +129,59 @@ class MtrAccumulator:
             real_loss_pct=current.loss_pct if current else None,
             events=tuple(events),
         )
+
+    def _route_change_events(self, cycle: tuple[HopProbe, ...]) -> list[MtrEvent]:
+        events: list[MtrEvent] = []
+        for probe in cycle:
+            if probe.address is None:
+                continue
+            previous = self._last_addresses.get(probe.ttl)
+            if previous is not None and previous != probe.address:
+                events.append(
+                    MtrEvent(
+                        "route_changed", probe.ttl, previous_address=previous, address=probe.address
+                    )
+                )
+            self._last_addresses[probe.ttl] = probe.address
+        return events
+
+    def _loss_episode_events(self, hops: list[MtrHopStats], timestamp: datetime) -> list[MtrEvent]:
+        real_start = next((hop for hop in hops if hop.real_loss), None)
+        opened = self._update_loss_candidate(real_start, timestamp)
+        closed = self._close_active_loss_if_clear(hops, timestamp)
+        return [event for event in (opened, closed) if event is not None]
+
+    def _update_loss_candidate(
+        self, real_start: MtrHopStats | None, timestamp: datetime
+    ) -> MtrEvent | None:
+        if real_start is None:
+            self._candidate_start = None
+            self._candidate_cycles = 0
+            return None
+        if self._candidate_start == real_start.ttl:
+            self._candidate_cycles += 1
+        else:
+            self._candidate_start, self._candidate_cycles = real_start.ttl, 1
+        if (
+            self._active_start is None
+            and self._candidate_cycles >= self._thresholds.mtr_confirm_cycles
+        ):
+            self._active_start, self._active_at = real_start.ttl, timestamp
+            return MtrEvent("loss_opened", real_start.ttl, real_start.loss_pct)
+        return None
+
+    def _close_active_loss_if_clear(
+        self, hops: list[MtrHopStats], timestamp: datetime
+    ) -> MtrEvent | None:
+        if self._active_start is None:
+            return None
+        active = next((hop for hop in hops if hop.ttl == self._active_start), None)
+        if active is None or active.loss_pct >= self._thresholds.mtr_loss_clear_pct:
+            return None
+        duration = (timestamp - self._active_at).total_seconds() if self._active_at else None
+        event = MtrEvent("loss_closed", active.ttl, active.loss_pct, duration_s=duration)
+        self._active_start, self._active_at = None, None
+        return event
 
     def _build_hops(self, target_ip: str) -> tuple[list[MtrHopStats], bool]:
         destination_ttls = [
@@ -319,7 +324,9 @@ def probe_hop(target_ip: str, ttl: int, timeout_ms: int) -> HopProbe:
         address = socket.inet_ntoa(struct.pack("I", reply.Address))
         status = int(reply.Status)
         if status == 0:
-            return HopProbe(ttl, address, float(reply.RoundTripTime), "success", is_destination=True)
+            return HopProbe(
+                ttl, address, float(reply.RoundTripTime), "success", is_destination=True
+            )
         if status == 11013:  # IP_TTL_EXPIRED_TRANSIT
             return HopProbe(ttl, address, float(reply.RoundTripTime), "ttl_expired")
         return HopProbe(ttl, address or None, None, "timeout", f"ICMP status {status}")
@@ -335,20 +342,36 @@ def run_visual_traceroute(
     on_hop: Callable[[TracerouteHop], None] | None = None,
 ) -> tuple[TracerouteHop, ...]:
     """Run the platform traceroute command and emit each parsed hop as it arrives."""
+    host = _validated_traceroute_host(host, max_hops, wait_ms)
+    command = _traceroute_command(host, max_hops, wait_ms)
+    process = _start_traceroute(command)
+    try:
+        hops = _read_traceroute_hops(process, on_hop)
+        _wait_for_traceroute(process, max_hops, wait_ms)
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    return tuple(hops)
+
+
+def _validated_traceroute_host(host: str, max_hops: int, wait_ms: int) -> str:
     host = host.strip()
     if not host:
         raise ValueError("Целевой хост не указан")
     if max_hops < 1 or wait_ms < 1:
         raise ValueError("Параметры трассировки должны быть положительными")
+    return host
 
+
+def _traceroute_command(host: str, max_hops: int, wait_ms: int) -> list[str]:
     if sys.platform == "win32":
-        command = ["tracert", "-w", str(wait_ms), "-h", str(max_hops), host]
-    else:
-        command = ["traceroute", "-n", "-w", str(max(1, wait_ms // 1000)), "-m", str(max_hops), host]
+        return ["tracert", "-w", str(wait_ms), "-h", str(max_hops), host]
+    return ["traceroute", "-n", "-w", str(max(1, wait_ms // 1000)), "-m", str(max_hops), host]
 
-    hops: list[TracerouteHop] = []
+
+def _start_traceroute(command: list[str]):
     try:
-        process = subprocess.Popen(
+        return subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -360,25 +383,29 @@ def run_visual_traceroute(
     except OSError as exc:
         raise RuntimeError(f"Не удалось запустить traceroute: {exc}") from exc
 
+
+def _read_traceroute_hops(
+    process, on_hop: Callable[[TracerouteHop], None] | None
+) -> list[TracerouteHop]:
+    hops: list[TracerouteHop] = []
+    if process.stdout is None:
+        return hops
+    for line in process.stdout:
+        hop = parse_traceroute_line(line)
+        if hop is not None:
+            hops.append(hop)
+            if on_hop is not None:
+                on_hop(hop)
+    return hops
+
+
+def _wait_for_traceroute(process, max_hops: int, wait_ms: int) -> None:
     try:
-        if process.stdout is not None:
-            for line in process.stdout:
-                hop = parse_traceroute_line(line)
-                if hop is None:
-                    continue
-                hops.append(hop)
-                if on_hop is not None:
-                    on_hop(hop)
         process.wait(timeout=max_hops * max(1.0, wait_ms / 1000) + 10)
     except subprocess.TimeoutExpired as exc:
         process.kill()
         process.wait()
         raise RuntimeError("Трассировка превысила допустимое время ожидания") from exc
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-
-    return tuple(hops)
 
 
 def parse_traceroute_line(line: str) -> TracerouteHop | None:
@@ -402,7 +429,9 @@ def parse_traceroute_line(line: str) -> TracerouteHop | None:
                 break
         except ValueError:
             continue
-    timed_out = address is None and ("*" in body or "timed out" in body.casefold() or "превыш" in body.casefold())
+    timed_out = address is None and (
+        "*" in body or "timed out" in body.casefold() or "превыш" in body.casefold()
+    )
     hostname = _extract_hostname(body, address)
     status = "Тайм-аут" if timed_out else "Доступен" if address else "Не определён"
     return TracerouteHop(index, address, hostname, latency_ms, status, timed_out)
@@ -411,7 +440,12 @@ def parse_traceroute_line(line: str) -> TracerouteHop | None:
 def _extract_hostname(body: str, address: str | None) -> str | None:
     value = re.sub(r"<?\d+(?:[.,]\d+)?\s*(?:ms|мс)", " ", body, flags=re.IGNORECASE)
     value = value.replace("*", " ")
-    value = re.sub(r"(?:Request timed out\.|Превышено время ожидания\.?|timed out)", " ", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"(?:Request timed out\.|Превышено время ожидания\.?|timed out)",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
     if address:
         value = value.replace(f"[{address}]", " ").replace(address, " ")
     value = re.sub(r"\s+", " ", value).strip(" []")

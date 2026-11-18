@@ -29,13 +29,18 @@ def _load_inter_fonts() -> str:
     return registered_families[0] if registered_families else "Inter"
 
 
+def _create_main_window(arguments: list[str] | None = None) -> object:
+    """Create the dashboard."""
+    from netvision.ui.dashboard_v2 import NetVisionDashboardV2
+
+    return NetVisionDashboardV2()
+
+
 def main() -> None:
     setup_crash_handler()
-    from netvision.ui.main_window import MainWindow
     from netvision.ui.theme import APP_STYLE
 
     app = QApplication(sys.argv)
-    setup_crash_handler()
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("NetVision")
     app.setApplicationDisplayName("NetVision")
@@ -47,8 +52,7 @@ def main() -> None:
     app.setFont(app_font)
     app.setStyleSheet(APP_STYLE)
 
-    window = MainWindow()
+    window = _create_main_window()
     window.show()
-    QTimer.singleShot(0, window.refresh_processes)
+    QTimer.singleShot(0, window.process_controller.refresh_processes)
     raise SystemExit(app.exec())
-

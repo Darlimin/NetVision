@@ -5,7 +5,6 @@ from pathlib import Path
 
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_THRESHOLD_LITERALS = {15, 100, 150}
 SOURCE_FILES = tuple((PROJECT_ROOT / "netvision").rglob("*.py"))

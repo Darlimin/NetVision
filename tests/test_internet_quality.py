@@ -1,5 +1,3 @@
-import json
-import socket
 import unittest
 from io import BytesIO
 from unittest.mock import patch
@@ -27,8 +25,11 @@ class InternetQualityTests(unittest.TestCase):
         response.__enter__ = lambda: response
         response.__exit__ = lambda *_args: None
 
-        with patch("netvision.core.internet_quality.urllib.request.urlopen", return_value=response) as open_url, patch(
-            "netvision.core.internet_quality.time.perf_counter", side_effect=[10.0, 12.0]
+        with (
+            patch(
+                "netvision.core.internet_quality.urllib.request.urlopen", return_value=response
+            ) as open_url,
+            patch("netvision.core.internet_quality.time.perf_counter", side_effect=[10.0, 12.0]),
         ):
             result = measure_download(urls=("https://cdn.example/test",), timeout=4)
 
@@ -105,8 +106,13 @@ class InternetQualityTests(unittest.TestCase):
         self.assertEqual(open_url.call_count, 2)
 
     @patch("netvision.core.internet_quality.urllib.request.build_opener")
-    @patch("netvision.core.internet_quality.urllib.request.urlopen", side_effect=OSError("proxy refused"))
-    def test_http_request_retries_without_system_proxy(self, _open_url: object, build_opener: object) -> None:
+    @patch(
+        "netvision.core.internet_quality.urllib.request.urlopen",
+        side_effect=OSError("proxy refused"),
+    )
+    def test_http_request_retries_without_system_proxy(
+        self, _open_url: object, build_opener: object
+    ) -> None:
         response = BytesIO(b"x" * DOWNLOAD_BYTES)
         response.__enter__ = lambda: response
         response.__exit__ = lambda *_args: None
@@ -123,7 +129,14 @@ class InternetQualityTests(unittest.TestCase):
         snapshot = SystemSnapshot(
             hostname="pc",
             interfaces=(
-                NetworkInterface("Wi-Fi", "Wi-Fi", True, 866, ipv4=("169.254.53.164", "192.168.31.100"), ipv6=("fe80::1",)),
+                NetworkInterface(
+                    "Wi-Fi",
+                    "Wi-Fi",
+                    True,
+                    866,
+                    ipv4=("169.254.53.164", "192.168.31.100"),
+                    ipv6=("fe80::1",),
+                ),
                 NetworkInterface("happ-xray", "VPN", True, 4294, ipv4=("172.19.0.1",)),
             ),
             gateway=None,
@@ -140,9 +153,13 @@ class InternetQualityTests(unittest.TestCase):
 
     def test_smart_report_describes_autonomous_measurements(self) -> None:
         report = InternetQualityReport(
-            speedtest=SpeedtestResult(download_mbps=80.0, ping_ms=18.0, server_name="Cloudflare DNS"),
+            speedtest=SpeedtestResult(
+                download_mbps=80.0, ping_ms=18.0, server_name="Cloudflare DNS"
+            ),
             network=PublicNetworkInfo(ipv4="198.51.100.40", isp="Example ISP", city="Москва"),
-            local=LocalNetworkContext(adapter_name="Wi-Fi", adapter_speed_mbps=866, local_ipv4=("192.168.1.20",)),
+            local=LocalNetworkContext(
+                adapter_name="Wi-Fi", adapter_speed_mbps=866, local_ipv4=("192.168.1.20",)
+            ),
         )
 
         summary = build_smart_report(report)

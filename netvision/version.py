@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 # Semantic Versioning policy:
-# - PATCH (0.9.0 -> 0.9.1): compatible bug fixes and focused patches.
-# - MINOR (0.9.0 -> 0.10.0): compatible user-facing features.
+# - PATCH (0.10.0 -> 0.10.1): compatible bug fixes and focused patches.
+# - MINOR (0.10.0 -> 0.11.0): compatible user-facing features.
 # - MAJOR (0.x.y -> 1.0.0): incompatible public API or architecture changes.
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # Optional UI-only prerelease label, for example "beta" or "rc.1". Keep the
 # package version above PEP 440-compatible so setuptools can build the project.

@@ -107,8 +107,7 @@ def run_mtu_stress_test(
         raise ValueError("Параметры MTU-проверки некорректны")
 
     return tuple(
-        _probe_mtu_size(host.strip(), size, count=count, wait_ms=wait_ms)
-        for size in payload_sizes
+        _probe_mtu_size(host.strip(), size, count=count, wait_ms=wait_ms) for size in payload_sizes
     )
 
 
@@ -126,7 +125,9 @@ def latency_statistics(
         return LatencyStatistics(None, None, None, None, loss_percent, "Нет ответов")
     average = round(sum(values) / len(values), 1)
     jitter = (
-        round(sum(abs(right - left) for left, right in zip(values, values[1:])) / (len(values) - 1), 1)
+        round(
+            sum(abs(right - left) for left, right in zip(values, values[1:])) / (len(values) - 1), 1
+        )
         if len(values) > 1
         else 0.0
     )
@@ -136,7 +137,9 @@ def latency_statistics(
 
 def _probe_mtu_size(host: str, payload_size: int, *, count: int, wait_ms: int) -> MtuProbeResult:
     if payload_size < 1 or payload_size > 65500:
-        return MtuProbeResult(payload_size, 0, count, 100.0, None, "Размер пакета вне допустимого диапазона")
+        return MtuProbeResult(
+            payload_size, 0, count, 100.0, None, "Размер пакета вне допустимого диапазона"
+        )
     command = _mtu_ping_command(host, payload_size, count, wait_ms)
     try:
         completed = subprocess.run(
@@ -164,7 +167,16 @@ def _probe_mtu_size(host: str, payload_size: int, *, count: int, wait_ms: int) -
 def _mtu_ping_command(host: str, payload_size: int, count: int, wait_ms: int) -> list[str]:
     if os.name == "nt":
         return ["ping", "-n", str(count), "-w", str(wait_ms), "-f", "-l", str(payload_size), host]
-    return ["ping", "-c", str(count), "-W", str(max(1, wait_ms // 1000)), "-s", str(payload_size), host]
+    return [
+        "ping",
+        "-c",
+        str(count),
+        "-W",
+        str(max(1, wait_ms // 1000)),
+        "-s",
+        str(payload_size),
+        host,
+    ]
 
 
 def _mtu_error(output: str, return_code: int) -> str:

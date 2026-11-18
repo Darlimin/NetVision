@@ -79,7 +79,9 @@ def test_hop_breakdown_preserves_order_and_marks_first_loss() -> None:
 
     with patch(
         "netvision.core.packet_loss.probe_ping",
-        side_effect=lambda host, _count, _wait: _ping(host, 0.0 if host.endswith("2.1") else 33.3, 8.0),
+        side_effect=lambda host, _count, _wait: _ping(
+            host, 0.0 if host.endswith("2.1") else 33.3, 8.0
+        ),
     ):
         results = run_hop_loss_breakdown(hops)
 
@@ -89,8 +91,7 @@ def test_hop_breakdown_preserves_order_and_marks_first_loss() -> None:
 
 
 def test_udp_stress_reports_local_send_count_without_claiming_delivery() -> None:
-    with patch("netvision.core.packet_loss.socket.socket") as socket_factory:
-        socket_instance = socket_factory.return_value.__enter__.return_value
+    with patch("netvision.core.packet_loss.socket.socket"):
         result = run_udp_stress_test("127.0.0.1", 443, count=4)
 
     assert result.sent == 4

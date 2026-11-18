@@ -14,6 +14,12 @@ class FakeConnection:
         self.type = connection_type
 
 
+class ObjectEndpoint:
+    def __init__(self, ip: str, port: int):
+        self.ip = ip
+        self.port = port
+
+
 class FakeProcess:
     def __init__(self, name: str, connections=()):
         self._name = name
@@ -30,10 +36,14 @@ class FakeProcess:
 class ProcessInspectorTests(unittest.TestCase):
     @patch.object(process_inspector.psutil, "Process")
     @patch.object(process_inspector.psutil, "net_connections")
-    def test_groups_active_tcp_and_udp_connections_by_process(self, connections_mock, process_mock) -> None:
+    def test_groups_active_tcp_and_udp_connections_by_process(
+        self, connections_mock, process_mock
+    ) -> None:
         connections_mock.return_value = [
             FakeConnection(101, ("192.168.1.4", 52000), ("203.0.113.10", 443), "ESTABLISHED"),
-            FakeConnection(101, ("192.168.1.4", 52001), ("203.0.113.20", 27015), "NONE", socket.SOCK_DGRAM),
+            FakeConnection(
+                101, ("192.168.1.4", 52001), ("203.0.113.20", 27015), "NONE", socket.SOCK_DGRAM
+            ),
             FakeConnection(101, ("192.168.1.4", 52003), (), "NONE", socket.SOCK_DGRAM),
             FakeConnection(101, ("192.168.1.4", 52002), ("203.0.113.30", 80), "LISTEN"),
             FakeConnection(202, ("192.168.1.4", 53000), ("198.51.100.5", 443), "SYN_SENT"),
@@ -52,7 +62,7 @@ class ProcessInspectorTests(unittest.TestCase):
         result = process_inspector.scan_processes()
 
         self.assertIsNone(result.warning)
-        self.assertEqual([item.name for item in result.processes], ["discord.exe", "game.exe"])
+        self.assertEqual([item.name for item in result.processes], ["game.exe"])
         game = next(item for item in result.processes if item.pid == 101)
         self.assertEqual(len(game.connections), 3)
         self.assertEqual(game.connections[0].remote_endpoint, "203.0.113.10:443")
@@ -65,7 +75,17 @@ class ProcessInspectorTests(unittest.TestCase):
         self.assertTrue(process_inspector.is_ignored_process("mDNSResponder.exe"))
         self.assertFalse(process_inspector.is_ignored_process("telegram.exe"))
 
-    @patch.object(process_inspector.psutil, "net_connections", side_effect=process_inspector.psutil.AccessDenied())
+    def test_identifies_only_globally_routable_addresses_as_public(self) -> None:
+        self.assertTrue(process_inspector.is_public_address("8.8.8.8"))
+        self.assertFalse(process_inspector.is_public_address("127.0.0.1"))
+        self.assertFalse(process_inspector.is_public_address("192.168.1.20"))
+        self.assertFalse(process_inspector.is_public_address(""))
+
+    @patch.object(
+        process_inspector.psutil,
+        "net_connections",
+        side_effect=process_inspector.psutil.AccessDenied(),
+    )
     def test_reports_access_denied(self, _connections_mock) -> None:
         result = process_inspector.scan_processes()
 
@@ -87,7 +107,14 @@ class ProcessInspectorTests(unittest.TestCase):
                     ("192.168.1.4", 52100),
                     ("203.0.113.42", 27015),
                     "ESTABLISHED",
-                )
+                ),
+                FakeConnection(
+                    777,
+                    ("192.168.1.4", 52101),
+                    ("8.8.8.8", 27015),
+                    "NONE",
+                    socket.SOCK_DGRAM,
+                ),
             ],
         )
 
@@ -98,6 +125,36 @@ class ProcessInspectorTests(unittest.TestCase):
         self.assertEqual(len(result.processes), 1)
         self.assertEqual(result.processes[0].pid, 777)
         self.assertEqual(result.processes[0].connections[0].remote_endpoint, "203.0.113.42:27015")
+        self.assertEqual(result.processes[0].connections[1].protocol, "UDP")
+        self.assertEqual(result.processes[0].connections[1].status, "NONE")
+
+    @patch.object(process_inspector.psutil, "Process")
+    def test_keeps_udp_peer_from_object_endpoint_with_none_status(self, process_mock) -> None:
+        process_mock.return_value = FakeProcess(
+            "huntgame.exe",
+            [
+                FakeConnection(
+                    777,
+                    ObjectEndpoint("192.168.1.4", 52101),
+                    ObjectEndpoint("8.8.8.8", 27015),
+                    process_inspector.psutil.CONN_NONE,
+                    socket.SOCK_DGRAM,
+                )
+            ],
+        )
+
+        result = process_inspector.scan_process(777)
+
+        connection = result.processes[0].connections[0]
+        self.assertEqual(connection.protocol, "UDP")
+        self.assertEqual(connection.status, process_inspector.psutil.CONN_NONE)
+        self.assertEqual(connection.remote_endpoint, "8.8.8.8:27015")
+        self.assertTrue(process_inspector.is_public_address(connection.remote_address))
+
+    def test_public_address_rejects_empty_or_non_string_endpoint_values(self) -> None:
+        self.assertFalse(process_inspector.is_public_address(""))
+        self.assertFalse(process_inspector.is_public_address(None))
+        self.assertFalse(process_inspector.is_public_address(()))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 """Qt adapters for core probes, with non-blocking monitor lifetime management."""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -7,6 +8,7 @@ import socket
 from threading import Event
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
+from shiboken6 import isValid
 
 from netvision.core.probes import probe_ping
 from netvision.core.system import collect_wifi_snapshot
@@ -41,10 +43,17 @@ class LatencyMonitorWorker(QObject):
     sample = Signal(object, bool)
     finished = Signal()
 
-    def __init__(self, host: str, port: int, interval_s: float = 1.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        interval_s: float = 1.0,
+        protocol: str = "TCP",
+    ) -> None:
         super().__init__()
         self._host, self._port = host, port
         self._interval_s = interval_s
+        self._protocol = protocol.upper()
         self._stop_event = Event()
 
     def stop(self) -> None:
@@ -56,8 +65,12 @@ class LatencyMonitorWorker(QObject):
         try:
             while not self._stop_event.is_set():
                 try:
-                    result = probe_tcp_connect(self._host, self._port, timeout=1.0)
-                    latency, success = result.connect_ms, result.is_open
+                    if self._protocol == "UDP":
+                        result = probe_ping(self._host, count=1, wait_ms=1000)
+                        latency, success = result.average_ms, bool(result.received)
+                    else:
+                        result = probe_tcp_connect(self._host, self._port, timeout=1.0)
+                        latency, success = result.connect_ms, result.is_open
                 except Exception:
                     latency, success = None, False
                 if self._stop_event.is_set():
@@ -105,11 +118,13 @@ class WifiMonitorWorker(QObject):
         route_interface: str,
         gateway: str,
         *,
+        route_is_vpn: bool = False,
         th: Thresholds = DEFAULT_THRESHOLDS,
     ) -> None:
         super().__init__()
         self._route_interface = route_interface
         self._gateway = gateway
+        self._route_is_vpn = route_is_vpn
         self._thresholds = th
         self._stop_event = Event()
 
@@ -122,7 +137,10 @@ class WifiMonitorWorker(QObject):
             while not self._stop_event.is_set():
                 state = "ok"
                 try:
-                    snapshot = collect_wifi_snapshot(self._route_interface)
+                    snapshot = collect_wifi_snapshot(
+                        self._route_interface,
+                        allow_vpn_fallback=self._route_is_vpn,
+                    )
                 except OSError:
                     snapshot = None
                     state = "unavailable"
@@ -171,44 +189,16 @@ class MtrMonitorWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
+            if self._stop_event.is_set():
+                return
             target_ip = self._resolve_target()
             accumulator = MtrAccumulator(
                 self._thresholds.mtr_window_cycles,
                 thresholds=self._thresholds,
             )
-            with ThreadPoolExecutor(
-                max_workers=min(8, self._thresholds.mtr_max_hops)
-            ) as executor:
+            with ThreadPoolExecutor(max_workers=min(8, self._thresholds.mtr_max_hops)) as executor:
                 while not self._stop_event.is_set():
-                    probes = []
-                    reached_destination = False
-                    workers = min(8, self._thresholds.mtr_max_hops)
-                    for first_ttl in range(1, self._thresholds.mtr_max_hops + 1, workers):
-                        batch = [
-                            (
-                                ttl,
-                                executor.submit(
-                                    probe_hop,
-                                    target_ip,
-                                    ttl,
-                                    self._thresholds.mtr_probe_timeout_ms,
-                                ),
-                            )
-                            for ttl in range(
-                                first_ttl,
-                                min(first_ttl + workers, self._thresholds.mtr_max_hops + 1),
-                            )
-                        ]
-                        for _ttl, future in batch:
-                            if self._stop_event.is_set():
-                                break
-                            probe = future.result()
-                            probes.append(probe)
-                            if probe.is_destination:
-                                reached_destination = True
-                                break
-                        if self._stop_event.is_set() or reached_destination:
-                            break
+                    probes, _reached_destination = self._collect_probe_cycle(executor, target_ip)
                     if self._stop_event.is_set():
                         break
                     snapshot = accumulator.update(target_ip, probes)
@@ -221,6 +211,40 @@ class MtrMonitorWorker(QObject):
                 self.failed.emit(f"MTR недоступен: {exc}")
         finally:
             self.finished.emit()
+
+    def _collect_probe_cycle(self, executor, target_ip: str) -> tuple[list, bool]:
+        probes = []
+        reached_destination = False
+        workers = min(8, self._thresholds.mtr_max_hops)
+        for first_ttl in range(1, self._thresholds.mtr_max_hops + 1, workers):
+            if self._stop_event.is_set():
+                break
+            batch = [
+                (
+                    ttl,
+                    executor.submit(
+                        probe_hop,
+                        target_ip,
+                        ttl,
+                        self._thresholds.mtr_probe_timeout_ms,
+                    ),
+                )
+                for ttl in range(
+                    first_ttl,
+                    min(first_ttl + workers, self._thresholds.mtr_max_hops + 1),
+                )
+            ]
+            for _ttl, future in batch:
+                if self._stop_event.is_set():
+                    break
+                probe = future.result()
+                probes.append(probe)
+                if probe.is_destination:
+                    reached_destination = True
+                    break
+            if self._stop_event.is_set() or reached_destination:
+                break
+        return probes, reached_destination
 
     def _resolve_target(self) -> str:
         records = socket.getaddrinfo(self._host.strip(), None, socket.AF_INET)
@@ -241,13 +265,31 @@ class WorkerRegistry(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._jobs: dict[QThread, QObject] = {}
+        self._active_threads: set[QThread] = set()
+        self._release_timer = QTimer(self)
+        self._release_timer.setSingleShot(True)
+        self._release_timer.timeout.connect(self._release, Qt.ConnectionType.QueuedConnection)
 
     @property
     def busy(self) -> bool:
         return bool(self._jobs)
 
+    @staticmethod
+    def _is_alive(value: object | None) -> bool:
+        try:
+            return value is not None and isValid(value)
+        except RuntimeError:
+            return False
+
     def start(self, worker: QObject) -> QThread:
-        thread = QThread(self)
+        if not self._is_alive(self) or not self._is_alive(worker):
+            raise RuntimeError("Cannot start a deleted registry or worker")
+        if QThread.currentThread() != self.thread() or worker.thread() != self.thread():
+            raise RuntimeError("Registry and worker must belong to the calling thread")
+        if worker.parent() is not None:
+            raise ValueError("A worker moved to a thread must not have a QObject parent")
+        thread = QThread()
+        self._active_threads.add(thread)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         # quit() is thread-safe. Direct delivery does not require a GUI event
@@ -260,18 +302,33 @@ class WorkerRegistry(QObject):
     def retain(self, thread: QThread, worker: QObject) -> None:
         """Own a one-shot worker as well as monitors until native cleanup ends."""
         self._jobs[thread] = worker
+        self._active_threads.add(thread)
         thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._release)
+        thread.finished.connect(self._release, Qt.ConnectionType.QueuedConnection)
 
     def stop(self, thread: QThread | None) -> None:
+        if not self._is_alive(thread):
+            return
         worker = self._jobs.get(thread)
-        if hasattr(worker, "stop") and callable(worker.stop):
+        if self._is_alive(worker) and hasattr(worker, "stop") and callable(worker.stop):
             worker.stop()
 
     def stop_all(self) -> None:
         for worker in self._jobs.values():
-            if hasattr(worker, "stop") and callable(worker.stop):
+            if self._is_alive(worker) and hasattr(worker, "stop") and callable(worker.stop):
                 worker.stop()
+
+    def wait_for_all(self, timeout_ms: int) -> bool:
+        """Wait at most timeout_ms in total; intended for bounded test teardown."""
+        from time import monotonic
+
+        deadline = monotonic() + max(timeout_ms, 0) / 1000
+        for thread in tuple(self._active_threads):
+            if self._is_alive(thread):
+                remaining = max(0, int((deadline - monotonic()) * 1000))
+                if not thread.wait(remaining):
+                    return False
+        return True
 
     @Slot()
     def _release(self) -> None:
@@ -279,13 +336,26 @@ class WorkerRegistry(QObject):
         # Deleting QThread here can block Python's GIL during that cleanup.
         pending_cleanup = False
         for thread in tuple(self._jobs):
-            if thread.isFinished():
-                if thread.wait(0):
-                    self._jobs.pop(thread)
+            if not self._is_alive(thread):
+                self._jobs.pop(thread, None)
+                self._active_threads.discard(thread)
+                continue
+            try:
+                finished = thread.isFinished()
+                joined = thread.wait(0) if finished else False
+            except RuntimeError:
+                self._jobs.pop(thread, None)
+                self._active_threads.discard(thread)
+                continue
+            if joined:
+                self._jobs.pop(thread, None)
+                self._active_threads.discard(thread)
+                if self._is_alive(thread):
                     thread.deleteLater()
-                else:
-                    pending_cleanup = True
+            else:
+                pending_cleanup = True
         if pending_cleanup:
-            QTimer.singleShot(10, self._release)
+            if not self._release_timer.isActive():
+                self._release_timer.start(10)
         if not self._jobs:
             self.idle.emit()

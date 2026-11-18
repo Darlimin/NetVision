@@ -6,7 +6,6 @@ import os
 import socket
 import struct
 
-
 DEFAULT_STUN_SERVERS = (
     ("stun.l.google.com", 19302),
     ("stun.cloudflare.com", 3478),
@@ -122,8 +121,7 @@ def probe_nat(
         cgnat_likely=cgnat_likely,
         double_nat_likely=double_nat_likely,
         udp_egress_differs=bool(
-            external_ip
-            and any(endpoint.mapped_ip != external_ip for endpoint in mapped)
+            external_ip and any(endpoint.mapped_ip != external_ip for endpoint in mapped)
         ),
     )
 
@@ -234,8 +232,7 @@ def _route_heuristics(hops: tuple[object, ...], hop_limit: int) -> tuple[bool, b
     first_hops = tuple(hops)[: max(0, hop_limit)]
     cgnat_likely = any(_in_network(_hop_address(hop), "100.64.0.0", 10) for hop in first_hops)
     double_nat_likely = any(
-        2 <= int(getattr(hop, "index", 0)) <= hop_limit
-        and _is_private_ipv4(_hop_address(hop))
+        2 <= int(getattr(hop, "index", 0)) <= hop_limit and _is_private_ipv4(_hop_address(hop))
         for hop in first_hops
     )
     return cgnat_likely, double_nat_likely

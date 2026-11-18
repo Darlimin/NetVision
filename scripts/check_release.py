@@ -7,8 +7,6 @@ import ast
 import json
 from pathlib import Path
 import re
-import sys
-
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALES = ("netvision/ui/ru-ru.json", "netvision/ui/en-en.json")
@@ -46,7 +44,9 @@ def check_localization_keys(root: Path) -> list[str]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            failures.append(f"Localization file is unavailable or invalid: {relative_path} ({error})")
+            failures.append(
+                f"Localization file is unavailable or invalid: {relative_path} ({error})"
+            )
             continue
         if not isinstance(payload, dict):
             failures.append(f"Localization catalog is not an object: {relative_path}")

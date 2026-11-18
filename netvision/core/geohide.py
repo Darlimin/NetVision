@@ -11,7 +11,6 @@ from urllib.request import Request, urlopen
 
 from netvision.version import __version__
 
-
 GEOHIDE_URL = "https://geohide.ru/"
 _IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 _BLOCK_RE = re.compile(
@@ -120,79 +119,15 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
     """Extract public IPv4 addresses and DNS/UDP-related text from the page."""
     payload_truncated = len(payload) > MAX_PAYLOAD_CHARS
     payload = payload[:MAX_PAYLOAD_CHARS]
-    blocks: list[str] = []
-    block_limit_reached = False
-    for block_index, match in enumerate(_BLOCK_RE.finditer(payload)):
-        if block_index >= MAX_BLOCKS:
-            block_limit_reached = True
-            break
-        text = html.unescape(_HTML_TAG_RE.sub(" ", match.group(1)[:MAX_BLOCK_TEXT_CHARS]))
-        text = " ".join(text.split())
-        if text:
-            blocks.append(text)
-
+    blocks, block_limit_reached = _page_blocks(payload)
     servers: list[GeoHideServer] = []
     seen_addresses: set[str] = set()
     parameters: list[str] = []
-    confirmed = False
-    for block in blocks:
-        found = _public_addresses(block)
-        if not found or not _BLOCK_DNS_TERMS.search(block):
-            continue
-        confirmed = True
-        region = _region_for_text(block)
-        server_type = _server_type_for_text(block)
-        for address in found:
-            if address in seen_addresses:
-                continue
-            server = GeoHideServer(address, region, server_type)
-            servers.append(server)
-            seen_addresses.add(address)
-        if block not in parameters and len(block) <= 240:
-            parameters.append(block)
-
-    # Some versions of the page render the server list in scripts or cards
-    # that are not covered by the block expression. Scan the complete text
-    # and keep every public address, using nearby RU/EU/US context.
-    ip_limit_reached = False
-    for ip_index, match in enumerate(_IPV4_RE.finditer(payload)):
-        if ip_index >= MAX_IP_MATCHES:
-            ip_limit_reached = True
-            break
-        address = match.group(0)
-        if address in seen_addresses or not _is_public_ipv4(address):
-            continue
-        context = html.unescape(
-            _HTML_TAG_RE.sub(
-                " ",
-                payload[
-                    max(0, match.start() - MAX_CONTEXT_CHARS):
-                    match.end() + MAX_CONTEXT_CHARS
-                ],
-            )
-        )
-        if not (
-            _DNS_TERMS.search(context)
-            or _SERVER_TERMS.search(context)
-            or _region_for_text(context) != "Global"
-        ):
-            continue
-        server = GeoHideServer(
-            address,
-            _region_context(payload, match.start(), match.end()),
-            _server_type_for_text(context),
-        )
-        servers.append(server)
-        seen_addresses.add(address)
-        confirmed = confirmed or bool(_BLOCK_DNS_TERMS.search(context))
-
-    if not servers:
-        for address in _public_addresses(payload):
-            if address not in seen_addresses:
-                servers.append(
-                    GeoHideServer(address, _region_for_text(payload), _server_type_for_text(payload))
-                )
-                seen_addresses.add(address)
+    confirmed = _collect_block_servers(blocks, servers, seen_addresses, parameters)
+    ip_limit_reached, confirmed = _collect_context_servers(
+        payload, servers, seen_addresses, confirmed
+    )
+    _add_fallback_servers(payload, servers, seen_addresses)
 
     return GeoHideResult(
         servers=tuple(servers),
@@ -200,6 +135,112 @@ def parse_geohide_page(payload: str) -> GeoHideResult:
         confirmed=confirmed,
         truncated=payload_truncated or block_limit_reached or ip_limit_reached,
     )
+
+
+def _page_blocks(payload: str) -> tuple[list[str], bool]:
+    blocks: list[str] = []
+    for block_index, match in enumerate(_BLOCK_RE.finditer(payload)):
+        if block_index >= MAX_BLOCKS:
+            return blocks, True
+        text = html.unescape(_HTML_TAG_RE.sub(" ", match.group(1)[:MAX_BLOCK_TEXT_CHARS]))
+        text = " ".join(text.split())
+        if text:
+            blocks.append(text)
+    return blocks, False
+
+
+def _collect_block_servers(
+    blocks: list[str],
+    servers: list[GeoHideServer],
+    seen_addresses: set[str],
+    parameters: list[str],
+) -> bool:
+    confirmed = False
+    for block in blocks:
+        found = _public_addresses(block)
+        if not found or not _BLOCK_DNS_TERMS.search(block):
+            continue
+        confirmed = True
+        for address in found:
+            _add_server(
+                servers,
+                seen_addresses,
+                address,
+                _region_for_text(block),
+                _server_type_for_text(block),
+            )
+        if block not in parameters and len(block) <= 240:
+            parameters.append(block)
+    return confirmed
+
+
+def _collect_context_servers(
+    payload: str,
+    servers: list[GeoHideServer],
+    seen_addresses: set[str],
+    confirmed: bool,
+) -> tuple[bool, bool]:
+    for ip_index, match in enumerate(_IPV4_RE.finditer(payload)):
+        if ip_index >= MAX_IP_MATCHES:
+            return True, confirmed
+        address = match.group(0)
+        context = _ip_context(payload, match.start(), match.end())
+        if (
+            address in seen_addresses
+            or not _is_public_ipv4(address)
+            or not _is_server_context(context)
+        ):
+            continue
+        _add_server(
+            servers,
+            seen_addresses,
+            address,
+            _region_context(payload, match.start(), match.end()),
+            _server_type_for_text(context),
+        )
+        confirmed = confirmed or bool(_BLOCK_DNS_TERMS.search(context))
+    return False, confirmed
+
+
+def _ip_context(payload: str, start: int, end: int) -> str:
+    return html.unescape(
+        _HTML_TAG_RE.sub(" ", payload[max(0, start - MAX_CONTEXT_CHARS) : end + MAX_CONTEXT_CHARS])
+    )
+
+
+def _is_server_context(context: str) -> bool:
+    return bool(
+        _DNS_TERMS.search(context)
+        or _SERVER_TERMS.search(context)
+        or _region_for_text(context) != "Global"
+    )
+
+
+def _add_fallback_servers(
+    payload: str, servers: list[GeoHideServer], seen_addresses: set[str]
+) -> None:
+    if servers:
+        return
+    for address in _public_addresses(payload):
+        _add_server(
+            servers,
+            seen_addresses,
+            address,
+            _region_for_text(payload),
+            _server_type_for_text(payload),
+        )
+
+
+def _add_server(
+    servers: list[GeoHideServer],
+    seen_addresses: set[str],
+    address: str,
+    region: str,
+    server_type: str,
+) -> None:
+    if address not in seen_addresses:
+        servers.append(GeoHideServer(address, region, server_type))
+        seen_addresses.add(address)
 
 
 def fetch_geohide_dns(timeout: float = 12.0) -> GeoHideResult:

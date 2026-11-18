@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from enum import Enum
 import json
 import os
@@ -13,8 +13,8 @@ from uuid import uuid4
 
 from netvision.core.test_history import default_history_path
 
-
 MAX_JOURNAL_EVENTS = 2000
+COMPACT_RATIO = 1.25
 
 
 class Layer(str, Enum):
@@ -29,6 +29,9 @@ KIND_LAYER: dict[str, Layer] = {
     "udp.port_opened": Layer.MEASUREMENT,
     "udp.port_closed": Layer.MEASUREMENT,
     "udp.monitor_error": Layer.MEASUREMENT,
+    "udp.capture_started": Layer.MEASUREMENT,
+    "udp.endpoint_observed": Layer.MEASUREMENT,
+    "udp.capture_failed": Layer.MEASUREMENT,
     "udp.possible_disconnect": Layer.INFERENCE,
     "process.sockets": Layer.MEASUREMENT,
     "vpn.bypass_suspected": Layer.INFERENCE,
@@ -109,8 +112,7 @@ class JournalEvent:
             layer = Layer(str(payload["layer"]))
         except (KeyError, TypeError, ValueError):
             return None
-        if at.tzinfo is None:
-            at = at.replace(tzinfo=timezone.utc)
+        at = at.astimezone()
         values = payload.get("values", {})
         refs = payload.get("refs", {})
         if not isinstance(values, dict) or not isinstance(refs, dict):
@@ -144,25 +146,41 @@ class JournalStore:
             raise ValueError("Journal limit must be positive")
         self.path = path or default_journal_path()
         self.limit = limit
+        self._events: list[JournalEvent] | None = None
 
     def load(self) -> list[JournalEvent]:
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
-            return []
-        events = [event for line in lines if (event := self._decode_line(line)) is not None]
-        return events[-self.limit:]
+        if self._events is None:
+            try:
+                lines = self.path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
+                lines = []
+            self._events = [
+                event for line in lines if (event := self._decode_line(line)) is not None
+            ]
+        return list(self._events[-self.limit :])
 
     def append(self, event: JournalEvent) -> JournalEvent:
-        events = self.load()
-        events.append(event)
-        self._write(events[-self.limit:])
+        self.load()
+        self._append_line(event)
+        self._events.append(event)
+        if len(self._events) > self.limit * COMPACT_RATIO:
+            self._events = self._events[-self.limit :]
+            self._write(self._events)
         return event
 
     def clear(self, *, session: str | None = None) -> None:
-        events = self.load()
-        remaining = [] if session is None else [event for event in events if event.session != session]
-        self._write(remaining)
+        self.load()
+        remaining = (
+            [] if session is None else [event for event in self._events if event.session != session]
+        )
+        self._events = remaining[-self.limit :]
+        self._write(self._events)
+
+    def _append_line(self, event: JournalEvent) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(event.to_dict(), ensure_ascii=False, default=_json_default))
+            output.write("\n")
 
     @staticmethod
     def _decode_line(line: str) -> JournalEvent | None:
@@ -185,7 +203,9 @@ class JournalStore:
             ) as output:
                 temporary_path = Path(output.name)
                 for event in events:
-                    output.write(json.dumps(event.to_dict(), ensure_ascii=False, default=_json_default))
+                    output.write(
+                        json.dumps(event.to_dict(), ensure_ascii=False, default=_json_default)
+                    )
                     output.write("\n")
             os.replace(temporary_path, self.path)
         finally:
@@ -206,13 +226,17 @@ class SessionJournal:
 
     def events(self, *, include_past_sessions: bool = False) -> list[JournalEvent]:
         events = self.store.load()
-        return events if include_past_sessions else [event for event in events if event.session == self.session]
+        return (
+            events
+            if include_past_sessions
+            else [event for event in events if event.session == self.session]
+        )
 
     def recent(self, kind_prefix: str = "", since_s: float | None = None) -> list[JournalEvent]:
         """Return current-session events matching a kind prefix and optional age limit."""
         cutoff = None
         if since_s is not None:
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(0.0, since_s))
+            cutoff = datetime.now().astimezone() - timedelta(seconds=max(0.0, since_s))
         return [
             event
             for event in self.events()
@@ -222,11 +246,7 @@ class SessionJournal:
     def export(self, since: datetime | None = None) -> list[dict[str, object]]:
         """Serialize current-session events for inclusion in a diagnostic bundle."""
         cutoff = _as_aware(since) if since is not None else None
-        return [
-            event.to_dict()
-            for event in self.events()
-            if cutoff is None or event.at >= cutoff
-        ]
+        return [event.to_dict() for event in self.events() if cutoff is None or event.at >= cutoff]
 
     def record(
         self,
@@ -257,10 +277,10 @@ class SessionJournal:
 
 def _as_aware(value: datetime | None) -> datetime:
     if value is None:
-        return datetime.now(timezone.utc)
+        return datetime.now().astimezone()
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.astimezone()
+    return value.astimezone()
 
 
 def _json_default(value: object) -> str:

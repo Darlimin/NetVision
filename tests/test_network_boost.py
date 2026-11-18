@@ -7,7 +7,9 @@ from netvision.core.network_boost import BackgroundTrafficCandidate
 
 
 class FakeConnection:
-    def __init__(self, pid, connection_type, status="", local_address=("192.168.1.5", 50000)) -> None:
+    def __init__(
+        self, pid, connection_type, status="", local_address=("192.168.1.5", 50000)
+    ) -> None:
         self.pid = pid
         self.type = connection_type
         self.status = status
@@ -40,7 +42,9 @@ class FakeProcess:
 class NetworkBoostTests(unittest.TestCase):
     @patch.object(network_boost.psutil, "Process")
     @patch.object(network_boost.psutil, "net_connections")
-    def test_scanner_only_returns_known_non_system_background_apps(self, connections_mock, process_mock) -> None:
+    def test_scanner_only_returns_known_non_system_background_apps(
+        self, connections_mock, process_mock
+    ) -> None:
         connections_mock.return_value = [
             FakeConnection(101, socket.SOCK_STREAM, "ESTABLISHED"),
             FakeConnection(101, socket.SOCK_STREAM, "SYN_SENT"),
@@ -72,14 +76,18 @@ class NetworkBoostTests(unittest.TestCase):
         self.assertTrue(network_boost.is_protected_process("svchost.exe"))
         self.assertTrue(network_boost.is_protected_process("explorer.exe"))
         self.assertTrue(network_boost.is_protected_process("NetVision.exe"))
-        self.assertTrue(network_boost.is_protected_process("qBittorrent.exe", network_boost.os.getpid()))
+        self.assertTrue(
+            network_boost.is_protected_process("qBittorrent.exe", network_boost.os.getpid())
+        )
         self.assertFalse(network_boost.is_protected_process("qBittorrent.exe", 12345))
 
     @patch.object(network_boost.psutil, "Process")
     def test_termination_revalidates_identity_before_terminate(self, process_mock) -> None:
         process = FakeProcess(101, "qBittorrent.exe")
         process_mock.return_value = process
-        candidate = BackgroundTrafficCandidate(101, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 3, 1000.0)
+        candidate = BackgroundTrafficCandidate(
+            101, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 3, 1000.0
+        )
 
         result = network_boost.terminate_background_candidates((candidate,))
 
@@ -92,7 +100,9 @@ class NetworkBoostTests(unittest.TestCase):
     def test_termination_refuses_pid_reused_by_another_process(self, process_mock) -> None:
         process = FakeProcess(101, "steam.exe")
         process_mock.return_value = process
-        candidate = BackgroundTrafficCandidate(101, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 1, 1000.0)
+        candidate = BackgroundTrafficCandidate(
+            101, "qBittorrent.exe", "qBittorrent", "Торрент-клиент", 1, 1000.0
+        )
 
         result = network_boost.terminate_background_candidates((candidate,))
 
@@ -136,7 +146,9 @@ class NetworkBoostTests(unittest.TestCase):
         process.create_time.return_value = 1000.0
         process.wait.side_effect = network_boost.psutil.TimeoutExpired(0.01)
         candidate = BackgroundTrafficCandidate(12345, "steam.exe", "Steam", "", 1, 1000.0)
-        results = network_boost.terminate_background_candidates((candidate, candidate), timeout_s=0.01)
+        results = network_boost.terminate_background_candidates(
+            (candidate, candidate), timeout_s=0.01
+        )
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
         process.terminate.assert_called_once()
@@ -145,14 +157,20 @@ class NetworkBoostTests(unittest.TestCase):
     @patch.object(network_boost.psutil, "Process")
     def test_disappeared_and_access_denied_processes_are_reported(self, process_mock) -> None:
         candidate = BackgroundTrafficCandidate(12345, "steam.exe", "Steam", "", 1, 1000.0)
-        for error, success in ((network_boost.psutil.NoSuchProcess(12345), True),
-                               (network_boost.psutil.AccessDenied(12345), False)):
+        for error, success in (
+            (network_boost.psutil.NoSuchProcess(12345), True),
+            (network_boost.psutil.AccessDenied(12345), False),
+        ):
             process_mock.side_effect = error
-            self.assertEqual(network_boost.terminate_background_candidates((candidate,))[0].success, success)
+            self.assertEqual(
+                network_boost.terminate_background_candidates((candidate,))[0].success, success
+            )
 
     @patch.object(network_boost.psutil, "Process")
     @patch.object(network_boost.psutil, "net_connections")
-    def test_scanning_empty_inaccessible_and_disappeared_processes(self, connections_mock, process_mock) -> None:
+    def test_scanning_empty_inaccessible_and_disappeared_processes(
+        self, connections_mock, process_mock
+    ) -> None:
         connections_mock.return_value = []
         self.assertEqual(network_boost.scan_background_traffic_candidates().candidates, ())
         process_mock.assert_not_called()

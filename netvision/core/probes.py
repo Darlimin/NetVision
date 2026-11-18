@@ -94,7 +94,9 @@ def probe_ping(host: str, count: int = 5, wait_ms: int = 900) -> PingResult:
     loss = round((count - received) * 100 / count, 1) if count else 0.0
     average = round(sum(samples) / received, 1) if received else None
     jitter = (
-        round(sum(abs(right - left) for left, right in zip(samples, samples[1:])) / (received - 1), 1)
+        round(
+            sum(abs(right - left) for left, right in zip(samples, samples[1:])) / (received - 1), 1
+        )
         if received > 1
         else None
     )
@@ -120,6 +122,14 @@ def probe_ping(host: str, count: int = 5, wait_ms: int = 900) -> PingResult:
 
 
 def parse_ping_samples(output: str) -> tuple[float, ...]:
+    try:
+        import netvision_rs
+
+        parser = getattr(netvision_rs, "parse_ping_output", None)
+        if parser is not None:
+            return tuple(float(value) for value in parser(output))
+    except (ImportError, RuntimeError, ValueError):
+        pass
     samples: list[float] = []
     ttl_pattern = re.compile(r"TTL\s*=", flags=re.IGNORECASE)
     value_pattern = re.compile(r"([=<])\s*(\d+(?:[.,]\d+)?)")
@@ -189,9 +199,9 @@ def _optional_text(value: object) -> str | None:
 
 def probe_tls(target: Target, timeout: float = 5.0) -> TlsResult:
     started = time.perf_counter()
-    context = ssl.create_default_context()
-    context.set_alpn_protocols(["h2", "http/1.1"])
     try:
+        context = ssl.create_default_context()
+        context.set_alpn_protocols(["h2", "http/1.1"])
         with socket.create_connection((target.host, target.port), timeout=timeout) as raw:
             with context.wrap_socket(raw, server_hostname=target.host) as secure:
                 certificate = secure.getpeercert()
@@ -240,6 +250,29 @@ def trace_route(target: Target, max_hops: int = 10, wait_ms: int = 650) -> tuple
 
 
 def parse_tracert_output(output: str) -> tuple[HopResult, ...]:
+    try:
+        import netvision_rs
+
+        parser = getattr(netvision_rs, "parse_tracert_rows", None)
+        if parser is not None and not any(c.isdecimal() and not c.isascii() for c in output):
+            rows = parser(output.splitlines())
+            return tuple(
+                _tracert_hop(int(index), body, latencies) for index, body, latencies in rows
+            )
+    except (ImportError, RuntimeError, ValueError, OverflowError):
+        pass
+    return _parse_tracert_output_python(output)
+
+
+def _tracert_hop(index: int, body: str, latency_values: list[float]) -> HopResult:
+    address = _trailing_ip_address(body)
+    latency = round(sum(latency_values) / len(latency_values), 1) if latency_values else None
+    return HopResult(
+        index=index, address=address, latency_ms=latency, timed_out=address is None and "*" in body
+    )
+
+
+def _parse_tracert_output_python(output: str) -> tuple[HopResult, ...]:
     hops: list[HopResult] = []
     for line in output.splitlines():
         match = re.match(r"^\s*(\d+)\s+(.+)$", line)
@@ -247,14 +280,11 @@ def parse_tracert_output(output: str) -> tuple[HopResult, ...]:
             continue
         index = int(match.group(1))
         body = match.group(2)
-        address = _trailing_ip_address(body)
         latency_values = [
             float(value.replace(",", "."))
             for value in re.findall(r"<?(\d+(?:[.,]\d+)?)\s*(?:ms|мс)", body, re.IGNORECASE)
         ]
-        latency = round(sum(latency_values) / len(latency_values), 1) if latency_values else None
-        timed_out = address is None and "*" in body
-        hops.append(HopResult(index=index, address=address, latency_ms=latency, timed_out=timed_out))
+        hops.append(_tracert_hop(index, body, latency_values))
     return tuple(hops)
 
 
@@ -290,7 +320,11 @@ def _certificate_name(parts: object) -> str | None:
         if not isinstance(group, tuple):
             continue
         for item in group:
-            if isinstance(item, tuple) and len(item) == 2 and item[0] in {"commonName", "organizationName"}:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and item[0] in {"commonName", "organizationName"}
+            ):
                 values.append(str(item[1]))
     return " / ".join(dict.fromkeys(values)) or None
 
@@ -302,4 +336,3 @@ def _parse_certificate_date(value: object) -> datetime | None:
         return datetime.fromtimestamp(ssl.cert_time_to_seconds(value))
     except (ValueError, OverflowError):
         return None
-

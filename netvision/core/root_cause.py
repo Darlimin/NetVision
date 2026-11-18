@@ -50,25 +50,7 @@ def analyze_report(
     if bypass_finding is not None:
         findings.append(bypass_finding)
 
-    if is_udp_target:
-        findings.append(
-            RootCauseFinding(
-                CauseSeverity.INFO,
-                "Выбран UDP-endpoint",
-                "TCP-проверка не является решающей для игрового UDP-трафика; ориентируйтесь на ping, потери и маршрут.",
-                "Процесс установил UDP-соединение с выбранным адресом",
-            )
-        )
-        if nat is not None and nat.nat_type == "apdm":
-            findings.append(
-                RootCauseFinding(
-                    CauseSeverity.WARNING,
-                    "Strict NAT: P2P-соединения (голос, пати) могут не устанавливаться",
-                    "STUN обнаружил зависимое от адреса или порта сопоставление UDP."
-                    " Это усложняет прямые P2P-соединения.",
-                    "; ".join(endpoint.display for endpoint in nat.mapped_endpoints),
-                )
-            )
+    findings.extend(_udp_target_findings(is_udp_target, nat))
 
     if report.dns.status == ProbeStatus.ERROR:
         findings.append(
@@ -89,6 +71,10 @@ def analyze_report(
                 report.tcp.error or f"TCP-порт {report.target.port} не подтвердил соединение",
             )
         )
+
+    mtu_finding = _mtu_finding(report, th)
+    if mtu_finding is not None:
+        findings.append(mtu_finding)
 
     if _has_local_latency_problem(report, th) or _has_wifi_problem(wifi, th):
         findings.append(
@@ -131,6 +117,33 @@ def analyze_report(
     )
 
 
+def _udp_target_findings(
+    is_udp_target: bool,
+    nat: NatReport | None,
+) -> tuple[RootCauseFinding, ...]:
+    if not is_udp_target:
+        return ()
+    findings = [
+        RootCauseFinding(
+            CauseSeverity.INFO,
+            "Выбран UDP-endpoint",
+            "TCP-проверка не является решающей для игрового UDP-трафика; ориентируйтесь на ping, потери и маршрут.",
+            "Процесс установил UDP-соединение с выбранным адресом",
+        )
+    ]
+    if nat is not None and nat.nat_type == "apdm":
+        findings.append(
+            RootCauseFinding(
+                CauseSeverity.WARNING,
+                "Strict NAT: P2P-соединения (голос, пати) могут не устанавливаться",
+                "STUN обнаружил зависимое от адреса или порта сопоставление UDP."
+                " Это усложняет прямые P2P-соединения.",
+                "; ".join(endpoint.display for endpoint in nat.mapped_endpoints),
+            )
+        )
+    return tuple(findings)
+
+
 def _legacy_route_finding(report: DiagnosticReport) -> RootCauseFinding | None:
     if not _has_route_problem(report):
         return None
@@ -160,51 +173,11 @@ def vpn_bypass_connections(
 ) -> RootCauseFinding | None:
     """Detect global process sockets that bypass an active VPN interface."""
     routes = report.system.default_routes
-    if (
-        process is None
-        or not routes
-        or not routes[0].is_vpn
-        or _is_vpn_name(process.name)
-    ):
+    if process is None or not routes or not routes[0].is_vpn or _is_vpn_name(process.name):
         return None
 
-    vpn_addresses: set[str] = set()
-    physical_addresses: dict[str, str] = {}
-    for interface in report.system.interfaces:
-        addresses = (*interface.ipv4, *interface.ipv6)
-        if interface.kind == "VPN":
-            vpn_addresses.update(
-                address for value in addresses if (address := _ip_address(value)) is not None
-            )
-        elif interface.kind != "Loopback":
-            for value in addresses:
-                address = _ip_address(value)
-                if address is not None:
-                    physical_addresses[address] = interface.name
-
-    for route in routes:
-        if route.is_vpn and (address := _ip_address(route.local_address)) is not None:
-            vpn_addresses.add(address)
-
-    evidence: list[str] = []
-    for connection in process.connections:
-        remote_address = _global_address(connection.remote_address)
-        local_address = _ip_address(connection.local_address)
-        if (
-            remote_address is None
-            or local_address is None
-            or local_address in vpn_addresses
-            or local_address not in physical_addresses
-        ):
-            continue
-        item = (
-            f"{local_address} -> {remote_address} "
-            f"({physical_addresses[local_address]})"
-        )
-        if item not in evidence:
-            evidence.append(item)
-        if len(evidence) == 3:
-            break
+    vpn_addresses, physical_addresses = _interface_address_sets(report)
+    evidence = _vpn_bypass_evidence(process, vpn_addresses, physical_addresses)
 
     if not evidence:
         return None
@@ -216,14 +189,60 @@ def vpn_bypass_connections(
     )
 
 
+def _interface_address_sets(report: DiagnosticReport) -> tuple[set[str], dict[str, str]]:
+    vpn_addresses: set[str] = set()
+    physical_addresses: dict[str, str] = {}
+    for interface in report.system.interfaces:
+        addresses = (_ip_address(value) for value in (*interface.ipv4, *interface.ipv6))
+        if interface.kind == "VPN":
+            vpn_addresses.update(address for address in addresses if address is not None)
+        elif interface.kind != "Loopback":
+            physical_addresses.update(
+                {address: interface.name for address in addresses if address is not None}
+            )
+    vpn_addresses.update(
+        address
+        for route in report.system.default_routes
+        if route.is_vpn and (address := _ip_address(route.local_address)) is not None
+    )
+    return vpn_addresses, physical_addresses
+
+
+def _vpn_bypass_evidence(
+    process: ProcessNetworkInfo,
+    vpn_addresses: set[str],
+    physical_addresses: dict[str, str],
+) -> list[str]:
+    evidence: list[str] = []
+    for connection in process.connections:
+        item = _physical_connection_evidence(connection, vpn_addresses, physical_addresses)
+        if item is not None and item not in evidence:
+            evidence.append(item)
+        if len(evidence) == 3:
+            break
+    return evidence
+
+
+def _physical_connection_evidence(
+    connection: ProcessConnection,
+    vpn_addresses: set[str],
+    physical_addresses: dict[str, str],
+) -> str | None:
+    remote_address = _global_address(connection.remote_address)
+    local_address = _ip_address(connection.local_address)
+    if remote_address is None or local_address is None or local_address in vpn_addresses:
+        return None
+    interface = physical_addresses.get(local_address)
+    return f"{local_address} -> {remote_address} ({interface})" if interface else None
+
+
 def _has_local_latency_problem(
     report: DiagnosticReport,
     th: Thresholds = DEFAULT_THRESHOLDS,
 ) -> bool:
     average_high = report.ping.average_ms is not None and report.ping.average_ms > th.rtt_high_ms
     jitter_high = (
-        report.ping.jitter_ms is not None
-        and report.ping.jitter_ms > th.jitter_critical_ms
+        report.ping.jitter_ms is not None and report.ping.jitter_ms > th.jitter_critical_ms
     )
     return average_high or jitter_high
 
@@ -240,6 +259,46 @@ def _has_vpn_problem(
     return vpn_active and (
         report.ping.loss_percent > 0
         or (report.ping.jitter_ms is not None and report.ping.jitter_ms > th.jitter_critical_ms)
+    )
+
+
+def _mtu_finding(
+    report: DiagnosticReport,
+    th: Thresholds = DEFAULT_THRESHOLDS,
+) -> RootCauseFinding | None:
+    if _tls_transport_failure(report):
+        return RootCauseFinding(
+            CauseSeverity.INFO,
+            "Проверить MTU",
+            "TCP-соединение открыто, но защищённое соединение не завершилось."
+            " Проверьте Path MTU до цели.",
+            report.tls.error or "TLS не завершил соединение",
+        )
+    if _loss_with_normal_latency(report, th):
+        return RootCauseFinding(
+            CauseSeverity.INFO,
+            "Проверить MTU",
+            "Потери появляются без высокой базовой задержки." " Проверьте Path MTU до цели.",
+            f"Ping {_format_ms(report.ping.average_ms)}, потери {report.ping.loss_percent:.0f}%",
+        )
+    return None
+
+
+def _tls_transport_failure(report: DiagnosticReport) -> bool:
+    if report.tcp.status != ProbeStatus.SUCCESS or report.tls is None:
+        return False
+    if report.tls.status != ProbeStatus.ERROR:
+        return False
+    error = (report.tls.error or "").casefold()
+    markers = ("timeout", "timed out", "время ожидания", "reset", "обрыв")
+    return any(marker in error for marker in markers)
+
+
+def _loss_with_normal_latency(report: DiagnosticReport, th: Thresholds) -> bool:
+    return bool(
+        report.ping.loss_percent > 0
+        and report.ping.average_ms is not None
+        and report.ping.average_ms <= th.rtt_normal_ms
     )
 
 
@@ -260,10 +319,7 @@ def _latency_evidence(
         wifi_values.append(f"сигнал Wi-Fi {wifi.signal_pct}%")
     if wifi.channel:
         wifi_values.append(f"канал {wifi.channel}")
-    if (
-        wifi.gateway_rtt_ms is not None
-        and wifi.gateway_rtt_ms > th.wifi_gateway_rtt_warn_ms
-    ):
+    if wifi.gateway_rtt_ms is not None and wifi.gateway_rtt_ms > th.wifi_gateway_rtt_warn_ms:
         wifi_values.append(f"шлюз {wifi.gateway_rtt_ms:.1f} мс")
     return f"{evidence}; Wi-Fi: {', '.join(wifi_values)}" if wifi_values else evidence
 

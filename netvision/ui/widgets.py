@@ -67,20 +67,32 @@ class ThemedCanvas(QWidget):
     """Use the widget's QSS palette also for manually painted surfaces."""
 
     _LIGHT_COLORS = {
-        "#161b22": "#FFFFFF", "#18202e": "#F4F7F8", "#222c3d": "#EAF8F3",
-        "#1e2638": "#D9E2E5", "#263247": "#E4ECEE",
-        "#e1e7ef": "#17212B", "#e2e8f0": "#17212B",
-        "#a0aec0": "#50616D", "#78869a": "#667784",
-        "#8a99ad": "#667784", "#5b6b82": "#50616D",
-        "#00e5a3": "#008E65", "#00e6a8": "#008E65",
-        "#ffb800": "#9A6500", "#ff4757": "#C53B49",
+        "#161b22": "#FFFFFF",
+        "#18202e": "#F4F7F8",
+        "#222c3d": "#EAF8F3",
+        "#1e2638": "#D9E2E5",
+        "#263247": "#E4ECEE",
+        "#e1e7ef": "#17212B",
+        "#e2e8f0": "#17212B",
+        "#a0aec0": "#50616D",
+        "#78869a": "#667784",
+        "#8a99ad": "#667784",
+        "#5b6b82": "#50616D",
+        "#00e5a3": "#008E65",
+        "#00e6a8": "#008E65",
+        "#ffb800": "#9A6500",
+        "#ff4757": "#C53B49",
     }
 
     def _color(self, dark_color: str) -> QColor:
         light = self.palette().color(QPalette.ColorRole.Window).lightness() > 128
-        return QColor(self._LIGHT_COLORS.get(dark_color.lower(), dark_color) if light else dark_color)
+        return QColor(
+            self._LIGHT_COLORS.get(dark_color.lower(), dark_color) if light else dark_color
+        )
 
-    def _paint_header(self, painter: QPainter, title: str, legend: tuple[tuple[str, str], ...]) -> None:
+    def _paint_header(
+        self, painter: QPainter, title: str, legend: tuple[tuple[str, str], ...]
+    ) -> None:
         font = painter.font()
         font.setPixelSize(10)
         font.setBold(False)
@@ -91,8 +103,13 @@ class ThemedCanvas(QWidget):
         painter.setFont(font)
         painter.setPen(self._color("#5B6B82"))
         title_rect = QRectF(12, 2, max(0, self.width() - legend_width - 24), 23)
-        painter.drawText(title_rect, Qt.AlignmentFlag.AlignVCenter,
-                         painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, int(title_rect.width())))
+        painter.drawText(
+            title_rect,
+            Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(
+                title, Qt.TextElideMode.ElideRight, int(title_rect.width())
+            ),
+        )
         if legend_width:
             font.setBold(False)
             painter.setFont(font)
@@ -159,7 +176,11 @@ class LatencyChart(ThemedCanvas):
         painter.setBrush(self._color("#18202E"))
         painter.drawRoundedRect(plot, 5, 5)
         self._draw_header(painter)
-        values = [sample.latency_ms for sample in self._samples if sample.success and sample.latency_ms is not None]
+        values = [
+            sample.latency_ms
+            for sample in self._samples
+            if sample.success and sample.latency_ms is not None
+        ]
         minimum, maximum = self._axis_range(values)
         self._draw_grid(painter, plot, minimum, maximum)
         self._sample_x.clear()
@@ -195,7 +216,9 @@ class LatencyChart(ThemedCanvas):
                 continue
             sample = self._samples[index]
             if previous_point is not None:
-                self._draw_curve_segment(painter, previous_point, point, _latency_color(sample), plot)
+                self._draw_curve_segment(
+                    painter, previous_point, point, _latency_color(sample), plot
+                )
             previous_point = point
 
         self._draw_hover_marker(painter, plot)
@@ -225,7 +248,9 @@ class LatencyChart(ThemedCanvas):
                 if sample.success and sample.latency_ms is not None
                 else f"<span style='color:#FF6B78'><b>{self._translate('Потеря пакета')}</b></span>"
             )
-            point = self._sample_points.get(index, QPointF(self._sample_x[index], self._plot_rect.bottom()))
+            point = self._sample_points.get(
+                index, QPointF(self._sample_x[index], self._plot_rect.bottom())
+            )
             self._show_hover_tooltip(message, point)
 
     def leaveEvent(self, _event: object) -> None:
@@ -327,10 +352,15 @@ class LatencyChart(ThemedCanvas):
         painter.drawPath(curve)
 
     def _draw_header(self, painter: QPainter) -> None:
-        self._paint_header(painter, self._translate("ЗАДЕРЖКА / СТАБИЛЬНОСТЬ · ПОСЛЕДНИЕ 60 СЕКУНД"), (
-            (self._translate("● живая"), "#00E5A3"), ("● ping", "#FFB800"),
-            (self._translate("● сбой"), "#FF4757"),
-        ))
+        self._paint_header(
+            painter,
+            self._translate("ЗАДЕРЖКА / СТАБИЛЬНОСТЬ · ПОСЛЕДНИЕ 60 СЕКУНД"),
+            (
+                (self._translate("● живая"), "#00E5A3"),
+                ("● ping", "#FFB800"),
+                (self._translate("● сбой"), "#FF4757"),
+            ),
+        )
 
     def _draw_grid(self, painter: QPainter, plot: QRectF, minimum: float, maximum: float) -> None:
         painter.setPen(QPen(self._color("#263247"), 1, Qt.PenStyle.DashLine))
@@ -345,13 +375,19 @@ class LatencyChart(ThemedCanvas):
             value = maximum - (maximum - minimum) * fraction
             y = plot.top() + plot.height() * fraction
             label = f"{value:.0f} ms"
-            painter.drawText(QRectF(2, y - 8, plot.left() - 8, 16), Qt.AlignmentFlag.AlignRight, label)
+            painter.drawText(
+                QRectF(2, y - 8, plot.left() - 8, 16), Qt.AlignmentFlag.AlignRight, label
+            )
         painter.drawText(
             QRectF(plot.left(), plot.bottom() + 7, 76, 18),
             Qt.AlignmentFlag.AlignLeft,
             self._translate("60с назад"),
         )
-        painter.drawText(QRectF(plot.center().x() - 25, plot.bottom() + 7, 50, 18), Qt.AlignmentFlag.AlignCenter, "30с")
+        painter.drawText(
+            QRectF(plot.center().x() - 25, plot.bottom() + 7, 50, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            "30с",
+        )
         painter.drawText(
             QRectF(plot.right() - 58, plot.bottom() + 7, 58, 18),
             Qt.AlignmentFlag.AlignRight,
@@ -424,7 +460,9 @@ class JitterChart(ThemedCanvas):
             y = plot.bottom() - min(1.0, value / upper) * plot.height()
             point = QPointF(x, y)
             if previous is not None:
-                self._draw_segment(painter, previous, point, self._color(_jitter_color(value).name()), plot)
+                self._draw_segment(
+                    painter, previous, point, self._color(_jitter_color(value).name()), plot
+                )
             previous = point
 
     def _axis_upper(self) -> float:
@@ -434,10 +472,15 @@ class JitterChart(ThemedCanvas):
         return max(20.0, max(values) * 1.2)
 
     def _draw_header(self, painter: QPainter) -> None:
-        self._paint_header(painter, self._translate("JITTER / ОТКЛОНЕНИЕ RTT · ПОСЛЕДНИЕ 60 СЕКУНД"), (
-            (self._translate("● стабильно"), "#00E5A3"), ("● spike", "#FFB800"),
-            (self._translate("● критично"), "#FF4757"),
-        ))
+        self._paint_header(
+            painter,
+            self._translate("JITTER / ОТКЛОНЕНИЕ RTT · ПОСЛЕДНИЕ 60 СЕКУНД"),
+            (
+                (self._translate("● стабильно"), "#00E5A3"),
+                ("● spike", "#FFB800"),
+                (self._translate("● критично"), "#FF4757"),
+            ),
+        )
 
     def _draw_grid(self, painter: QPainter, plot: QRectF, upper: float) -> None:
         painter.setPen(QPen(self._color("#263247"), 1, Qt.PenStyle.DashLine))
@@ -461,7 +504,11 @@ class JitterChart(ThemedCanvas):
             Qt.AlignmentFlag.AlignLeft,
             self._translate("60с назад"),
         )
-        painter.drawText(QRectF(plot.center().x() - 25, plot.bottom() + 7, 50, 18), Qt.AlignmentFlag.AlignCenter, "30с")
+        painter.drawText(
+            QRectF(plot.center().x() - 25, plot.bottom() + 7, 50, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            "30с",
+        )
         painter.drawText(
             QRectF(plot.right() - 58, plot.bottom() + 7, 58, 18),
             Qt.AlignmentFlag.AlignRight,
@@ -585,7 +632,11 @@ class MetricTile(QFrame):
         self.setProperty("compact", compact)
         layout = self.layout()
         if isinstance(layout, QVBoxLayout):
-            layout.setContentsMargins(10, 6, 10, 6) if compact else layout.setContentsMargins(14, 10, 14, 10)
+            (
+                layout.setContentsMargins(10, 6, 10, 6)
+                if compact
+                else layout.setContentsMargins(14, 10, 14, 10)
+            )
             layout.setSpacing(0 if compact else 2)
         self.setMinimumHeight(82 if compact else 0)
         self.style().unpolish(self)
@@ -628,7 +679,7 @@ class MetricTile(QFrame):
         cleaned = value.strip()
         prefix = f"{self._metric_label} "
         if cleaned.casefold().startswith(prefix):
-            cleaned = cleaned[len(prefix):].lstrip(" :-–—")
+            cleaned = cleaned[len(prefix) :].lstrip(" :-–—")
         return cleaned or "--"
 
 
@@ -806,11 +857,21 @@ class TopologyWidget(ThemedCanvas):
 
     def set_report(self, report: DiagnosticReport) -> None:
         active_interface = next(
-            (item for item in report.system.interfaces if item.is_up and item.ipv4 and item.kind != "Loopback"),
+            (
+                item
+                for item in report.system.interfaces
+                if item.is_up and item.ipv4 and item.kind != "Loopback"
+            ),
             next((item for item in report.system.interfaces if item.is_up), None),
         )
-        local_ip = active_interface.ipv4[0] if active_interface and active_interface.ipv4 else "IP не определён"
-        interface_name = active_interface.name if active_interface else "Активный интерфейс не найден"
+        local_ip = (
+            active_interface.ipv4[0]
+            if active_interface and active_interface.ipv4
+            else "IP не определён"
+        )
+        interface_name = (
+            active_interface.name if active_interface else "Активный интерфейс не найден"
+        )
         nodes: list[TopologyNode] = [
             TopologyNode(
                 label="ВАШ ПК",
@@ -839,7 +900,9 @@ class TopologyWidget(ThemedCanvas):
                     details={
                         "IP": gateway.address,
                         "Интерфейс": gateway.interface or "не определён",
-                        "Метрика": str(gateway.metric) if gateway.metric is not None else "не определена",
+                        "Метрика": (
+                            str(gateway.metric) if gateway.metric is not None else "не определена"
+                        ),
                     },
                 )
             )
@@ -857,9 +920,8 @@ class TopologyWidget(ThemedCanvas):
                 TopologyNode(
                     label=f"HOP {hop.index:02d}",
                     primary=hop.address or "нет ответа",
-                    secondary=geo_description or (
-                        "маршрутный узел" if hop.address else "запрос превысил тайм-аут"
-                    ),
+                    secondary=geo_description
+                    or ("маршрутный узел" if hop.address else "запрос превысил тайм-аут"),
                     kind="timeout" if hop.timed_out else "hop",
                     status=ProbeStatus.WARNING if hop.timed_out else ProbeStatus.SUCCESS,
                     latency_ms=hop.latency_ms,
@@ -927,7 +989,12 @@ class TopologyWidget(ThemedCanvas):
 
         self._draw_dns_branch(painter, center_x, top, node_width)
         for index, node in enumerate(self._nodes):
-            rect = QRectF(center_x - node_width / 2, top + index * (node_height + gap), node_width, node_height)
+            rect = QRectF(
+                center_x - node_width / 2,
+                top + index * (node_height + gap),
+                node_width,
+                node_height,
+            )
             self._node_rects.append(rect)
             if index > 0:
                 previous = self._node_rects[index - 1]
@@ -943,10 +1010,14 @@ class TopologyWidget(ThemedCanvas):
             self._draw_node(painter, rect, node, index)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        hovered = next((i for i, rect in enumerate(self._node_rects) if rect.contains(event.position())), -1)
+        hovered = next(
+            (i for i, rect in enumerate(self._node_rects) if rect.contains(event.position())), -1
+        )
         if hovered != self._hovered_index:
             self._hovered_index = hovered
-            self.setCursor(Qt.CursorShape.PointingHandCursor if hovered >= 0 else Qt.CursorShape.ArrowCursor)
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor if hovered >= 0 else Qt.CursorShape.ArrowCursor
+            )
             self.update()
 
     def leaveEvent(self, _event: object) -> None:
@@ -961,7 +1032,9 @@ class TopologyWidget(ThemedCanvas):
     def _draw_node(self, painter: QPainter, rect: QRectF, node: TopologyNode, index: int) -> None:
         color = self._color(_status_color(node.status).name())
         fill = self._color("#18202E") if index != self._hovered_index else self._color("#222C3D")
-        border = color if index in {self._hovered_index, self._active_index} else self._color("#1E2638")
+        border = (
+            color if index in {self._hovered_index, self._active_index} else self._color("#1E2638")
+        )
 
         if index == self._active_index:
             pulse = int(28 + 18 * (1 + math.sin(self._phase)) / 2)
@@ -993,7 +1066,11 @@ class TopologyWidget(ThemedCanvas):
         painter.setFont(primary_font)
         painter.drawText(
             QRectF(rect.left() + 20, rect.top() + 33, rect.width() - 40, 24),
-            painter.fontMetrics().elidedText(self._translate(node.primary), Qt.TextElideMode.ElideRight, max(0, int(rect.width() - 40))),
+            painter.fontMetrics().elidedText(
+                self._translate(node.primary),
+                Qt.TextElideMode.ElideRight,
+                max(0, int(rect.width() - 40)),
+            ),
         )
 
         painter.setPen(self._color("#A0AEC0"))
@@ -1003,7 +1080,11 @@ class TopologyWidget(ThemedCanvas):
         painter.setFont(secondary_font)
         painter.drawText(
             QRectF(rect.left() + 20, rect.top() + 65, rect.width() - 40, 16),
-            painter.fontMetrics().elidedText(self._translate(node.secondary), Qt.TextElideMode.ElideRight, max(0, int(rect.width() - 40))),
+            painter.fontMetrics().elidedText(
+                self._translate(node.secondary),
+                Qt.TextElideMode.ElideRight,
+                max(0, int(rect.width() - 40)),
+            ),
         )
 
         dot = QPointF(rect.right() - 20, rect.top() + 20)
@@ -1023,7 +1104,13 @@ class TopologyWidget(ThemedCanvas):
         start = QPointF(previous.center().x(), previous.bottom())
         end = QPointF(current.center().x(), current.top())
         color = self._color(_status_color(status).name())
-        painter.setPen(QPen(color, 2.4 if active or status != ProbeStatus.PENDING else 1.4, Qt.PenStyle.SolidLine))
+        painter.setPen(
+            QPen(
+                color,
+                2.4 if active or status != ProbeStatus.PENDING else 1.4,
+                Qt.PenStyle.SolidLine,
+            )
+        )
         painter.drawLine(start, end)
 
         arrow = QPainterPath()
@@ -1044,19 +1131,25 @@ class TopologyWidget(ThemedCanvas):
             painter.setFont(font)
             painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
 
-    def _draw_dns_branch(self, painter: QPainter, center_x: float, top: float, node_width: float) -> None:
+    def _draw_dns_branch(
+        self, painter: QPainter, center_x: float, top: float, node_width: float
+    ) -> None:
         if self.width() < 690:
             painter.setPen(self._color("#78869A"))
             font = painter.font()
             font.setPixelSize(9)
             painter.setFont(font)
-            painter.drawText(QRectF(24, 15, self.width() - 48, 20), Qt.AlignmentFlag.AlignCenter, self._dns_label)
+            painter.drawText(
+                QRectF(24, 15, self.width() - 48, 20), Qt.AlignmentFlag.AlignCenter, self._dns_label
+            )
             return
 
         anchor_x = center_x + node_width / 2
         branch_rect = QRectF(anchor_x + 24, top + 15, min(220, self.width() - anchor_x - 42), 45)
         painter.setPen(QPen(self._color("#1E2638"), 1.2, Qt.PenStyle.DashLine))
-        painter.drawLine(QPointF(anchor_x, top + 37), QPointF(branch_rect.left(), branch_rect.center().y()))
+        painter.drawLine(
+            QPointF(anchor_x, top + 37), QPointF(branch_rect.left(), branch_rect.center().y())
+        )
         painter.setBrush(self._color("#18202E"))
         painter.setPen(QPen(self._color("#FFB800"), 1))
         painter.drawRoundedRect(branch_rect, 5, 5)
@@ -1074,7 +1167,9 @@ class TopologyWidget(ThemedCanvas):
     def _placeholder_nodes(self, target: str) -> list[TopologyNode]:
         return [
             TopologyNode("ВАШ ПК", "Локальная система", "интерфейсы ожидают проверки", "device"),
-            TopologyNode("ЛОКАЛЬНАЯ СЕТЬ", "Шлюз определяется", "маршрут ещё не запущен", "gateway"),
+            TopologyNode(
+                "ЛОКАЛЬНАЯ СЕТЬ", "Шлюз определяется", "маршрут ещё не запущен", "gateway"
+            ),
             TopologyNode("ЦЕЛЕВОЙ УЗЕЛ", target, "TCP-проверка ожидает запуска", "target"),
         ]
 
@@ -1155,4 +1250,3 @@ def _geo_details(result: object | None) -> dict[str, str]:
         "Провайдер": getattr(result, "isp", None),
     }
     return {key: value for key, value in values.items() if value}
-

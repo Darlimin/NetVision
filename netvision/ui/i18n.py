@@ -8,7 +8,6 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
-
 _LANGUAGE_FILES = {
     "ru": "ru-ru.json",
     "en": "en-en.json",
@@ -58,14 +57,12 @@ class UiTranslator(QObject):
         self._catalogs[new_language] = _load_catalog(new_language)
         if new_language == "en":
             self._english_reverse = {
-                translation: source
-                for source, translation in self._catalogs["en"].items()
+                translation: source for source, translation in self._catalogs["en"].items()
             }
         elif "en" not in self._catalogs:
             self._catalogs["en"] = _load_catalog("en")
             self._english_reverse = {
-                translation: source
-                for source, translation in self._catalogs["en"].items()
+                translation: source for source, translation in self._catalogs["en"].items()
             }
         if emit and changed:
             self.language_changed.emit(new_language)

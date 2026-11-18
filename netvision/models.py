@@ -174,4 +174,3 @@ class DiagnosticReport:
     started_at: datetime
     total_ms: float
     errors: tuple[str, ...] = field(default_factory=tuple)
-

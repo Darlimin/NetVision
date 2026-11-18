@@ -229,7 +229,7 @@ def _fingerprint(certificate_der: bytes | None) -> str | None:
     if not certificate_der:
         return None
     digest = hashlib.sha256(certificate_der).hexdigest().upper()
-    return ":".join(digest[index:index + 2] for index in range(0, len(digest), 2))
+    return ":".join(digest[index : index + 2] for index in range(0, len(digest), 2))
 
 
 def _format_ssl_error(error: ssl.SSLCertVerificationError) -> str:

@@ -75,7 +75,9 @@ class PacketLossAnalyzer:
         jitter_threshold_ms: float | None = None,
         th: Thresholds = DEFAULT_THRESHOLDS,
     ) -> None:
-        jitter_threshold_ms = th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
+        jitter_threshold_ms = (
+            th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
+        )
         if max_samples < 1 or jitter_threshold_ms < 0:
             raise ValueError("Параметры анализатора потерь некорректны")
         self._max_samples = max_samples
@@ -98,18 +100,20 @@ class PacketLossAnalyzer:
         self._events.clear()
         self._loss_episode_tracker = self._new_loss_episode_tracker()
 
-    def observe(self, success: bool, latency_ms: float | None = None) -> tuple[PacketLossSnapshot, LossEvent | None]:
+    def observe(
+        self, success: bool, latency_ms: float | None = None
+    ) -> tuple[PacketLossSnapshot, LossEvent | None]:
         sample = LossSample(success, float(latency_ms) if latency_ms is not None else None)
         self._samples.append(sample)
         if len(self._samples) > self._max_samples:
-            del self._samples[:-self._max_samples]
+            del self._samples[: -self._max_samples]
 
         snapshot = summarize_loss(
             self._samples,
             jitter_threshold_ms=self._jitter_threshold_ms,
             th=self._thresholds,
         )
-        observed_at = datetime.now()
+        observed_at = datetime.now().astimezone()
         step, episode = self._loss_episode_tracker.update(0.0 if success else 1.0, observed_at)
         event: LossEvent | None = None
         if step == "opened" and episode is not None:
@@ -138,7 +142,11 @@ class PacketLossAnalyzer:
             )
         elif snapshot.jitter_drops > 0 and len(self._samples) >= 2:
             previous = self._samples[-2].latency_ms
-            if previous is not None and latency_ms is not None and abs(latency_ms - previous) >= self._jitter_threshold_ms:
+            if (
+                previous is not None
+                and latency_ms is not None
+                and abs(latency_ms - previous) >= self._jitter_threshold_ms
+            ):
                 event = LossEvent(
                     observed_at,
                     "jitter",
@@ -178,7 +186,9 @@ def summarize_loss(
     jitter_threshold_ms: float | None = None,
     th: Thresholds = DEFAULT_THRESHOLDS,
 ) -> PacketLossSnapshot:
-    jitter_threshold_ms = th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
+    jitter_threshold_ms = (
+        th.jitter_critical_ms if jitter_threshold_ms is None else jitter_threshold_ms
+    )
     if jitter_threshold_ms < 0:
         raise ValueError("Порог jitter не может быть отрицательным")
     values = tuple(samples)
@@ -241,8 +251,7 @@ def run_hop_loss_breakdown(
     addressed = [hop for hop in ordered if hop.address]
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(addressed)))) as executor:
         futures = {
-            executor.submit(probe_ping, hop.address or "", count, wait_ms): hop
-            for hop in addressed
+            executor.submit(probe_ping, hop.address or "", count, wait_ms): hop for hop in addressed
         }
         for future in as_completed(futures):
             hop = futures[future]
@@ -263,7 +272,14 @@ def run_hop_loss_breakdown(
             )
         else:
             results[hop.index] = HopLossResult(
-                hop.index, hop.address, 0, 0, None, hop.latency_ms, "Не определено", "Адрес hop не получен"
+                hop.index,
+                hop.address,
+                0,
+                0,
+                None,
+                hop.latency_ms,
+                "Не определено",
+                "Адрес hop не получен",
             )
     return tuple(results[hop.index] for hop in ordered)
 
@@ -305,15 +321,23 @@ def run_udp_stress_test(
                     sent += 1
                     elapsed.append((perf_counter() - started) * 1000)
     except OSError as exc:
-        return StressTestResult("UDP", f"{host.strip()}:{port}", 0, 0, None, None, "Ошибка", error=str(exc))
+        return StressTestResult(
+            "UDP", f"{host.strip()}:{port}", 0, 0, None, None, "Ошибка", error=str(exc)
+        )
     average = round(sum(elapsed) / len(elapsed), 1) if elapsed else None
     status = "Отправка успешна" if sent else "Ошибка"
     note = "UDP не подтверждает доставку без ACK приложения; учтены только локальные sendto."
-    return StressTestResult("UDP", f"{host.strip()}:{port}", count, sent, None, average, status, note, error_text)
+    return StressTestResult(
+        "UDP", f"{host.strip()}:{port}", count, sent, None, average, status, note, error_text
+    )
 
 
 def _hop_result(hop: HopResult, ping: PingResult) -> HopLossResult:
-    status = "Стабильно" if ping.loss_percent == 0 else ("Есть потери" if ping.received else "Нет ответа")
+    status = (
+        "Стабильно"
+        if ping.loss_percent == 0
+        else ("Есть потери" if ping.received else "Нет ответа")
+    )
     return HopLossResult(
         hop.index,
         hop.address,

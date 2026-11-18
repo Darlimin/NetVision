@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import ipaddress
 import socket
 from time import perf_counter
+from threading import Event
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,8 @@ def custom_dns_profile(address: str) -> DnsResolverProfile:
 def benchmark_resolvers(
     profiles: tuple[DnsResolverProfile, ...] | list[DnsResolverProfile],
     timeout: float = 1.5,
+    *,
+    cancel_event: Event | None = None,
 ) -> tuple[DnsBenchmarkResult, ...]:
     """Measure every resolver endpoint concurrently using TCP port 53."""
     endpoint_results: dict[tuple[int, str], tuple[float | None, str | None]] = {}
@@ -65,29 +68,41 @@ def benchmark_resolvers(
     if not tasks:
         return ()
 
-    with ThreadPoolExecutor(max_workers=min(12, len(tasks))) as executor:
+    executor = ThreadPoolExecutor(max_workers=min(12, len(tasks)))
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         futures = {
             executor.submit(_probe_dns_port, address, timeout): (profile_index, address)
             for profile_index, address in tasks
         }
-        for future in as_completed(futures):
-            try:
-                endpoint_results[futures[future]] = future.result()
-            except Exception as exc:  # Keep one resolver failure from aborting the comparison.
-                endpoint_results[futures[future]] = (None, str(exc))
+        pending = set(futures)
+        while pending:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError()
+            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    endpoint_results[futures[future]] = future.result()
+                except Exception as exc:
+                    endpoint_results[futures[future]] = (None, str(exc))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     results: list[DnsBenchmarkResult] = []
     for index, profile in enumerate(profiles):
-        attempts = [
-            (address, *endpoint_results[(index, address)])
-            for address in profile.addresses
-        ]
+        attempts = [(address, *endpoint_results[(index, address)]) for address in profile.addresses]
         successful = [attempt for attempt in attempts if attempt[1] is not None]
         if successful:
-            address, latency_ms, _error = min(successful, key=lambda attempt: attempt[1] or float("inf"))
+            address, latency_ms, _error = min(
+                successful, key=lambda attempt: attempt[1] or float("inf")
+            )
             results.append(DnsBenchmarkResult(profile, address, latency_ms))
             continue
-        errors = "; ".join(error for _address, _latency, error in attempts if error) or "Нет ответа на TCP/53"
+        errors = (
+            "; ".join(error for _address, _latency, error in attempts if error)
+            or "Нет ответа на TCP/53"
+        )
         results.append(DnsBenchmarkResult(profile, None, None, errors))
     return tuple(results)
 

@@ -29,7 +29,9 @@ class DiagnosticParallelismTests(unittest.TestCase):
         snapshot = SystemSnapshot("test-pc", (), None, (), None, ())
         dns = DnsResult(target.host, ("192.0.2.1",), 2.0, ProbeStatus.SUCCESS)
         tcp = TcpResult(target.host, target.port, "192.0.2.1", 3.0, ProbeStatus.SUCCESS)
-        ping = PingResult(target.host, 5, 5, 0.0, 4.0, 2.0, 6.0, 1.0, (2, 3, 4, 5, 6), ProbeStatus.SUCCESS)
+        ping = PingResult(
+            target.host, 5, 5, 0.0, 4.0, 2.0, 6.0, 1.0, (2, 3, 4, 5, 6), ProbeStatus.SUCCESS
+        )
 
         with (
             patch.object(diagnostics, "collect_system_snapshot", concurrent_result(snapshot)),
@@ -57,4 +59,3 @@ class PublicRouteAddressTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

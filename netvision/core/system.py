@@ -12,7 +12,13 @@ from dataclasses import dataclass
 import psutil
 
 from netvision.core.probes import _oem_encoding
-from netvision.models import DefaultRoute, GatewayInfo, NetworkInterface, SystemSnapshot, WifiSnapshot
+from netvision.models import (
+    DefaultRoute,
+    GatewayInfo,
+    NetworkInterface,
+    SystemSnapshot,
+    WifiSnapshot,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +102,12 @@ def parse_wifi_interfaces_output(text: str) -> list[WifiSnapshot]:
     return snapshots
 
 
-def collect_wifi_snapshot(route_interface: str | None) -> WifiSnapshot | None:
-    """Return Wi-Fi data only when it belongs to the active route interface."""
+def collect_wifi_snapshot(
+    route_interface: str | None,
+    *,
+    allow_vpn_fallback: bool = False,
+) -> WifiSnapshot | None:
+    """Return route Wi-Fi data, or the physical Wi-Fi link behind a VPN route."""
     if not route_interface:
         return None
     completed = subprocess.run(
@@ -112,10 +122,13 @@ def collect_wifi_snapshot(route_interface: str | None) -> WifiSnapshot | None:
         message = _decode_oem_output(completed.stderr).strip()
         raise OSError(message or "netsh wlan недоступен")
     snapshots = parse_wifi_interfaces_output(_decode_oem_output(completed.stdout))
-    return next(
+    matched = next(
         (snapshot for snapshot in snapshots if snapshot.interface_name == route_interface),
         None,
     )
+    if matched is not None or not allow_vpn_fallback:
+        return matched
+    return snapshots[0] if snapshots else None
 
 
 def collect_system_snapshot() -> SystemSnapshot:
@@ -447,4 +460,3 @@ def _decode_oem_output(value: bytes | str | None) -> str:
     if isinstance(value, str):
         return value
     return (value or b"").decode(_oem_encoding(), errors="replace")
-

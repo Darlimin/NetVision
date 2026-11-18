@@ -17,7 +17,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 from netvision.models import DiagnosticReport
 
-
 UDP_EVENT_COLUMNS = (
     "timestamp",
     "event_type",
@@ -52,8 +51,7 @@ def serialize_report(report: DiagnosticReport, udp_events: Iterable[object] = ()
     udp_event_rows = serialize_udp_events(udp_events)
     payload["schema_version"] = "1.1"
     payload["system"]["proxies"] = [
-        [scheme, _redact_proxy_credentials(value)]
-        for scheme, value in report.system.proxies
+        [scheme, _redact_proxy_credentials(value)] for scheme, value in report.system.proxies
     ]
     payload["udp_activity"] = {
         "event_count": len(udp_event_rows),
@@ -96,9 +94,7 @@ def serialize_support_bundle(
         "meta": _support_meta(app_version),
     }
     if "report" in selected_sections:
-        payload["report"] = (
-            json.loads(serialize_report(report)) if report is not None else None
-        )
+        payload["report"] = json.loads(serialize_report(report)) if report is not None else None
     if "session" in selected_sections:
         payload["session"] = {"events": events, "thresholds": threshold_payload}
     if "measurements" in selected_sections:
@@ -146,7 +142,9 @@ def _support_meta(app_version: str | None) -> dict[str, object]:
     }
 
 
-def _support_process_payload(process: object | None, endpoints: Iterable[object]) -> dict[str, object] | None:
+def _support_process_payload(
+    process: object | None, endpoints: Iterable[object]
+) -> dict[str, object] | None:
     if process is None:
         return None
     if isinstance(process, Mapping):
@@ -171,7 +169,10 @@ def _support_endpoint_payload(endpoint: object) -> dict[str, object]:
     if isinstance(endpoint, Mapping):
         get = endpoint.get
     else:
-        get = lambda key, default=None: getattr(endpoint, key, default)
+
+        def get(key: str, default: object = None) -> object:
+            return getattr(endpoint, key, default)
+
     return {
         "protocol": str(get("protocol", "")),
         "local_port": get("local_port"),
@@ -189,15 +190,15 @@ def _support_jsonable(value: object) -> object:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_support_jsonable(item) for item in value]
     if is_dataclass(value):
-        return {field.name: _support_jsonable(getattr(value, field.name)) for field in fields(value)}
+        return {
+            field.name: _support_jsonable(getattr(value, field.name)) for field in fields(value)
+        }
     slots = getattr(type(value), "__slots__", ())
     if isinstance(slots, str):
         slots = (slots,)
     if slots:
         return {
-            name: _support_jsonable(getattr(value, name))
-            for name in slots
-            if hasattr(value, name)
+            name: _support_jsonable(getattr(value, name)) for name in slots if hasattr(value, name)
         }
     isoformat = getattr(value, "isoformat", None)
     if callable(isoformat):
@@ -213,10 +214,7 @@ class _SupportRedactor:
 
     def apply(self, value: object, key: str = "") -> object:
         if isinstance(value, Mapping):
-            return {
-                str(name): self.apply(item, str(name))
-                for name, item in value.items()
-            }
+            return {str(name): self.apply(item, str(name)) for name, item in value.items()}
         if isinstance(value, list):
             return [self.apply(item, key) for item in value]
         if isinstance(value, str):
@@ -328,7 +326,9 @@ def _udp_event_payload(event: object) -> dict[str, object]:
         "port": port if isinstance(port, int) else None,
         "details": str(getattr(event, "details", "")),
         "is_anomaly": bool(getattr(event, "is_anomaly", False)),
-        "pid": getattr(event, "pid", None) if isinstance(getattr(event, "pid", None), int) else None,
+        "pid": (
+            getattr(event, "pid", None) if isinstance(getattr(event, "pid", None), int) else None
+        ),
     }
 
 
@@ -348,8 +348,12 @@ def _journal_event_payload(event: object) -> dict[str, object]:
         "severity": str(getattr(event, "severity", "")),
         "subject": str(getattr(event, "subject", "")),
         "template": str(getattr(event, "template", "")),
-        "values": json.dumps(values if isinstance(values, dict) else {}, ensure_ascii=False, default=_json_default),
-        "refs": json.dumps(refs if isinstance(refs, dict) else {}, ensure_ascii=False, default=_json_default),
+        "values": json.dumps(
+            values if isinstance(values, dict) else {}, ensure_ascii=False, default=_json_default
+        ),
+        "refs": json.dumps(
+            refs if isinstance(refs, dict) else {}, ensure_ascii=False, default=_json_default
+        ),
     }
 
 
@@ -364,7 +368,9 @@ def _redact_proxy_credentials(value: str) -> str:
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
         port = f":{parsed.port}" if parsed.port is not None else ""
-        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, parsed.query, parsed.fragment))
+        return urlunsplit(
+            (parsed.scheme, f"{host}{port}", parsed.path, parsed.query, parsed.fragment)
+        )
     except ValueError:
         return "<proxy configured>"
 
@@ -374,4 +380,3 @@ def _json_default(value: object) -> str:
     if callable(isoformat):
         return str(isoformat())
     return str(value)
-

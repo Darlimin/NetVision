@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from netvision.core import bufferbloat
 from netvision.core.thresholds import DEFAULT_THRESHOLDS
-from netvision.ui.main_window import BufferbloatWorker
+from netvision.ui.legacy_workers import BufferbloatWorker
 
 
 class BufferbloatTests(unittest.TestCase):
@@ -24,9 +24,11 @@ class BufferbloatTests(unittest.TestCase):
             time.sleep(0.01)
             return 1, 0.01
 
-        with patch.object(bufferbloat, "_download", side_effect=instant_download), patch.object(
-            bufferbloat, "_upload", side_effect=instant_download
-        ), patch.object(bufferbloat, "_measure_tcp_latency", return_value=20.0):
+        with (
+            patch.object(bufferbloat, "_download", side_effect=instant_download),
+            patch.object(bufferbloat, "_upload", side_effect=instant_download),
+            patch.object(bufferbloat, "_measure_tcp_latency", return_value=20.0),
+        ):
             started = time.monotonic()
             report = bufferbloat.run_bufferbloat_test(
                 target=None,
@@ -89,10 +91,10 @@ class BufferbloatTests(unittest.TestCase):
                 super().__init__(*args, **kwargs)
                 created_budgets.append(self)
 
-        with patch.object(bufferbloat, "_ByteBudget", CapturingBudget), patch.object(
-            bufferbloat, "_download", return_value=(64, 0.0)
-        ), patch.object(
-            bufferbloat, "_measure_tcp_latency", return_value=20.0
+        with (
+            patch.object(bufferbloat, "_ByteBudget", CapturingBudget),
+            patch.object(bufferbloat, "_download", return_value=(64, 0.0)),
+            patch.object(bufferbloat, "_measure_tcp_latency", return_value=20.0),
         ):
             phase = bufferbloat._load_phase(
                 "download",

@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import tempfile
 
-
 MAX_HISTORY_ENTRIES = 500
 
 

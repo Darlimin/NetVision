@@ -42,6 +42,8 @@ class DnsAdapterState:
 
 
 _DNS_SNAPSHOTS: dict[str, DnsAdapterState] = {}
+
+
 def flush_dns_cache() -> SystemActionResult:
     """Flush the Windows DNS resolver cache without opening a console window."""
     if os.name != "nt":
@@ -77,15 +79,9 @@ def apply_dns_servers(adapter_name: str, servers: Sequence[str]) -> SystemAction
     if not servers:
         return SystemActionResult(False, "Не выбран DNS-профиль")
 
-    normalized: list[str] = []
-    try:
-        for server in servers:
-            address = ipaddress.ip_address(server)
-            if address.version != 4:
-                return SystemActionResult(False, "Автонастройка поддерживает только IPv4 DNS-профили")
-            normalized.append(str(address))
-    except ValueError:
-        return SystemActionResult(False, "DNS-профиль содержит некорректный IP-адрес")
+    normalized, error = _normalize_dns_servers(servers)
+    if error is not None:
+        return SystemActionResult(False, error)
 
     snapshot = capture_dns_state(adapter_name)
     if snapshot is None:
@@ -95,21 +91,66 @@ def apply_dns_servers(adapter_name: str, servers: Sequence[str]) -> SystemAction
         )
     _DNS_SNAPSHOTS[adapter_name.casefold()] = snapshot
 
-    commands = [
+    result = _run_dns_commands(adapter_name, normalized, snapshot)
+    if result is not None:
+        return result
+    return SystemActionResult(
+        True,
+        f"DNS для «{adapter_name}» обновлён: {', '.join(normalized)}",
+        SystemChange("dns", adapter_name, snapshot, tuple(normalized)),
+    )
+
+
+def _normalize_dns_servers(servers: Sequence[str]) -> tuple[list[str], str | None]:
+    normalized: list[str] = []
+    try:
+        for server in servers:
+            address = ipaddress.ip_address(server)
+            if address.version != 4:
+                return [], "Автонастройка поддерживает только IPv4 DNS-профили"
+            normalized.append(str(address))
+    except ValueError:
+        return [], "DNS-профиль содержит некорректный IP-адрес"
+    return normalized, None
+
+
+def _dns_commands(adapter_name: str, normalized: Sequence[str]) -> list[list[str]]:
+    return [
         [
-            "netsh", "interface", "ipv4", "set", "dnsservers",
-            f"name={adapter_name}", "source=static", f"address={normalized[0]}", "validate=no",
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "dnsservers",
+            f"name={adapter_name}",
+            "source=static",
+            f"address={normalized[0]}",
+            "validate=no",
         ],
         *(
             [
-                "netsh", "interface", "ipv4", "add", "dnsservers",
-                f"name={adapter_name}", f"address={server}", f"index={index}", "validate=no",
+                "netsh",
+                "interface",
+                "ipv4",
+                "add",
+                "dnsservers",
+                f"name={adapter_name}",
+                f"address={server}",
+                f"index={index}",
+                "validate=no",
             ]
             for index, server in enumerate(normalized[1:], start=2)
         ),
     ]
+
+
+def _run_dns_commands(
+    adapter_name: str,
+    normalized: Sequence[str],
+    snapshot: DnsAdapterState,
+) -> SystemActionResult | None:
     try:
-        for command in commands:
+        for command in _dns_commands(adapter_name, normalized):
             completed = subprocess.run(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -120,7 +161,10 @@ def apply_dns_servers(adapter_name: str, servers: Sequence[str]) -> SystemAction
                 check=False,
             )
             if completed.returncode != 0:
-                details = _decode_output(completed.stdout).strip() or f"код завершения {completed.returncode}"
+                details = (
+                    _decode_output(completed.stdout).strip()
+                    or f"код завершения {completed.returncode}"
+                )
                 restore_dns_state(snapshot)
                 return SystemActionResult(
                     False,
@@ -129,11 +173,7 @@ def apply_dns_servers(adapter_name: str, servers: Sequence[str]) -> SystemAction
     except (OSError, subprocess.SubprocessError) as exc:
         restore_dns_state(snapshot)
         return SystemActionResult(False, f"Не удалось применить DNS: {exc}")
-    return SystemActionResult(
-        True,
-        f"DNS для «{adapter_name}» обновлён: {', '.join(normalized)}",
-        SystemChange("dns", adapter_name, snapshot, tuple(normalized)),
-    )
+    return None
 
 
 def optimize_mtu(
@@ -168,8 +208,14 @@ def apply_mtu_trial(
         return SystemActionResult(False, "Не удалось определить текущий MTU для безопасного отката")
     result = _run_hidden_command(
         [
-            "netsh", "interface", "ipv4", "set", "subinterface", adapter_name,
-            f"mtu={mtu}", "store=active",
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            adapter_name,
+            f"mtu={mtu}",
+            "store=active",
         ],
         "Не удалось применить пробный MTU",
     )
@@ -190,8 +236,14 @@ def persist_mtu(adapter_name: str, mtu: int) -> SystemActionResult:
         return SystemActionResult(False, "MTU должен быть в диапазоне от 576 до 9000")
     result = _run_hidden_command(
         [
-            "netsh", "interface", "ipv4", "set", "subinterface", adapter_name,
-            f"mtu={mtu}", "store=persistent",
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            adapter_name,
+            f"mtu={mtu}",
+            "store=persistent",
         ],
         "Не удалось сохранить MTU",
     )
@@ -235,8 +287,14 @@ def restore_mtu_state(adapter_name: str, mtu: int) -> SystemActionResult:
         return SystemActionResult(False, "Недопустимое состояние MTU для отката")
     result = _run_hidden_command(
         [
-            "netsh", "interface", "ipv4", "set", "subinterface", adapter_name,
-            f"mtu={mtu}", "store=persistent",
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            adapter_name,
+            f"mtu={mtu}",
+            "store=persistent",
         ],
         "Не удалось восстановить MTU",
     )
@@ -270,8 +328,7 @@ def capture_dns_state(adapter_name: str) -> DnsAdapterState | None:
         if not interface_guid:
             return None
         key_path = (
-            "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\"
-            + interface_guid
+            "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\" + interface_guid
         )
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
             enable_dhcp = int(_registry_value(winreg, key, "EnableDHCP", 0)) == 1
@@ -295,8 +352,13 @@ def restore_dns_state(state: DnsAdapterState) -> SystemActionResult:
     if state.dhcp_enabled:
         return _run_hidden_command(
             [
-                "netsh", "interface", "ipv4", "set", "dnsservers",
-                f"name={state.adapter_name}", "source=dhcp",
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "dnsservers",
+                f"name={state.adapter_name}",
+                "source=dhcp",
             ],
             "Не удалось восстановить DHCP-DNS",
         )
@@ -304,8 +366,14 @@ def restore_dns_state(state: DnsAdapterState) -> SystemActionResult:
     if not state.name_server.strip():
         return _run_hidden_command(
             [
-                "netsh", "interface", "ipv4", "set", "dnsservers",
-                f"name={state.adapter_name}", "source=static", "address=none",
+                "netsh",
+                "interface",
+                "ipv4",
+                "set",
+                "dnsservers",
+                f"name={state.adapter_name}",
+                "source=static",
+                "address=none",
             ],
             "Не удалось восстановить пустой статический DNS",
         )
@@ -315,13 +383,27 @@ def restore_dns_state(state: DnsAdapterState) -> SystemActionResult:
         return SystemActionResult(False, "В сохранённом состоянии DNS нет адресов")
     commands = [
         [
-            "netsh", "interface", "ipv4", "set", "dnsservers",
-            f"name={state.adapter_name}", "source=static", f"address={servers[0]}", "validate=no",
+            "netsh",
+            "interface",
+            "ipv4",
+            "set",
+            "dnsservers",
+            f"name={state.adapter_name}",
+            "source=static",
+            f"address={servers[0]}",
+            "validate=no",
         ],
         *(
             [
-                "netsh", "interface", "ipv4", "add", "dnsservers",
-                f"name={state.adapter_name}", f"address={server}", f"index={index}", "validate=no",
+                "netsh",
+                "interface",
+                "ipv4",
+                "add",
+                "dnsservers",
+                f"name={state.adapter_name}",
+                f"address={server}",
+                f"index={index}",
+                "validate=no",
             ]
             for index, server in enumerate(servers[1:], start=2)
         ),
@@ -341,7 +423,9 @@ def restore_dns_for_adapter(adapter_name: str) -> SystemActionResult:
 
 
 def _find_interface_guid(winreg: object, adapter_name: str) -> str | None:
-    control_path = r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+    control_path = (
+        r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}"
+    )
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, control_path) as root:
             index = 0
@@ -384,7 +468,9 @@ def reset_tcpip_stack() -> SystemActionResult:
         result = _run_hidden_command(command, failure_prefix)
         if not result.success:
             return result
-    return SystemActionResult(True, "TCP/IP и Winsock сброшены. Перезагрузите Windows, чтобы завершить применение.")
+    return SystemActionResult(
+        True, "TCP/IP и Winsock сброшены. Перезагрузите Windows, чтобы завершить применение."
+    )
 
 
 def restart_network_adapter(adapter_name: str) -> SystemActionResult:
@@ -417,7 +503,9 @@ def restart_network_adapter(adapter_name: str) -> SystemActionResult:
 def restart_adapter_verified(adapter_name: str, timeout: float = 15.0) -> SystemActionResult:
     """Restart an adapter and wait until it is up with a usable IPv4 address."""
     if timeout <= 0:
-        return SystemActionResult(False, "Время ожидания перезапуска адаптера должно быть положительным")
+        return SystemActionResult(
+            False, "Время ожидания перезапуска адаптера должно быть положительным"
+        )
     result = restart_network_adapter(adapter_name)
     if not result.success:
         return result
@@ -488,7 +576,9 @@ def _run_hidden_command(command: Sequence[str], failure_prefix: str) -> SystemAc
     if completed.returncode == 0:
         return SystemActionResult(True, "Команда выполнена")
     details = _decode_output(completed.stdout).strip() or f"код завершения {completed.returncode}"
-    return SystemActionResult(False, f"{failure_prefix}: {details}. Возможно, нужны права администратора.")
+    return SystemActionResult(
+        False, f"{failure_prefix}: {details}. Возможно, нужны права администратора."
+    )
 
 
 def _open_process(command: Sequence[str], label: str) -> SystemActionResult:

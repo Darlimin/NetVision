@@ -49,4 +49,3 @@ def _normalize_host(host: str) -> str:
         except UnicodeError as exc:
             raise ValueError("Имя хоста содержит недопустимые символы.") from exc
         return normalized
-

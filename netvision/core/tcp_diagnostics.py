@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import socket
 from time import perf_counter
+from threading import Event
 
 import psutil
-
 
 TRACKED_TCP_STATES = frozenset({"ESTABLISHED", "TIME_WAIT", "SYN_SENT", "SYN_RECV", "CLOSE_WAIT"})
 
@@ -59,7 +59,16 @@ def scan_tcp_sockets() -> tuple[TcpSocketRecord, ...]:
             pid = None
         name = names.setdefault(pid, _process_name(pid)) if pid is not None else "Системный сокет"
         records.append(TcpSocketRecord(pid, name, local, remote, state))
-    return tuple(sorted(records, key=lambda record: (record.process_name.casefold(), record.remote_endpoint, record.state)))
+    return tuple(
+        sorted(
+            records,
+            key=lambda record: (
+                record.process_name.casefold(),
+                record.remote_endpoint,
+                record.state,
+            ),
+        )
+    )
 
 
 def probe_tcp_connect(host: str, port: int, timeout: float = 2.0) -> TcpConnectMeasurement:
@@ -70,9 +79,13 @@ def probe_tcp_connect(host: str, port: int, timeout: float = 2.0) -> TcpConnectM
         with socket.create_connection((host.strip(), port), timeout=timeout):
             elapsed = round((perf_counter() - started) * 1000, 1)
     except socket.timeout:
-        return TcpConnectMeasurement(host.strip(), port, None, "Фильтруется / timeout", "Время ожидания TCP истекло")
+        return TcpConnectMeasurement(
+            host.strip(), port, None, "Фильтруется / timeout", "Время ожидания TCP истекло"
+        )
     except ConnectionRefusedError:
-        return TcpConnectMeasurement(host.strip(), port, None, "Закрыт", "Удалённый узел отклонил TCP-соединение")
+        return TcpConnectMeasurement(
+            host.strip(), port, None, "Закрыт", "Удалённый узел отклонил TCP-соединение"
+        )
     except OSError as exc:
         return TcpConnectMeasurement(host.strip(), port, None, "Ошибка", str(exc))
     return TcpConnectMeasurement(host.strip(), port, elapsed, "Открыт")
@@ -83,6 +96,7 @@ def probe_common_ports(
     ports: tuple[int, ...] | list[int],
     *,
     timeout: float = 1.5,
+    cancel_event: Event | None = None,
 ) -> tuple[TcpConnectMeasurement, ...]:
     """Probe independent TCP ports in parallel, preserving the requested order."""
     normalized = tuple(dict.fromkeys(int(port) for port in ports))
@@ -91,14 +105,26 @@ def probe_common_ports(
     if any(port < 1 or port > 65535 for port in normalized):
         raise ValueError("TCP-порты должны быть в диапазоне 1–65535")
     results: dict[int, TcpConnectMeasurement] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(normalized))) as executor:
-        futures = {executor.submit(probe_tcp_connect, host, port, timeout): port for port in normalized}
-        for future in as_completed(futures):
-            port = futures[future]
-            try:
-                results[port] = future.result()
-            except Exception as exc:
-                results[port] = TcpConnectMeasurement(host, port, None, "Ошибка", str(exc))
+    executor = ThreadPoolExecutor(max_workers=min(8, len(normalized)))
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+        futures = {
+            executor.submit(probe_tcp_connect, host, port, timeout): port for port in normalized
+        }
+        pending = set(futures)
+        while pending:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CancelledError()
+            done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+            for future in done:
+                port = futures[future]
+                try:
+                    results[port] = future.result()
+                except Exception as exc:
+                    results[port] = TcpConnectMeasurement(host, port, None, "Ошибка", str(exc))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return tuple(results[port] for port in normalized)
 
 

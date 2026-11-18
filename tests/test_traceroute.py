@@ -9,7 +9,6 @@ from netvision.core.thresholds import DEFAULT_THRESHOLDS
 from netvision.core.traceroute import HopProbe, MtrAccumulator
 from netvision.ui.monitor_workers import MtrMonitorWorker, WorkerRegistry
 
-
 TARGET = "8.8.8.8"
 
 
@@ -112,9 +111,15 @@ class MtrMonitorWorkerTests(unittest.TestCase):
         received: list[object] = []
         worker.snapshot.connect(received.append)
 
-        with patch("netvision.ui.monitor_workers.socket.getaddrinfo", return_value=[(2, 0, 0, "", (TARGET, 0))]), patch(
-            "netvision.ui.monitor_workers.probe_hop",
-            side_effect=[_probe(1, "192.168.1.1"), _probe(2, TARGET, destination=True)],
+        with (
+            patch(
+                "netvision.ui.monitor_workers.socket.getaddrinfo",
+                return_value=[(2, 0, 0, "", (TARGET, 0))],
+            ),
+            patch(
+                "netvision.ui.monitor_workers.probe_hop",
+                side_effect=[_probe(1, "192.168.1.1"), _probe(2, TARGET, destination=True)],
+            ),
         ):
             thread = registry.start(worker)
             started = time.monotonic()

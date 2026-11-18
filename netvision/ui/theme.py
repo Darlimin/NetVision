@@ -643,9 +643,7 @@ QComboBox#LanguageSelector:hover, QComboBox#LanguageSelector:focus {
 }
 
 QToolButton#ThemeToggle {
-    min-width: 36px;
     min-height: 36px;
-    max-width: 36px;
     max-height: 36px;
     padding: 0;
     color: #A0AEC0;
@@ -991,7 +989,7 @@ QLabel#MetricValue {
 }
 
 QFrame#MetricTile[compact="true"] {
-    min-height: 76px;
+    min-height: 80px;
     max-height: 82px;
 }
 
@@ -1777,4 +1775,3 @@ QPushButton#SessionAnomalyOpenLogButton:hover {
     border-color: #55D6AE;
 }
 """
-

@@ -12,6 +12,8 @@ class Thresholds:
     rtt_high_ms: float = 100.0
     rtt_peak_ms: float = 150.0
     rtt_normal_ms: float = 80.0
+    game_good_rtt_ms: float = 60.0
+    loss_warn_pct: float = 5.0
     dns_good_ms: float = 30.0
     dns_ok_ms: float = 80.0
     episode_quiet_samples: int = 3

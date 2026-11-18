@@ -19,9 +19,13 @@ def _snapshot() -> SystemSnapshot:
 
 class MtuOptimizerTests(unittest.TestCase):
     def _run(self, run_mock, *, minimum=576, maximum=1500):
-        with patch.object(mtu_optimizer.socket, "getaddrinfo", return_value=[(2, 0, 0, "", ("8.8.8.8", 0))]), patch.object(
-            mtu_optimizer, "_route_local_ipv4", return_value="192.168.1.10"
-        ), patch.object(mtu_optimizer.os, "name", "nt"):
+        with (
+            patch.object(
+                mtu_optimizer.socket, "getaddrinfo", return_value=[(2, 0, 0, "", ("8.8.8.8", 0))]
+            ),
+            patch.object(mtu_optimizer, "_route_local_ipv4", return_value="192.168.1.10"),
+            patch.object(mtu_optimizer.os, "name", "nt"),
+        ):
             return mtu_optimizer.run_mtu_optimizer(
                 "target.example", minimum=minimum, maximum=maximum, snapshot=_snapshot()
             )
@@ -47,7 +51,11 @@ class MtuOptimizerTests(unittest.TestCase):
             if command[0] == "netsh":
                 return CompletedProcess(command, 0, stdout=b"1500 0 0 0 Wi-Fi\n")
             mtu = int(command[-2]) + 28
-            output = b"Reply from 8.8.8.8: bytes=32 time=10ms\n" if mtu <= 1492 else b"Packet needs to be fragmented but DF set.\n"
+            output = (
+                b"Reply from 8.8.8.8: bytes=32 time=10ms\n"
+                if mtu <= 1492
+                else b"Packet needs to be fragmented but DF set.\n"
+            )
             return CompletedProcess(command, 0 if mtu <= 1492 else 1, stdout=output)
 
         run_mock.side_effect = side_effect
@@ -70,7 +78,11 @@ class MtuOptimizerTests(unittest.TestCase):
                 return CompletedProcess(command, 1, stdout=b"Request timed out.\n")
             if mtu == 1486:
                 calls_for_1486 += 1
-            output = b"Reply from 8.8.8.8: bytes=32 time=10ms\n" if mtu <= 1492 else b"Packet needs to be fragmented but DF set.\n"
+            output = (
+                b"Reply from 8.8.8.8: bytes=32 time=10ms\n"
+                if mtu <= 1492
+                else b"Packet needs to be fragmented but DF set.\n"
+            )
             return CompletedProcess(command, 0 if mtu <= 1492 else 1, stdout=output)
 
         run_mock.side_effect = side_effect
@@ -91,7 +103,10 @@ class MtuOptimizerTests(unittest.TestCase):
         current = mtu_optimizer.detect_system_mtu("VPN")
 
         self.assertEqual(current, 1420)
-        self.assertEqual(mtu_optimizer._mtu_decision(current, 1420, mtu_optimizer.DEFAULT_THRESHOLDS), "NO_CHANGE")
+        self.assertEqual(
+            mtu_optimizer._mtu_decision(current, 1420, mtu_optimizer.DEFAULT_THRESHOLDS),
+            "NO_CHANGE",
+        )
 
 
 if __name__ == "__main__":

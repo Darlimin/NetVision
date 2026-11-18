@@ -46,7 +46,9 @@ class ReportSerializationTests(unittest.TestCase):
             ),
             dns=DnsResult(target.host, (), None, ProbeStatus.WARNING),
             tcp=TcpResult(target.host, target.port, None, None, ProbeStatus.WARNING),
-            ping=PingResult(target.host, 5, 0, 100, None, None, None, None, (), ProbeStatus.WARNING),
+            ping=PingResult(
+                target.host, 5, 0, 100, None, None, None, None, (), ProbeStatus.WARNING
+            ),
             tls=None,
             hops=(),
             geolocation=(),
@@ -158,8 +160,15 @@ class ReportSerializationTests(unittest.TestCase):
             report,
             measurements={
                 "wifi": WifiSnapshot(
-                    "Wi-Fi", "Home Secret Network", "AA:BB:CC:DD:EE:FF",
-                    None, None, None, None, None, None,
+                    "Wi-Fi",
+                    "Home Secret Network",
+                    "AA:BB:CC:DD:EE:FF",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
             },
             redact=False,
@@ -176,7 +185,11 @@ class ReportSerializationTests(unittest.TestCase):
             target=target,
             system=SystemSnapshot(
                 "support-pc",
-                (NetworkInterface("Wi-Fi", "Wi-Fi", True, 866, "00:11:22:33:44:55", ("192.168.1.50",)),),
+                (
+                    NetworkInterface(
+                        "Wi-Fi", "Wi-Fi", True, 866, "00:11:22:33:44:55", ("192.168.1.50",)
+                    ),
+                ),
                 None,
                 ("1.1.1.1",),
                 "8.8.8.8",
@@ -184,10 +197,25 @@ class ReportSerializationTests(unittest.TestCase):
             ),
             dns=DnsResult(target.host, ("8.8.8.8",), 10.0, ProbeStatus.SUCCESS),
             tcp=TcpResult(target.host, target.port, "8.8.8.8", 12.0, ProbeStatus.SUCCESS),
-            ping=PingResult(target.host, 3, 3, 0.0, 12.0, 10.0, 15.0, 1.0, (10.0, 12.0, 15.0), ProbeStatus.SUCCESS),
+            ping=PingResult(
+                target.host,
+                3,
+                3,
+                0.0,
+                12.0,
+                10.0,
+                15.0,
+                1.0,
+                (10.0, 12.0, 15.0),
+                ProbeStatus.SUCCESS,
+            ),
             tls=None,
             hops=(HopResult(1, "8.8.8.8", 12.0),),
-            geolocation=(GeoResult("8.8.8.8", "US", None, None, "AS15169", "Google", "Google", ProbeStatus.SUCCESS),),
+            geolocation=(
+                GeoResult(
+                    "8.8.8.8", "US", None, None, "AS15169", "Google", "Google", ProbeStatus.SUCCESS
+                ),
+            ),
             started_at=datetime(2026, 10, 21, 12, 0, 0),
             total_ms=12.0,
         )
@@ -195,4 +223,3 @@ class ReportSerializationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

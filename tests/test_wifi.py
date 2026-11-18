@@ -3,8 +3,7 @@ import unittest
 from netvision.core.system import parse_wifi_interfaces_output
 from netvision.models import WifiSnapshot
 from netvision.ui.monitor_workers import WifiSignalTracker
-from netvision.ui.main_window import _wifi_correlation_evidence
-
+from netvision.ui.utils import _wifi_correlation_evidence
 
 EN_OUTPUT = """
     Name                   : Wi-Fi
