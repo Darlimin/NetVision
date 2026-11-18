@@ -35,6 +35,9 @@ dist/
 *.dylib
 .build-*/
 release/
+netvision_rs/target/
+.codex-backups/
+codex-rejected-cas.pem
 
 # IDE and editor files
 .idea/
