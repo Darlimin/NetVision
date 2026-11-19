@@ -1,12 +1,14 @@
 """Package the newest completed Windows build for GitHub Releases."""
 
 from pathlib import Path
+from runpy import run_path
 from tempfile import NamedTemporaryFile
 from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parent.parent
 RELEASE = ROOT / "release"
-ARCHIVE = RELEASE / "NetVision-v0.10.0-windows-amd64.zip"
+VERSION = run_path(str(ROOT / "netvision" / "version.py"))["__version__"]
+ARCHIVE = RELEASE / f"NetVision-v{VERSION}-windows-amd64.zip"
 
 
 def main() -> int:

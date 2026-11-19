@@ -33,6 +33,8 @@ class WifiController(QObject):
         self.host._wifi_snapshot = snapshot
         if snapshot is None:
             return
+        if self.host._report is not None:
+            self.host.overview_controller._update_dashboard_verdict(self.host._report)
         self.host._set_wifi_status(_format_wifi_snapshot(snapshot))
         if previous is not None and _wifi_roamed(previous, snapshot):
             self.host._record_journal_event(

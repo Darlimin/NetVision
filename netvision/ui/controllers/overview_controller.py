@@ -8,6 +8,13 @@ from netvision.core.judgement import tls_domain_required
 from netvision.models import DiagnosticReport, ProbeStatus
 from netvision.ui.ui_models import HeaderAnomalyEvent
 from netvision.ui import constants as ui_constants
+from netvision.ui.presentation import (
+    VPN_DNS_HINT,
+    VPN_MAIN_HINT,
+    is_literal_target,
+    metric_assessment,
+    smart_verdict,
+)
 from netvision.ui.utils import (
     _ms,
     _severity_label,
@@ -211,11 +218,75 @@ class OverviewController(QObject):
             else report.tls.version or "OK" if tls_ok and report.tls else "—"
         )
         self._set_dashboard_metric("tls", tls_text, "good" if tls_ok else "neutral")
+        vpn = bool(report.system.default_routes and report.system.default_routes[0].is_vpn)
+        self.workspace.dashboard_vpn_hint.setText(self.host._tr(VPN_MAIN_HINT))
+        self.workspace.dashboard_vpn_hint.setVisible(vpn)
+        self.host.dns_workspace.vpn_hint.setText(self.host._tr(VPN_DNS_HINT))
+        self.host.dns_workspace.vpn_hint.setVisible(vpn)
+        self._update_dashboard_verdict(report)
+        selected = self.host._selected_connection
+        udp = selected is not None and selected.protocol.upper() == "UDP"
+        assessments = {
+            "dns": metric_assessment(
+                "dns",
+                report.dns.latency_ms,
+                error=report.dns.status != ProbeStatus.SUCCESS,
+                vpn=vpn,
+            ),
+            "ping": metric_assessment(
+                "ping", report.ping.average_ms, error=report.ping.average_ms is None
+            ),
+            "loss": metric_assessment("loss", report.ping.loss_percent),
+            "jitter": metric_assessment("jitter", report.ping.jitter_ms),
+            "tcp": metric_assessment("tcp", report.tcp.latency_ms, error=not tcp_ok, udp=udp),
+            "tls": metric_assessment(
+                "tls",
+                1.0 if tls_ok else None,
+                error=bool(report.tls and not tls_ok),
+                udp=udp,
+                bare_ip=is_literal_target(report.target.host),
+                expires_days=(
+                    (
+                        report.tls.expires_at - datetime.now(report.tls.expires_at.tzinfo)
+                    ).total_seconds()
+                    / 86400
+                    if report.tls and report.tls.expires_at
+                    else None
+                ),
+            ),
+        }
+        for key, assessment in assessments.items():
+            card = self.workspace.dashboard_metric_cards[key]
+            card.caption.setText(self.host._tr(assessment.text))
+            card.value.setStyleSheet(f"color: {assessment.color};")
+            card.setProperty("metricState", assessment.state)
+            card.style().unpolish(card)
+            card.style().polish(card)
+            if assessment.text in ("Не для UDP", "Требует домен"):
+                card.value.setText(self.host._tr(assessment.text))
         self.workspace.dashboard_latency_chart.set_samples(
             self.host._dashboard_histories["latency"]
         )
         self.host._dashboard_render_topology(report)
         self.host._dashboard_render_regions(report)
+
+    def _update_dashboard_verdict(self, report: DiagnosticReport) -> None:
+        wifi = self.host._wifi_snapshot
+        vpn = bool(report.system.default_routes and report.system.default_routes[0].is_vpn)
+        cause = smart_verdict(
+            wifi.gateway_rtt_ms if wifi is not None else None,
+            None,
+            vpn,
+            report.ping.loss_percent,
+            report.ping.jitter_ms,
+            report.ping.average_ms,
+            bool(
+                report.tls
+                and tls_domain_required(report.target.host, report.tls.error)
+                and not report.errors
+            ),
+        )
+        self.workspace.dashboard_verdict.setText(self.host._tr(cause))
 
     def _set_dashboard_metric(self, key: str, value: str, state: str) -> None:
         self.workspace.dashboard_metric_cards[key].set_metric(

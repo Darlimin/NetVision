@@ -14,6 +14,8 @@ class SparklineWidget(QWidget):
         super().__init__()
         self._data: tuple[float, ...] = ()
         self._color = QColor(color_hex)
+        self.show_axis = False
+        self.translate = lambda text: text
         self.setMinimumHeight(minimum_height)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -56,11 +58,24 @@ class SparklineWidget(QWidget):
 
         painter.setPen(QPen(self._color, 2))
         if len(self._data) == 1:
+            if self.show_axis:
+                painter.setPen(QPen(QColor("#64748b"), 1))
+                painter.drawText(6, 14, f"{self.translate('макс')} {self._data[0]:.1f} ms")
+                painter.drawText(
+                    6, rect.bottom(), f"{self.translate('мин')} {self._data[0]:.1f} ms"
+                )
+                painter.setPen(QPen(self._color, 2))
             painter.drawLine(rect.left(), rect.center().y(), rect.right(), rect.center().y())
             return
 
         minimum = min(self._data)
         span = max(self._data) - minimum
+        if self.show_axis:
+            span = max(span, 30.0)
+            painter.setPen(QPen(QColor("#64748b"), 1))
+            painter.drawText(6, 14, f"{self.translate('макс')} {max(self._data):.1f} ms")
+            painter.drawText(6, rect.bottom(), f"{self.translate('мин')} {minimum:.1f} ms")
+            painter.setPen(QPen(self._color, 2))
         if span <= 0:
             span = 1.0
         step = rect.width() / (len(self._data) - 1)

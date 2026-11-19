@@ -14,6 +14,7 @@ from netvision.core.process_utils import EndpointChoice, _explain_game_connectio
 from netvision.ui.legacy_workers import ProcessScanWorker
 from netvision.ui.game_check_worker import GameAutoCheckResult
 from netvision.core.packet_capture import CaptureState
+from netvision.ui.presentation import GREY, socket_label, socket_priority, target_mode
 
 
 from netvision.ui.workspaces.process_selector import ProcessSelector
@@ -31,6 +32,14 @@ class ProcessController(QObject):
             self._on_connection_selected
         )
         workspace.process_refresh_button.clicked.connect(self.refresh_processes)
+
+    @Slot(str)
+    def _update_target_mode(self, text: str) -> None:
+        connection = self.host._selected_connection
+        protocol = connection.protocol if connection else "TCP"
+        self.host.core_workspace.dashboard_target_mode.setText(
+            self.host._tr(target_mode(text, protocol))
+        )
 
     @Slot(object)
     def _inherited__on_process_scan_completed(self, result: object) -> None:
@@ -93,7 +102,7 @@ class ProcessController(QObject):
             )
             self.workspace.process_connection_selector.blockSignals(False)
             return
-        for connection in self.host._selected_process.connections:
+        for connection in sorted(self.host._selected_process.connections, key=socket_priority):
             self.workspace.process_connection_selector.addItem(
                 self._connection_display_label(connection), connection
             )
@@ -124,7 +133,11 @@ class ProcessController(QObject):
             },
         )
         self.host._start_udp_port_monitor(self.host._selected_process.pid)
-        if self.host._selected_process.connections:
+        if (
+            self.host._selected_process.connections
+            and socket_priority(min(self.host._selected_process.connections, key=socket_priority))
+            < 3
+        ):
             self.host._connection_pick_auto = self.host.header_panel.lite_mode_button.isChecked()
             self.workspace.process_connection_selector.setCurrentIndex(0)
 
@@ -218,16 +231,7 @@ class ProcessController(QObject):
         return f"{process.name} · PID {process.pid} · {count} {noun}"
 
     def _connection_display_label(self, connection: ProcessConnection) -> str:
-        if not connection.remote_address or connection.remote_port < 1:
-            endpoint = self.host._translator.format(
-                "локальный UDP-порт {port}", port=connection.local_port
-            )
-        else:
-            endpoint = connection.remote_endpoint
-        suffix = (
-            " (локальный прокси/loopback)" if is_loopback_address(connection.remote_address) else ""
-        )
-        return f"{connection.protocol} · {endpoint}{suffix} · {connection.status}"
+        return socket_label(connection, self.host._tr)
 
     @Slot()
     def refresh_processes(self) -> None:
@@ -354,6 +358,18 @@ class ProcessController(QObject):
             return
         self._dashboard_sync_process_choices()
         self.host._dashboard_sync_controls()
+        if self.host._report is not None:
+            self.host.overview_controller._dashboard_apply_report(self.host._report)
+        else:
+            udp_selected = bool(
+                self.host._selected_connection
+                and self.host._selected_connection.protocol.upper() == "UDP"
+            )
+            for key in ("tcp", "tls"):
+                card = self.host.core_workspace.dashboard_metric_cards[key]
+                card.set_metric(self.host._tr("Не для UDP") if udp_selected else "—", "neutral")
+                card.caption.setText(self.host._tr("Не для UDP") if udp_selected else "")
+                card.value.setStyleSheet(f"color: {GREY};")
         self.host._dashboard_render_regions()
 
     @Slot(int, str)
@@ -500,9 +516,6 @@ class ProcessController(QObject):
             self.host._dashboard_game_connection = None
             self.host._dashboard_game_metrics = None
             self.host._dashboard_render_regions()
-            self.host.overview_controller._dashboard_apply_health(
-                "warning", self.host._tr("Игра не найдена")
-            )
             return
         process = value.process
         if value.selected_connection is not None and value.selected_connection.protocol == "UDP":

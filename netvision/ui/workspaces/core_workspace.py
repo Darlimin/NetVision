@@ -27,6 +27,7 @@ from netvision.core.system_actions import (
     open_windows_firewall,
 )
 from netvision.ui import constants as ui_constants
+from netvision.ui.presentation import GAME_AUTO_HELP, GAME_PRESET_HELP, LATENCY_HELP, METRIC_HELP
 from netvision.ui.components import factory
 from netvision.ui.widgets import TopologyWidget, apply_accent_glow, apply_panel_shadow
 from netvision.version import display_version
@@ -114,8 +115,17 @@ class CoreOverviewWorkspace(QWidget):
         self.dashboard_status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.dashboard_status_subtitle = QLabel()
         self.dashboard_status_subtitle.setObjectName("SubLabel")
+        self.dashboard_verdict = QLabel()
+        self.dashboard_verdict.setObjectName("SubLabel")
+        self.dashboard_verdict.setWordWrap(True)
+        self.dashboard_vpn_hint = QLabel()
+        self.dashboard_vpn_hint.setObjectName("SubLabel")
+        self.dashboard_vpn_hint.setWordWrap(True)
+        self.dashboard_vpn_hint.hide()
         status_layout.addWidget(self.dashboard_status_pill)
         status_layout.addWidget(self.dashboard_status_subtitle)
+        status_layout.addWidget(self.dashboard_verdict)
+        status_layout.addWidget(self.dashboard_vpn_hint)
         splitter.addWidget(status_card)
 
         process_card = factory.new_card()
@@ -151,6 +161,9 @@ class CoreOverviewWorkspace(QWidget):
         self.dashboard_target_input.setObjectName("DashboardInput")
         self.dashboard_target_input.textChanged.connect(self.controller._dashboard_sync_mtu_target)
         self.dashboard_target_input.textChanged.connect(
+            self.controller.process_controller._update_target_mode
+        )
+        self.dashboard_target_input.textChanged.connect(
             self.controller.tls_workspace.tls_target_input.setText
         )
         self.dashboard_target_input.textChanged.connect(
@@ -176,6 +189,9 @@ class CoreOverviewWorkspace(QWidget):
         process_layout.addWidget(preset_label, 5, 0)
         for column, button in enumerate(self.controller.preset_buttons.values(), start=1):
             process_layout.addWidget(button, 5, column, 1, 1)
+        self.controller.preset_buttons["Игровой сервер"].setToolTip(
+            self.controller._tr(GAME_PRESET_HELP)
+        )
         splitter.addWidget(process_card)
 
         action_card = factory.new_card()
@@ -193,6 +209,7 @@ class CoreOverviewWorkspace(QWidget):
             self.controller._tr("Автопроверка игры")
         )
         self.dashboard_game_auto_check_button.setObjectName("SecondaryActionBtn")
+        self.dashboard_game_auto_check_button.setToolTip(self.controller._tr(GAME_AUTO_HELP))
         self.dashboard_game_auto_check_button.clicked.connect(self.controller._open_game_auto_check)
         action_layout.addWidget(self.dashboard_start_button)
         action_layout.addWidget(self.dashboard_game_auto_check_button)
@@ -217,6 +234,7 @@ class CoreOverviewWorkspace(QWidget):
         self.dashboard_metric_cards = {}
         for key, title, color in definitions:
             card = self.metric_card_type(title, color)
+            card.title.setToolTip(self.controller._tr(METRIC_HELP[key]))
             self.dashboard_metric_cards[key] = card
             row.addWidget(card, 1)
         return row
@@ -517,6 +535,9 @@ class CoreOverviewWorkspace(QWidget):
             factory.card_title(self.controller._tr("Задержка / Стабильность (60 секунд)"))
         )
         self.dashboard_latency_chart = self.sparkline_type("#34D399", 132)
+        self.dashboard_latency_chart.show_axis = True
+        self.dashboard_latency_chart.translate = self.controller._tr
+        self.dashboard_latency_chart.setToolTip(self.controller._tr(LATENCY_HELP))
         chart_layout.addWidget(self.dashboard_latency_chart)
         row.addWidget(chart_card, 3)
 

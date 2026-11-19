@@ -290,12 +290,12 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(results[0].selected_connection, game_connection)
         self.assertEqual(results[0].selection_reason, "UDP + игровой порт")
 
-    def test_game_auto_check_uses_external_socket_from_fallback_process(self) -> None:
+    def test_game_auto_check_uses_external_socket_from_another_game(self) -> None:
         worker = GameAutoCheckWorker()
         results = []
         worker.completed.connect(results.append)
         hunt = RunningProcess(700, "HuntGame.exe")
-        fallback = RunningProcess(701, "game-launcher.exe")
+        fallback = RunningProcess(701, "cs2.exe")
         loopback = ProcessConnection("UDP", "NONE", "127.0.0.1", 10809, "127.0.0.1", 10809)
         external = ProcessConnection("UDP", "ESTABLISHED", "192.168.1.2", 40000, "8.8.8.8", 27015)
 
@@ -318,9 +318,9 @@ class MainWindowReportTests(unittest.TestCase):
             worker.run()
 
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0].process.name, "game-launcher.exe")
+        self.assertEqual(results[0].process.name, "cs2.exe")
         self.assertEqual(results[0].selected_connection, external)
-        self.assertIn("резервный процесс", results[0].warning or "")
+        self.assertIsNone(results[0].warning)
 
     def test_game_auto_check_requires_an_external_udp_socket(self) -> None:
         worker = GameAutoCheckWorker("HuntGame.exe")

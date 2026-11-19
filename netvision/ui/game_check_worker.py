@@ -15,7 +15,6 @@ from netvision.core.process_inspector import (
     RunningProcess,
     list_running_processes,
     scan_process,
-    is_ignored_process,
     has_unresolved_udp_socket,
     unresolved_udp_ports,
     is_public_address,
@@ -26,6 +25,7 @@ from netvision.core.process_utils import (
     _is_background_cdn,
     _game_connection_key,
 )
+from netvision.ui.presentation import GAME_PROCESSES
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,21 +97,13 @@ class GameAutoCheckWorker(QObject):
         if self._preferred_process is not None:
             preferred = self._preferred_process.casefold()
             return tuple(item for item in result.processes if item.name.casefold() == preferred)
-        hunt = tuple(item for item in result.processes if item.name.casefold() == "huntgame.exe")
-        fallback = tuple(
-            item
-            for item in result.processes
-            if item.name.casefold() != "huntgame.exe" and not is_ignored_process(item.name)
-        )
-        return hunt + fallback
+        return tuple(item for item in result.processes if item.name.casefold() in GAME_PROCESSES)
 
     def _missing_process_result(self, result: ProcessListResult) -> GameAutoCheckResult:
         if self._preferred_process is not None:
             warning = result.warning or f"Процесс {self._preferred_process} не найден"
         else:
-            warning = (
-                result.warning or "Игровой процесс и резервный процесс с внешним сокетом не найдены"
-            )
+            warning = result.warning or "Активных игр не найдено"
         return GameAutoCheckResult(None, (), None, warning, None)
 
     def _inspect_process(
@@ -145,9 +137,6 @@ class GameAutoCheckWorker(QObject):
             )
         choice = _explain_game_connection(selected, connections)
         ping = probe_ping(selected.remote_address, count=5, wait_ms=450)
-        if self._preferred_process is None and process.name.casefold() != "huntgame.exe":
-            fallback_warning = f"Игра не найдена; выбран резервный процесс {process.name}"
-            warning = f"{fallback_warning}; {warning}" if warning else fallback_warning
         reason = choice.rule if choice is not None else None
         if capture_result is not None and capture_result.connection is not None:
             reason = "Перехват UDP-заголовков"

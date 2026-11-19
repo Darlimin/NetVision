@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -65,6 +66,8 @@ class EventsCard(QFrame):
         layout.setContentsMargins(12, 8, 12, 8)
         title_row = QHBoxLayout()
         title_row.addWidget(factory.card_title(translate("Системные события")))
+        self.show_udp_events = QCheckBox(translate("Показывать UDP-порты"))
+        title_row.addWidget(self.show_udp_events)
         title_row.addStretch(1)
         self.dashboard_action_status = QLabel()
         self.dashboard_action_status.setObjectName("SubLabel")

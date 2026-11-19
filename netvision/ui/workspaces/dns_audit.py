@@ -47,6 +47,11 @@ class DnsWorkspace(QFrame):
         header.addLayout(title_box, 1)
         header.addWidget(self.dns_geohide_button)
         layout.addLayout(header)
+        self.vpn_hint = QLabel()
+        self.vpn_hint.setObjectName("Muted")
+        self.vpn_hint.setWordWrap(True)
+        self.vpn_hint.hide()
+        layout.addWidget(self.vpn_hint)
 
         system_panel = QWidget()
         system_layout = QVBoxLayout(system_panel)

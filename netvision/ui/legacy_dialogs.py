@@ -313,8 +313,15 @@ class GameAutoCheckDialog(QDialog):
         self.endpoint_label.setText(self._translate("Удалённая цель: не определена"))
         self.endpoint_label.setToolTip("")
         self.socket_list.clear()
-        self.status_label.setText(self._translate("Запустите игру и повторите проверку"))
-        self._set_alert_state("warning")
+        no_games = (
+            self._last_result is not None and self._last_result.warning == "Активных игр не найдено"
+        )
+        self.status_label.setText(
+            self._translate(
+                "Активных игр не найдено" if no_games else "Запустите игру и повторите проверку"
+            )
+        )
+        self._set_alert_state("info" if no_games else "warning")
 
     def _render_selected_endpoint(self, value: GameAutoCheckResult) -> EndpointChoice | None:
         choice = _explain_game_connection(value.selected_connection, value.connections)

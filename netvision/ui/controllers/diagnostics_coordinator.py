@@ -22,6 +22,7 @@ from netvision.ui.legacy_workers import BufferbloatWorker, InternetQualityWorker
 from netvision.ui.lite_mode import LiteStatus
 from netvision.ui.utils import _format_diagnostic_failure, _ms
 from netvision.ui.utils import _bufferbloat_speed, _speed, _latency
+from netvision.ui.presentation import nat_description
 
 from datetime import datetime
 import re
@@ -701,7 +702,7 @@ class DiagnosticsCoordinator(QObject):
                 flags.append("UDP egress отличается от внешнего IP")
             suffix = f" · {', '.join(flags)}" if flags else ""
             self.host.quality_workspace.nat_probe_status.setText(
-                f"NAT: {value.nat_type or 'не определён'} · filtering: {value.filtering}\n{'; '.join(endpoints)}{suffix}"
+                f"NAT: {value.nat_type or self.host._tr('Не определён')} ({self.host._tr(nat_description(value.nat_type))}) · filtering: {value.filtering}\n{'; '.join(endpoints)}{suffix}"
             )
             self.host._record_journal_event(
                 "nat.measured",

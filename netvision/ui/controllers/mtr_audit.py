@@ -10,6 +10,7 @@ from netvision.core.traceroute import MtrSnapshot, TracerouteHop
 from netvision.ui.legacy_workers import TracerouteWorker
 from netvision.ui.monitor_workers import MtrMonitorWorker, WorkerRegistry
 from netvision.ui.utils import _ms
+from netvision.ui.presentation import VPN_MTR_HINT
 
 
 from netvision.ui.workspaces.mtr_audit import MtrWorkspace
@@ -248,6 +249,12 @@ class MtrController(QObject):
             self._on_traceroute_failed("Трассировка вернула некорректный результат")
             return
         self.facts.set("traceroute.route", value)
+        report = self.host._report
+        vpn = bool(
+            report and report.system.default_routes and report.system.default_routes[0].is_vpn
+        )
+        self.workspace.vpn_hint.setText(self.host._tr(VPN_MTR_HINT))
+        self.workspace.vpn_hint.setVisible(vpn and len(value) == 1)
         if not value:
             self.workspace.traceroute_status.setText(self.host._tr("Маршрут не найден"))
             return
@@ -272,6 +279,12 @@ class MtrController(QObject):
         ):
             return
         self.host._mtr_snapshot = value
+        report = self.host._report
+        vpn = bool(
+            report and report.system.default_routes and report.system.default_routes[0].is_vpn
+        )
+        self.workspace.vpn_hint.setText(self.host._tr(VPN_MTR_HINT))
+        self.workspace.vpn_hint.setVisible(vpn and len(value.hops) <= 1)
         self.facts.set("mtr.snapshot", value)
         self._render_mtr_snapshot(value)
         if value.undetermined:

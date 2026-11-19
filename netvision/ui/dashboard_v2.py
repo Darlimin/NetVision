@@ -91,7 +91,7 @@ from netvision.ui.dialogs import (
     PresetEditorDialog,
     RollbackConfirmDialog,
 )
-from netvision.ui.game_check_worker import GameAutoCheckWorker
+from netvision.ui.game_check_worker import GameAutoCheckResult, GameAutoCheckWorker
 from netvision.ui.legacy_workers import ProcessSocketsWorker
 from netvision.ui.legacy_dialogs import GameAutoCheckDialog, NetworkBoostDialog
 from netvision.ui.legacy_workers import GameLaunchMonitorWorker, NetworkBoostScanWorker
@@ -117,6 +117,7 @@ from netvision.ui.utils import (
     _tls_certificate_state,
 )
 from netvision.version import display_version
+from netvision.ui.presentation import BUFFERBLOAT_HELP, MTR_HELP, MTU_HELP, NAT_HELP, target_mode
 
 
 class MetricCard(QFrame):
@@ -133,9 +134,12 @@ class MetricCard(QFrame):
         self.title.setObjectName("MetricTitle")
         self.value = QLabel("—")
         self.value.setObjectName("MetricValue")
+        self.caption = QLabel("")
+        self.caption.setObjectName("SubLabel")
         self.sparkline = SparklineWidget(color, 26)
         layout.addWidget(self.title)
         layout.addWidget(self.value)
+        layout.addWidget(self.caption)
         layout.addWidget(self.sparkline)
 
     def set_metric(self, value: str, state: str, samples: Iterable[float] = ()) -> None:
@@ -874,6 +878,10 @@ class NetVisionDashboardV2(QMainWindow):
             )
 
     def _retranslate_content_views(self) -> None:
+        self.mtr_workspace.setToolTip(self._tr(MTR_HELP))
+        self.bufferbloat_workspace.setToolTip(self._tr(BUFFERBLOAT_HELP))
+        self.mtu_workspace.mtu_section_title.setToolTip(self._tr(MTU_HELP))
+        self.quality_workspace.nat_probe_status.setToolTip(self._tr(NAT_HELP))
         self._refresh_preset_buttons()
         if hasattr(self.bufferbloat_workspace, "bufferbloat_recommendations"):
             self._render_bufferbloat_recommendations()
@@ -1462,6 +1470,20 @@ class NetVisionDashboardV2(QMainWindow):
         dialog.endpoint_chosen.connect(self._on_endpoint_chosen)
         dialog.capture_started.connect(self._on_game_capture_started)
         dialog.check_completed.connect(self.process_controller._on_game_auto_check_completed)
+        launched = False
+
+        def start_once(result: object) -> None:
+            nonlocal launched
+            if (
+                not launched
+                and isinstance(result, GameAutoCheckResult)
+                and result.selected_connection is not None
+                and result.selected_connection.protocol.upper() == "UDP"
+            ):
+                launched = True
+                self.start_diagnostic()
+
+        dialog.check_completed.connect(start_once)
         dialog.exec()
 
     def _render_tls_chain(self, records: tuple[CertificateRecord, ...]) -> None:
@@ -2839,12 +2861,28 @@ class NetVisionDashboardV2(QMainWindow):
                 self.core_workspace.dashboard_target_input.text()
             )
             self._dashboard_sync_tcp_ports(self.core_workspace.dashboard_port_input.value())
-            mode = (
-                "Режим: привязка к выбранному процессу"
-                if self._selected_connection is not None
-                else "Режим: проверка по адресу"
+            mode = target_mode(
+                self.core_workspace.target_input.text(),
+                self._selected_connection.protocol if self._selected_connection else "TCP",
             )
             self.core_workspace.dashboard_target_mode.setText(self._tr(mode))
+            self.core_workspace.dashboard_port_input.setToolTip(
+                self._tr(
+                    "Порт (UDP)"
+                    if self._selected_connection
+                    and self._selected_connection.protocol.upper() == "UDP"
+                    else "Порт (TCP)"
+                )
+            )
+            self.core_workspace.dashboard_port_input.setPrefix(
+                self._tr(
+                    "Порт (UDP)"
+                    if self._selected_connection
+                    and self._selected_connection.protocol.upper() == "UDP"
+                    else "Порт (TCP)"
+                )
+                + " "
+            )
         finally:
             self._dashboard_syncing = False
 
@@ -3053,6 +3091,8 @@ class NetVisionDashboardV2(QMainWindow):
         if not hasattr(
             getattr(self, "events_card", None), "dashboard_event_output"
         ) or not self._dashboard_widgets_alive(self.events_card.dashboard_event_output):
+            return
+        if "UDP-порты PID" in message and not self.events_card.show_udp_events.isChecked():
             return
         self._dashboard_events.append(
             f"[{self._format_session_elapsed(self._session_elapsed_seconds)}] {message}"
