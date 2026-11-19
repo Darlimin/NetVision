@@ -28,7 +28,7 @@ from netvision.core.thresholds import Thresholds, DEFAULT_THRESHOLDS
 from netvision.core.bufferbloat import run_bufferbloat_test
 from netvision.core.game_monitor import GameLaunchMonitor
 from netvision.core.dns_benchmark import DnsResolverProfile, benchmark_resolvers
-from netvision.core.system import collect_dns_configuration
+from netvision.core.system import active_network_identity, collect_dns_configuration
 from netvision.core.ping_benchmark import (
     RegionalPingTarget,
     benchmark_regional_targets,
@@ -384,22 +384,38 @@ class DnsBenchmarkWorker(_CancellableWorker):
 
 
 class DnsConfigurationWorker(_CancellableWorker):
-    completed = Signal(object, object)
+    completed = Signal(object, object, object, object)
     failed = Signal(str)
 
     @Slot()
     def run(self) -> None:
         try:
             self._check_cancelled()
+            before = active_network_identity()
             configuration = collect_dns_configuration()
             self._check_cancelled()
             public_addresses = fetch_public_ip_addresses(cancel_event=self._cancel_event)
+            after = active_network_identity()
             self._check_cancelled()
-            self.completed.emit(configuration, public_addresses)
+            self.completed.emit(configuration, public_addresses, before, after)
         except CancelledError:
             pass
         except Exception as exc:
             self.failed.emit(f"Не удалось получить системные DNS: {exc}")
+        finally:
+            self.finished.emit()
+
+
+class NetworkIdentityWorker(QObject):
+    completed = Signal(object)
+    finished = Signal()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.completed.emit(active_network_identity())
+        except (OSError, ValueError):
+            self.completed.emit(None)
         finally:
             self.finished.emit()
 

@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import ipaddress
 from netvision.core.session import Scope
 from netvision.core.thresholds import Thresholds
 from netvision.models import DiagnosticReport, ProbeStatus
+
+
+def tls_domain_required(host: str, error: str | None) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    text = (error or "").casefold()
+    return "ip address mismatch" in text or "certificate_verify_failed" in text
 
 
 def header_anomaly(
@@ -13,6 +23,12 @@ def header_anomaly(
 ) -> tuple[str, str, dict[str, float]]:
     if report.tcp.status != ProbeStatus.SUCCESS:
         return "error", "Нет подключения к целевому узлу", {}
+    if (
+        report.tls is not None
+        and report.tls.status != ProbeStatus.SUCCESS
+        and not tls_domain_required(report.target.host, report.tls.error)
+    ):
+        return "warning", "Ошибка проверки TLS", {}
     loss = report.ping.loss_percent
     if loss >= 20:
         return "error", "Потери пакетов: {loss:.0f}%", {"loss": loss}

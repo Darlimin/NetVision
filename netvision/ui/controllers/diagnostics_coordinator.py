@@ -142,6 +142,10 @@ class DiagnosticsCoordinator(QObject):
         )
         for error in report.errors:
             self.host._append_log(f"Предупреждение: {error}")
+        if report.tls and judgement.tls_domain_required(report.target.host, report.tls.error):
+            self.event_bus.log_requested.emit(
+                self.host._tr("Проверка сертификата ограничена: для IP требуется домен"), "INFO"
+            )
         self.host._append_log("Диагностика завершена")
 
     def _inherited__on_failed(self, failure: object) -> None:
@@ -513,13 +517,13 @@ class DiagnosticsCoordinator(QObject):
             self.host._tr("Базовый ping")
         )
         self.host.bufferbloat_workspace.bufferbloat_phase_details["download"].setText(
-            self.host._tr("Дельта: {delta} · скорость: {speed}").format(
+            self.host._tr("Дельта (p95 − p50): {delta} · скорость: {speed}").format(
                 delta=_ms(value.download_active.delta_ms),
                 speed=_bufferbloat_speed(value.download_active.speed_mbps),
             )
         )
         self.host.bufferbloat_workspace.bufferbloat_phase_details["upload"].setText(
-            self.host._tr("Дельта: {delta} · скорость: {speed}").format(
+            self.host._tr("Дельта (p95 − p50): {delta} · скорость: {speed}").format(
                 delta=_ms(value.upload_active.delta_ms),
                 speed=_bufferbloat_speed(value.upload_active.speed_mbps),
             )
@@ -528,7 +532,9 @@ class DiagnosticsCoordinator(QObject):
         self.host.bufferbloat_workspace.bufferbloat_verdict.setText(self.host._tr(value.verdict))
         attribution = self.host._bufferbloat_attribution(value)
         self.host.bufferbloat_workspace.bufferbloat_delta.setText(
-            self.host._tr("Δ download: {download} · Δ upload: {upload} · {attribution}").format(
+            self.host._tr(
+                "Δ (p95 − p50) download: {download} · upload: {upload} · {attribution}"
+            ).format(
                 download=_ms(value.download_active.delta_ms),
                 upload=_ms(value.upload_active.delta_ms),
                 attribution=attribution,

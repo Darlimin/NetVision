@@ -15,6 +15,7 @@ from netvision.core.probes import (
     trace_route,
 )
 from netvision.core.system import collect_system_snapshot
+from netvision.core.judgement import tls_domain_required
 from netvision.models import (
     DiagnosticReport,
     DnsResult,
@@ -105,7 +106,10 @@ def _run_tls_probe(target: Target, tcp: TcpResult, notify: ProgressCallback, err
     notify("tls", "Проверяем TLS и сертификат")
     tls = probe_tls(target)
     if tls.error:
-        errors.append(f"TLS: {tls.error}")
+        if tls_domain_required(target.host, tls.error):
+            notify("tls", "TLS-сертификат требует доменное имя; транспорт доступен")
+        else:
+            errors.append(f"TLS: {tls.error}")
     return tls
 
 

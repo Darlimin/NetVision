@@ -1,6 +1,6 @@
 """DnsController for diagnostics."""
 
-from PySide6.QtCore import QObject, QThread, Qt, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Slot
 from PySide6.QtGui import QColor, QCursor
 from PySide6.QtWidgets import QTableWidgetItem, QApplication, QPushButton, QSizePolicy, QToolTip
 from netvision.core.session import StateStore
@@ -8,7 +8,11 @@ from netvision.core.dns_benchmark import DnsBenchmarkResult, custom_dns_profile
 from netvision.core.system import DnsConfiguration
 from netvision.core.internet_quality import PublicIpAddresses
 from netvision.core.system_actions import apply_dns_servers, open_network_adapters
-from netvision.ui.legacy_workers import DnsBenchmarkWorker, DnsConfigurationWorker
+from netvision.ui.legacy_workers import (
+    DnsBenchmarkWorker,
+    DnsConfigurationWorker,
+    NetworkIdentityWorker,
+)
 from netvision.ui.monitor_workers import WorkerRegistry
 
 
@@ -24,17 +28,33 @@ class DnsController(QObject):
         self.workspace = workspace
         self.facts = facts
         self.registry = registry
+        self._network_identity = None
+        self._measured_identity = None
+        self._request_identity = None
+        self._identity_thread = None
+        self._reload_pending = False
+        self._shutting_down = False
+        self._identity_timer = QTimer(self)
+        self._identity_timer.setInterval(15000)
+        self._identity_timer.timeout.connect(self._check_network_identity)
+        self._identity_timer.start()
         workspace.dns_run_button.clicked.connect(self.start_dns_benchmark)
         workspace.dns_apply_button.clicked.connect(self._apply_selected_dns_profile)
         workspace.dns_custom_button.clicked.connect(self._add_custom_dns_profile)
         workspace.dns_adapter_properties_button.clicked.connect(self._open_dns_adapter_properties)
 
     def stop(self) -> None:
+        self._shutting_down = True
+        self._reload_pending = False
+        self._identity_timer.stop()
         self.registry.stop(self.host._dns_benchmark_thread)
         self.registry.stop(self.host._dns_config_thread)
+        self.registry.stop(self._identity_thread)
 
     @Slot(str)
     def _on_dns_benchmark_failed(self, message: str) -> None:
+        if self._shutting_down:
+            return
         self.host._set_task_button_busy(self.workspace.dns_run_button, False)
         self.workspace.dns_status.setText(message)
 
@@ -56,8 +76,11 @@ class DnsController(QObject):
 
     @Slot()
     def start_dns_benchmark(self) -> None:
+        if self._shutting_down:
+            return
         if self.host._dns_benchmark_thread and self.host._dns_benchmark_thread.isRunning():
             return
+        self._load_dns_configuration()
         self.host._set_task_button_busy(self.workspace.dns_run_button, True, "Проверка")
         self.workspace.dns_status.setText(
             self.host._tr("Проверяем TCP/53 параллельно для всех резолверов...")
@@ -84,6 +107,8 @@ class DnsController(QObject):
 
     @Slot(object)
     def _on_dns_benchmark_completed(self, value: object) -> None:
+        if self._shutting_down:
+            return
         self.host._set_task_button_busy(self.workspace.dns_run_button, False)
         if not isinstance(value, tuple) or not all(
             isinstance(item, DnsBenchmarkResult) for item in value
@@ -135,22 +160,33 @@ class DnsController(QObject):
         else:
             self.workspace.dns_status.setText(self.host._tr("Доступных DNS-серверов не найдено"))
 
-    @Slot(object, object)
+    @Slot(object, object, object, object)
     def _on_dns_configuration_completed(
         self,
         configuration: object,
         public_addresses: object,
+        before: object,
+        after: object,
     ) -> None:
+        if self._shutting_down:
+            return
         if not isinstance(configuration, DnsConfiguration):
             self._on_dns_configuration_failed("Системные DNS не распознаны")
             return
+        if before != after or (
+            self._network_identity != self._request_identity and after != self._network_identity
+        ):
+            self._reload_pending = True
+            return
+        self._network_identity = after
+        self._measured_identity = after
         self.workspace.dns_adapter_combo.clear()
         for name in configuration.adapter_names:
             self.workspace.dns_adapter_combo.addItem(name, name)
         self.host._dns_configuration = configuration
         self.host._dns_public_addresses = (
             public_addresses
-            if isinstance(public_addresses, PublicIpAddresses)
+            if after is not None and isinstance(public_addresses, PublicIpAddresses)
             else PublicIpAddresses()
         )
         self._render_dns_info()
@@ -158,6 +194,8 @@ class DnsController(QObject):
 
     @Slot(str)
     def _on_dns_configuration_failed(self, message: str) -> None:
+        if self._shutting_down:
+            return
         self.host._dns_configuration = None
         self.host._dns_public_addresses = PublicIpAddresses(error=message)
         self._render_dns_info()
@@ -169,10 +207,47 @@ class DnsController(QObject):
             return
         self.host._dns_config_thread = None
         self.host._dns_config_worker = None
+        if self._reload_pending and not self._shutting_down:
+            self._reload_pending = False
+            self._load_dns_configuration()
+
+    def _check_network_identity(self) -> None:
+        if self._shutting_down or self._identity_thread is not None or self.host._dashboard_closing:
+            return
+        worker = NetworkIdentityWorker()
+        worker.completed.connect(self._network_identity_changed)
+        thread = self.registry.start(worker)
+        self._identity_thread = thread
+        thread.finished.connect(self._clear_identity_worker)
+        if thread.isFinished():
+            self._identity_thread = None
+
+    @Slot()
+    def _clear_identity_worker(self) -> None:
+        if self.sender() is self._identity_thread:
+            self._identity_thread = None
+
+    @Slot(object)
+    def _network_identity_changed(self, identity: object) -> None:
+        if self._shutting_down:
+            return
+        if identity == self._network_identity:
+            return
+        self._network_identity = identity
+        if identity != self._measured_identity:
+            self.host._dns_public_addresses = PublicIpAddresses()
+            self._render_dns_info()
+            if self.host._dns_config_thread is not None:
+                self._reload_pending = True
+            elif identity is not None:
+                self._load_dns_configuration()
 
     def _load_dns_configuration(self) -> None:
+        if self._shutting_down:
+            return
         if self.host._dns_config_thread and self.host._dns_config_thread.isRunning():
             return
+        self._request_identity = self._network_identity
         thread = QThread(self.host)
         worker = DnsConfigurationWorker()
         worker.moveToThread(thread)

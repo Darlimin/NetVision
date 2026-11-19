@@ -290,6 +290,13 @@ def _tls_transport_failure(report: DiagnosticReport) -> bool:
     if report.tls.status != ProbeStatus.ERROR:
         return False
     error = (report.tls.error or "").casefold()
+    if "ip address mismatch" in error:
+        try:
+            ipaddress.ip_address(report.target.host)
+        except ValueError:
+            pass
+        else:
+            return False
     markers = ("timeout", "timed out", "время ожидания", "reset", "обрыв")
     return any(marker in error for marker in markers)
 

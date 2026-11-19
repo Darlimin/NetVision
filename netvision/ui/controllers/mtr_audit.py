@@ -1,8 +1,9 @@
 """MtrController for diagnostics."""
 
-from PySide6.QtCore import QObject, QThread, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QTableWidgetItem
+from shiboken6 import isValid
 
 from netvision.core.session import StateStore
 from netvision.core.traceroute import MtrSnapshot, TracerouteHop
@@ -78,7 +79,7 @@ class MtrController(QObject):
 
     @Slot()
     def _inherited_start_mtr_monitor(self) -> None:
-        if self.host._mtr_thread and self.host._mtr_thread.isRunning():
+        if self.host._mtr_thread is not None:
             return
         host = self.workspace.traceroute_target_input.text().strip()
         if not host:
@@ -106,15 +107,11 @@ class MtrController(QObject):
                 active_owner=lambda: self.host._mtr_worker,
             )
         )
-        worker.finished.connect(
-            self.host._queue_ui_slot(
-                self._clear_mtr_worker,
-                owner=worker,
-                active_owner=lambda: self.host._mtr_worker,
-            )
-        )
         self.host._mtr_worker = worker
         self.host._mtr_thread = self.registry.start(worker)
+        self.host._mtr_thread.finished.connect(self._clear_mtr_worker)
+        if self.host._mtr_thread.isFinished():
+            QTimer.singleShot(0, self._clear_mtr_worker)
         self.event_bus.journal_event_requested.emit(
             "mtr.started",
             {
@@ -348,6 +345,12 @@ class MtrController(QObject):
 
     @Slot()
     def _clear_mtr_worker(self) -> None:
+        if self.sender() is not None and self.sender() is not self.host._mtr_thread:
+            return
+        thread = self.host._mtr_thread
+        if thread is not None and isValid(thread) and not thread.wait(0):
+            QTimer.singleShot(10, self._clear_mtr_worker)
+            return
         self.host._mtr_thread = None
         self.host._mtr_worker = None
         self.workspace.mtr_start_button.blockSignals(True)

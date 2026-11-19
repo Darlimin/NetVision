@@ -32,7 +32,7 @@ class DnsWorkspace(QFrame):
         self.dns_back_button = QPushButton("←  Назад")
         self.dns_back_button.setObjectName("DnsBackButton")
         title_box = QVBoxLayout()
-        title = QLabel("DNS DEEP-DIVE")
+        title = QLabel("ДИАГНОСТИКА DNS")
         title.setObjectName("DnsWorkspaceTitle")
         subtitle = QLabel("Сравнение отклика публичных и пользовательских DNS-серверов")
         subtitle.setObjectName("Muted")

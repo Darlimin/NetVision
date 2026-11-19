@@ -5,6 +5,7 @@ from enum import StrEnum
 
 from netvision.models import DiagnosticReport, ProbeStatus
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
+from netvision.core.judgement import tls_domain_required
 
 
 class LiteStatus(StrEnum):
@@ -40,7 +41,11 @@ def summarize_report(
         or report.ping.loss_percent > 0
         or report.ping.jitter_ms is None
         or report.ping.jitter_ms > th.jitter_critical_ms
-        or (report.tls is not None and report.tls.status != ProbeStatus.SUCCESS)
+        or (
+            report.tls is not None
+            and report.tls.status != ProbeStatus.SUCCESS
+            and not tls_domain_required(report.target.host, report.tls.error)
+        )
     )
     if has_warning:
         return LiteSummary(

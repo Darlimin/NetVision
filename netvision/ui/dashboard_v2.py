@@ -1955,6 +1955,7 @@ class NetVisionDashboardV2(QMainWindow):
         self._close_combo_popups()
         self.mode_stack.setCurrentWidget(self.dns_view)
         self.dns_workspace.dns_back_button.setFocus()
+        self.dns_controller._check_network_identity()
         self.dns_controller._load_dns_configuration()
 
     def _render_quality_mtu_placeholders(self) -> None:
@@ -2354,6 +2355,7 @@ class NetVisionDashboardV2(QMainWindow):
     @Slot(int)
     def _dashboard_quality_tab_changed(self, index: int) -> None:
         if self.dashboard_quality_tabs.widget(index) is self.dns_view:
+            self.dns_controller._check_network_identity()
             self.dns_controller._load_dns_configuration()
 
     def _open_tls_workspace(self) -> None:
@@ -2384,6 +2386,7 @@ class NetVisionDashboardV2(QMainWindow):
                 self._worker_registry,
             )
             self._geohide_dialog.finished.connect(self._clear_geohide_dialog)
+            QTimer.singleShot(0, self._geohide_dialog._refresh)
         self._geohide_dialog.show()
         self._geohide_dialog.raise_()
         self._geohide_dialog.activateWindow()
@@ -2472,8 +2475,9 @@ class NetVisionDashboardV2(QMainWindow):
         self.mtu_workspace.mtu_section_title.setText(self._tr("MTU"))
         self.mtu_workspace.ping_mtu_host_input.setReadOnly(True)
         self.mtu_workspace.ping_mtu_host_input.setClearButtonEnabled(False)
-        self.mtu_workspace.ping_mtu_table.setFixedHeight(110)
-        mtu_panel.setMaximumHeight(300)
+        self.mtu_workspace.ping_mtu_table.setMinimumHeight(190)
+        mtu_panel.setMaximumHeight(16777215)
+        mtu_panel.layout().setSpacing(10)
         interface_tab.layout().addWidget(mtu_panel)
         self.dashboard_mtu_section = mtu_panel
         mtu_panel.show()
@@ -3023,9 +3027,14 @@ class NetVisionDashboardV2(QMainWindow):
 
     @staticmethod
     def _first_local_ip(snapshot: SystemSnapshot) -> str:
+        for route in sorted(snapshot.default_routes, key=lambda route: route.metric):
+            if route.local_address and not route.local_address.startswith("127."):
+                return route.local_address
         for interface in snapshot.interfaces:
-            if interface.is_up and interface.ipv4:
-                return interface.ipv4[0]
+            if interface.is_up:
+                for address in interface.ipv4:
+                    if not address.startswith("127."):
+                        return address
         return "локальный IP не определён"
 
     @staticmethod

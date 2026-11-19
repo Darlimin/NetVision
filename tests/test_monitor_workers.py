@@ -1,6 +1,8 @@
 """Exercise real Qt threads using deterministic probes, never the network."""
 
 from concurrent.futures import CancelledError
+import gc
+import weakref
 from threading import Event, Thread
 from time import monotonic
 from unittest.mock import patch
@@ -79,6 +81,39 @@ def test_mtr_registry_retains_worker_until_probe_returns():
             assert thread.wait(_THREAD_WAIT_MS)
             pump_until(app, lambda: not registry.busy)
     assert not snapshots
+
+
+def test_registry_retains_stopped_worker_and_thread_during_gc():
+    app = QApplication.instance() or QApplication(["tests", "-platform", "offscreen"])
+    registry = WorkerRegistry()
+    entered, release = Event(), Event()
+
+    class BlockingWorker(QObject):
+        finished = Signal()
+
+        @Slot()
+        def run(self):
+            entered.set()
+            release.wait(3)
+            self.finished.emit()
+
+        def stop(self):
+            pass
+
+    worker = BlockingWorker()
+    thread = registry.start(worker)
+    worker_ref, thread_ref = weakref.ref(worker), weakref.ref(thread)
+    try:
+        pump_until(app, entered.is_set)
+        registry.stop_all()
+        del worker, thread
+        gc.collect()
+        assert worker_ref() is not None and thread_ref() is not None
+        assert registry.busy and thread_ref().isRunning()
+    finally:
+        release.set()
+        assert registry.wait_for_all(_THREAD_WAIT_MS)
+        pump_until(app, lambda: not registry.busy)
 
 
 def test_cancelled_workers_finish_without_starting_work():

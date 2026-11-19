@@ -27,6 +27,15 @@ class DnsConfiguration:
     servers: tuple[str, ...]
 
 
+def active_network_identity() -> tuple[str, str] | None:
+    """Return the active default route's interface and IPv4, off the UI thread."""
+    interfaces = _collect_interfaces()
+    routes = _collect_default_routes(interfaces)
+    if not routes or not routes[0].interface or not routes[0].local_address:
+        return None
+    return routes[0].interface, routes[0].local_address
+
+
 def collect_dns_configuration() -> DnsConfiguration:
     """Read active adapter names and configured resolvers without external network calls."""
     interfaces = _collect_interfaces()

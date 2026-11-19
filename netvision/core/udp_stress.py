@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import socket
+import secrets
 import struct
 import time
 
@@ -24,8 +25,12 @@ class UdpStressReport:
 
 def _dns_query(transaction_id: int) -> bytes:
     header = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0)
-    question = b"\x08netvision\x05local\x00" + struct.pack("!HH", 1, 1)
+    question = b"\x07example\x03com\x00" + struct.pack("!HH", 1, 1)
     return header + question
+
+
+def _stun_query(transaction_id: bytes) -> bytes:
+    return struct.pack("!HHI", 1, 0, 0x2112A442) + transaction_id
 
 
 def run_udp_packet_loss_stress(
@@ -58,15 +63,30 @@ def run_udp_packet_loss_stress(
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
         connection.settimeout(timeout)
+        connection.connect((host, port))
         for sequence in range(count):
-            transaction_id = (int(time.monotonic_ns()) + sequence) & 0xFFFF
-            payload = _dns_query(transaction_id)
+            transaction_id = secrets.token_bytes(12)
+            payload = (
+                _stun_query(transaction_id)
+                if port == 3478
+                else _dns_query(int.from_bytes(transaction_id[:2], "big"))
+            )
             started = time.perf_counter()
             try:
-                connection.sendto(payload, (host, port))
+                connection.send(payload)
                 sent += 1
-                response, _ = connection.recvfrom(2048)
-                if len(response) >= 2 and struct.unpack("!H", response[:2])[0] == transaction_id:
+                response = connection.recv(2048)
+                valid = (
+                    len(response) >= 20
+                    and response[4:8] == b"\x21\x12\xa4\x42"
+                    and response[8:20] == transaction_id
+                    and response[:2] in (b"\x01\x01", b"\x01\x11")
+                    if port == 3478
+                    else len(response) >= 12
+                    and response[:2] == transaction_id[:2]
+                    and bool(response[2] & 0x80)
+                )
+                if valid:
                     received += 1
                     timings.append((time.perf_counter() - started) * 1000)
             except socket.timeout:

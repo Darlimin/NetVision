@@ -63,6 +63,7 @@ from netvision.models import (
     TcpResult,
 )
 from netvision.ui.controllers.ping_audit import PingController
+from netvision.ui.controllers.dns_audit import DnsController
 from netvision.ui.dashboard_v2 import NetVisionDashboardV2
 from netvision.ui.theme import APP_STYLE, LIGHT_STYLE
 
@@ -94,6 +95,12 @@ class MainWindowReportTests(unittest.TestCase):
         udp_patch = patch.object(NetVisionDashboardV2, "_start_udp_port_monitor")
         udp_patch.start()
         self.addCleanup(udp_patch.stop)
+        identity_patch = patch.object(DnsController, "_check_network_identity")
+        identity_patch.start()
+        self.addCleanup(identity_patch.stop)
+        dns_patch = patch.object(DnsController, "_load_dns_configuration")
+        dns_patch.start()
+        self.addCleanup(dns_patch.stop)
         journal_patch = patch(
             "netvision.core.session_journal.default_journal_path",
             return_value=self._journal_tmp_path / "event_journal.jsonl",
@@ -117,11 +124,15 @@ class MainWindowReportTests(unittest.TestCase):
         self.app.processEvents()
         gc.collect()
 
-    @staticmethod
-    def _dispose_test_window(widget: object) -> None:
+    def _dispose_test_window(self, widget: object) -> None:
         registry = getattr(widget, "_worker_registry", None)
+        controller = getattr(widget, "dns_controller", None)
+        if controller is not None:
+            controller.stop()
         if registry is not None:
             registry.stop_all()
+            self.assertTrue(registry.wait_for_all(10000), "UI workers did not stop")
+            self.app.processEvents()
         if hasattr(widget, "_quit_requested"):
             widget._quit_requested = True
         if hasattr(widget, "_background_enabled"):

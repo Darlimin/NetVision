@@ -119,6 +119,7 @@ class TeardownCoordinator(QObject):
         )
         if cancellable_running and (not other_running):
             host._closing = True
+            host.dns_controller.stop()
             host._worker_registry.stop_all()
             host.setEnabled(False)
             host.statusBar().showMessage(host._tr("Завершаем сетевой мониторинг…"))
@@ -150,6 +151,7 @@ class TeardownCoordinator(QObject):
             )
             return
         host._closing = True
+        host.dns_controller.stop()
         host._session_timer.stop()
         host.jitter_controller._sync_jitter_episode(
             "closed", host._jitter_episode_tracker.close("shutdown")

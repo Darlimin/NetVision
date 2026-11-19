@@ -15,6 +15,7 @@ ENV/
 .pytest_cache/
 pytest-cache-files*/
 .pytest-temp/
+.test-sandbox/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -38,6 +39,11 @@ release/
 netvision_rs/target/
 .codex-backups/
 codex-rejected-cas.pem
+/NetVision-*.zip
+*.lnk
+/netvision_source_bundle.txt
+/report.json
+/udp-events.csv
 
 # IDE and editor files
 .idea/

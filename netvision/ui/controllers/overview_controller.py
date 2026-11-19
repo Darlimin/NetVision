@@ -4,6 +4,7 @@ from datetime import datetime
 from PySide6.QtCore import QObject
 from netvision.core.session import StateStore
 from netvision.core.root_cause import analyze_report
+from netvision.core.judgement import tls_domain_required
 from netvision.models import DiagnosticReport, ProbeStatus
 from netvision.ui.ui_models import HeaderAnomalyEvent
 from netvision.ui import constants as ui_constants
@@ -130,14 +131,25 @@ class OverviewController(QObject):
 
         if report.tls:
             tls_ok = report.tls.status == ProbeStatus.SUCCESS
+            tls_ip_mismatch = not tls_ok and tls_domain_required(
+                report.target.host, report.tls.error
+            )
             self.host.expert_view.metrics["tls"].set_metric(
-                report.tls.version or "ERROR",
+                (
+                    self.host._tr("Требует домен")
+                    if tls_ip_mismatch
+                    else report.tls.version or "ERROR"
+                ),
                 self.host._tr(
                     "Безопасное соединение подтверждено"
                     if tls_ok
-                    else "Сертификат или шифрование не прошли проверку"
+                    else (
+                        "Требует домен"
+                        if tls_ip_mismatch
+                        else "Сертификат или шифрование не прошли проверку"
+                    )
                 ),
-                "good" if tls_ok else "bad",
+                "neutral" if tls_ip_mismatch else "good" if tls_ok else "bad",
             )
             if (
                 hasattr(self.host.tls_workspace, "tls_overview_values")
@@ -193,7 +205,11 @@ class OverviewController(QObject):
             "good" if tcp_ok else "error",
         )
         tls_ok = report.tls is not None and report.tls.status == ProbeStatus.SUCCESS
-        tls_text = report.tls.version or "OK" if tls_ok and report.tls else "—"
+        tls_text = (
+            self.host._tr("Требует домен")
+            if report.tls and tls_domain_required(report.target.host, report.tls.error)
+            else report.tls.version or "OK" if tls_ok and report.tls else "—"
+        )
         self._set_dashboard_metric("tls", tls_text, "good" if tls_ok else "neutral")
         self.workspace.dashboard_latency_chart.set_samples(
             self.host._dashboard_histories["latency"]
