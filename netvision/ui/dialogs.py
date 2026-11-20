@@ -476,7 +476,6 @@ class GeoHideDialog(QDialog):
         self._worker: GeoHideWorker | None = None
         self._close_pending = False
         self._worker_registry = worker_registry or WorkerRegistry(self)
-        self._worker_registry.idle.connect(self._clear_thread)
         self._result: GeoHideResult | None = None
         self._status_source = "Нажмите «Обновить», чтобы получить данные GeoHide"
         self._status_values: dict[str, object] = {}
@@ -587,6 +586,11 @@ class GeoHideDialog(QDialog):
         panel_layout.addWidget(self.status_label)
         layout.addWidget(panel)
         self.retranslate(self._translate)
+
+    def showEvent(self, event: object) -> None:
+        super().showEvent(event)
+        if self._result is None and self._thread is None and not self._close_pending:
+            self._refresh()
 
     def retranslate(self, translate: Callable[[str], str]) -> None:
         self._translate = translate
@@ -726,7 +730,7 @@ class GeoHideDialog(QDialog):
         )
 
     def _refresh(self) -> None:
-        if self._worker_registry.busy:
+        if self._thread is not None:
             return
         self._set_refresh_button_busy(True)
         self.progress.setVisible(True)
@@ -736,6 +740,7 @@ class GeoHideDialog(QDialog):
         worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
         self._worker = worker
         self._thread = self._worker_registry.start(worker)
+        self._thread.finished.connect(self._clear_thread)
 
     @Slot(object)
     def _on_loaded(self, value: object) -> None:
@@ -786,9 +791,9 @@ class GeoHideDialog(QDialog):
             QTimer.singleShot(0, self.reject)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._worker_registry.busy:
+        if self._thread is not None:
             self._close_pending = True
-            self._worker_registry.stop_all()
+            self._worker_registry.stop(self._thread)
             self._refresh_timer.stop()
             self.hide()
             event.ignore()

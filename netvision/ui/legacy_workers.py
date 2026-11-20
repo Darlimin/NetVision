@@ -22,7 +22,12 @@ from netvision.core.network_boost import (
     scan_background_traffic_candidates,
     terminate_background_candidates,
 )
-from netvision.core.internet_quality import run_internet_quality_check, fetch_public_ip_addresses
+from netvision.core.internet_quality import (
+    PublicIpAddresses,
+    fetch_public_ip_addresses,
+    fetch_public_network_info,
+    run_internet_quality_check,
+)
 from netvision.core.nat_diagnostics import probe_nat
 from netvision.core.thresholds import Thresholds, DEFAULT_THRESHOLDS
 from netvision.core.bufferbloat import run_bufferbloat_test
@@ -395,6 +400,11 @@ class DnsConfigurationWorker(_CancellableWorker):
             configuration = collect_dns_configuration()
             self._check_cancelled()
             public_addresses = fetch_public_ip_addresses(cancel_event=self._cancel_event)
+            network = fetch_public_network_info(timeout=3)
+            if network.ipv4:
+                public_addresses = PublicIpAddresses(
+                    ipv4=network.ipv4, ipv6=public_addresses.ipv6, error=public_addresses.error
+                )
             after = active_network_identity()
             self._check_cancelled()
             self.completed.emit(configuration, public_addresses, before, after)

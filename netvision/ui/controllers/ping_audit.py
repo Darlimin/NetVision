@@ -433,6 +433,9 @@ class PingController(QObject):
             self.host._format_ms(jitter),
             jitter_state,
         )
+        self.host.overview_controller.update_live_assessments(
+            snapshot.loss_percent, jitter, value if success else None
+        )
         self.host.core_workspace.dashboard_latency_chart.set_samples(
             self.host._dashboard_histories["latency"]
         )

@@ -270,16 +270,18 @@ class OverviewController(QObject):
         self.host._dashboard_render_topology(report)
         self.host._dashboard_render_regions(report)
 
-    def _update_dashboard_verdict(self, report: DiagnosticReport) -> None:
+    def _update_dashboard_verdict(
+        self, report: DiagnosticReport, *, loss=None, jitter=None, ping=None
+    ) -> None:
         wifi = self.host._wifi_snapshot
         vpn = bool(report.system.default_routes and report.system.default_routes[0].is_vpn)
         cause = smart_verdict(
             wifi.gateway_rtt_ms if wifi is not None else None,
             None,
             vpn,
-            report.ping.loss_percent,
-            report.ping.jitter_ms,
-            report.ping.average_ms,
+            report.ping.loss_percent if loss is None else loss,
+            report.ping.jitter_ms if jitter is None else jitter,
+            report.ping.average_ms if ping is None else ping,
             bool(
                 report.tls
                 and tls_domain_required(report.target.host, report.tls.error)
@@ -287,6 +289,20 @@ class OverviewController(QObject):
             ),
         )
         self.workspace.dashboard_verdict.setText(self.host._tr(cause))
+
+    def update_live_assessments(
+        self, loss: float, jitter: float | None, ping: float | None
+    ) -> None:
+        for key, value in (("loss", loss), ("jitter", jitter), ("ping", ping)):
+            assessment = metric_assessment(key, value, error=key == "ping" and value is None)
+            card = self.workspace.dashboard_metric_cards[key]
+            card.caption.setText(self.host._tr(assessment.text))
+            card.value.setStyleSheet(f"color: {assessment.color};")
+            card.setProperty("metricState", assessment.state)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        if self.host._report is not None:
+            self._update_dashboard_verdict(self.host._report, loss=loss, jitter=jitter, ping=ping)
 
     def _set_dashboard_metric(self, key: str, value: str, state: str) -> None:
         self.workspace.dashboard_metric_cards[key].set_metric(

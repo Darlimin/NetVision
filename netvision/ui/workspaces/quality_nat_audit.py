@@ -107,7 +107,7 @@ class QualityNatWorkspace(QWidget):
         self.quality_report_output = QPlainTextEdit()
         self.quality_report_output.setReadOnly(True)
         keep_wheel_scroll_local(self.quality_report_output)
-        self.quality_report_output.setMaximumHeight(112)
+        self.quality_report_output.setMinimumHeight(220)
         self.quality_report_output.setPlaceholderText(
             "Здесь появится сопоставление результатов Speedtest, Яндекса и локального адаптера."
         )

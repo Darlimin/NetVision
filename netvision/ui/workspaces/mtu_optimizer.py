@@ -54,7 +54,7 @@ class MtuWorkspace(QFrame):
         self.ping_mtu_table = QTableWidget(0, 5)
         self.ping_mtu_table.setObjectName("MtuOptimizerTable")
         self.ping_mtu_table.setHorizontalHeaderLabels(["MTU", "Payload", "RTT", "Статус", "Детали"])
-        factory.configure_table(self.ping_mtu_table, (70, 85, 75, 125, 180))
+        factory.configure_table(self.ping_mtu_table, (70, 85, 75, 240, 300))
         self.ping_mtu_table.setMinimumHeight(190)
         self.mtu_optimizer_target_input = self.ping_mtu_host_input
         self.mtu_optimizer_start_button = self.ping_mtu_run_button

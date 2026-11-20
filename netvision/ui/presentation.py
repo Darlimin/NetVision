@@ -186,6 +186,8 @@ def smart_verdict(
     ):
         return "Проблема локально (Wi-Fi / роутер) — проверьте сигнал или кабель"
     if gateway_ping is None and gateway_loss is None:
+        if (loss is not None and loss > 1) or (jitter is not None and jitter > JITTER_WARNING_MS):
+            return "Потери или скачки пинга — шлюз не проверен"
         return "Состояние шлюза не проверено"
     if vpn and (
         (loss is not None and loss > 1)

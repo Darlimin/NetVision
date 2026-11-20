@@ -695,6 +695,35 @@ class MainWindowReportTests(unittest.TestCase):
             apply_dns.assert_called_once_with("Ethernet", ("1.1.1.1",))
         window.close()
 
+    def test_dns_apply_refreshes_configuration_and_keeps_ip_on_timeout(self) -> None:
+        from netvision.core.internet_quality import PublicIpAddresses
+        from netvision.core.system import DnsConfiguration
+
+        window = NetVisionDashboardV2(bootstrap=False)
+        controller = window.dns_controller
+        identity = ("happ-xray", "10.0.0.2")
+        controller._network_identity = controller._measured_identity = identity
+        controller._request_identity = identity
+        window._dns_public_addresses = PublicIpAddresses(ipv4="203.0.113.10")
+        with patch.object(controller, "_load_dns_configuration") as refresh:
+            window._on_system_action_completed(
+                "DNS", window.dns_workspace.dns_apply_button, SystemActionResult(True, "OK")
+            )
+            refresh.assert_called_once()
+        configuration = DnsConfiguration(("happ-xray",), ("94.140.14.14",))
+        controller._on_dns_configuration_completed(
+            configuration, PublicIpAddresses(error="timeout"), identity, identity
+        )
+        self.assertEqual(window._dns_configuration, configuration)
+        self.assertEqual(window._dns_public_addresses.ipv4, "203.0.113.10")
+        self.assertTrue(controller._retry_timer.isActive())
+        controller._on_dns_configuration_completed(
+            configuration, PublicIpAddresses(ipv4="203.0.113.11"), identity, identity
+        )
+        self.assertEqual(window._dns_public_addresses.ipv4, "203.0.113.11")
+        controller._retry_timer.stop()
+        window.close()
+
     def test_ping_metric_opens_deep_dive_and_back_returns_to_dashboard(self) -> None:
         window = NetVisionDashboardV2(bootstrap=False)
         window.show()
@@ -1231,6 +1260,13 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(window.header_panel.mode_label.text(), "MODE")
         self.assertEqual(window.header_panel.expert_mode_button.text(), "Expert")
         self.assertEqual(window.header_panel.lite_mode_button.text(), "Simple mode")
+        for index in range(window.workspace_tabs.count()):
+            text = window.workspace_tabs.tabText(index)
+            self.assertNotIn("&", text.replace("&&", ""))
+        window.header_panel.language_combo.setCurrentIndex(0)
+        for index in range(window.workspace_tabs.count()):
+            text = window.workspace_tabs.tabText(index)
+            self.assertNotIn("&", text.replace("&&", ""))
         window.close()
 
     def test_header_theme_toggle_applies_light_and_dark_styles(self) -> None:
@@ -1247,6 +1283,54 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(window._theme, "dark")
         self.assertEqual(window.header_panel.theme_button.text(), "☾")
         self.assertEqual(app.styleSheet(), APP_STYLE)
+        window.close()
+
+    def test_release_tables_keep_interactive_columns(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        for table in (
+            window.interfaces_panel.interfaces_table,
+            window.mtu_workspace.ping_mtu_table,
+        ):
+            header = table.horizontalHeader()
+            self.assertTrue(header.stretchLastSection())
+            for column in range(table.columnCount()):
+                self.assertEqual(
+                    header.sectionResizeMode(column), QHeaderView.ResizeMode.Interactive
+                )
+        window.close()
+
+    def test_release_profiles_replace_socket_target_and_visible_fields(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        for profile_id, (_label, host, port) in window._preset_profiles.items():
+            window._selected_connection = ProcessConnection(
+                "UDP", "", "192.168.1.2", 2000, "8.8.8.8", 53
+            )
+            window._apply_preset(profile_id)
+            self.assertIsNone(window._selected_connection)
+            self.assertEqual(window.core_workspace.dashboard_target_input.text(), host)
+            self.assertEqual(window.core_workspace.dashboard_port_input.value(), port)
+            self.assertIn(host, window.core_workspace.dashboard_topology_label.text())
+            self.assertIn("TCP", window.core_workspace.dashboard_target_mode.text())
+        window.close()
+
+    def test_bufferbloat_help_is_only_on_heading(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        self.assertEqual(window.bufferbloat_workspace.toolTip(), "")
+        self.assertIn("Рост пинга", window.bufferbloat_workspace.help_heading.toolTip())
+        window.close()
+
+    def test_anomaly_popup_reuses_owned_widgets_across_gc_and_retranslation(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        controller = window.alarms_controller
+        controller._populate_header_anomaly_menu()
+        content = controller._anomaly_content
+        for index in range(20):
+            window.overview_controller._set_header_anomaly("warning", f"Event {index}")
+            controller._populate_header_anomaly_menu()
+            self.app.processEvents()
+            gc.collect()
+            self.assertIs(controller._anomaly_content, content)
+            self.assertIs(content.parent(), window._header_anomaly_menu)
         window.close()
 
     def test_process_selector_fills_diagnostic_target(self) -> None:

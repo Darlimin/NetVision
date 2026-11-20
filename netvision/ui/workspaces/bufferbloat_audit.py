@@ -38,6 +38,7 @@ class BufferbloatWorkspace(QWidget):
 
         heading_row = QHBoxLayout()
         heading = QLabel("BUFFERBLOAT")
+        self.help_heading = heading
         heading.setObjectName("FieldLabel")
         self.bufferbloat_start_button = QPushButton("Начать тест")
         self.bufferbloat_start_button.setIcon(

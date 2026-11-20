@@ -372,7 +372,6 @@ def test_geohide_close_hides_until_worker_finishes():
         registry = dialog._worker_registry
         dialog.finished.connect(lambda _result: finished.append(True))
         dialog.show()
-        dialog._refresh()
         thread = dialog._thread
         try:
             pump_until(app, entered.is_set)

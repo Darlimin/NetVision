@@ -106,7 +106,7 @@ class InterfacesView(QWidget):
         self.interfaces_table = QTableWidget(0, 4)
         self.interfaces_table.setObjectName("InterfacesTable")
         self.interfaces_table.setHorizontalHeaderLabels(["Имя", "Тип", "IPv4", "Состояние"])
-        factory.configure_table(self.interfaces_table, (180, 110, 200, 100))
+        factory.configure_table(self.interfaces_table, (280, 110, 200, 150))
         self.interfaces_table.verticalHeader().setDefaultSectionSize(36)
         self.wifi_status_label = QLabel("Wi-Fi: ожидание активного маршрута")
         self.wifi_status_label.setObjectName("Muted")

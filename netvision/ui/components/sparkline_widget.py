@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Iterable
 from PySide6.QtCore import QPointF
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 
@@ -78,6 +78,16 @@ class SparklineWidget(QWidget):
             painter.setPen(QPen(self._color, 2))
         if span <= 0:
             span = 1.0
+        if self.show_axis:
+            rect.adjust(0, 14, 0, -16)
+            grid_color = self.palette().color(self.foregroundRole())
+            grid_color.setAlpha(35)
+            painter.setPen(QPen(grid_color, 1))
+            for index in range(5):
+                y = rect.top() + rect.height() * index / 4
+                painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+                x = rect.left() + rect.width() * index / 4
+                painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
         step = rect.width() / (len(self._data) - 1)
         points = [
             QPointF(
@@ -86,4 +96,19 @@ class SparklineWidget(QWidget):
             )
             for index, value in enumerate(self._data)
         ]
-        painter.drawPath(self._build_smooth_path(points))
+        path = self._build_smooth_path(points)
+        if self.show_axis:
+            fill = QPainterPath(path)
+            fill.lineTo(points[-1].x(), rect.bottom())
+            fill.lineTo(points[0].x(), rect.bottom())
+            fill.closeSubpath()
+            gradient = QLinearGradient(0, rect.top(), 0, rect.bottom())
+            top = QColor(self._color)
+            top.setAlpha(70)
+            bottom = QColor(self._color)
+            bottom.setAlpha(5)
+            gradient.setColorAt(0, top)
+            gradient.setColorAt(1, bottom)
+            painter.fillPath(fill, gradient)
+        painter.setPen(QPen(self._color, 2))
+        painter.drawPath(path)

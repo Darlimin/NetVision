@@ -526,20 +526,20 @@ class CoreOverviewWorkspace(QWidget):
         layout.addLayout(self._build_middle_row())
         return zone
 
-    def _build_middle_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
+    def _build_middle_row(self) -> QVBoxLayout:
+        row = QVBoxLayout()
         row.setSpacing(12)
         chart_card = factory.new_card()
         chart_layout = QVBoxLayout(chart_card)
         chart_layout.addWidget(
             factory.card_title(self.controller._tr("Задержка / Стабильность (60 секунд)"))
         )
-        self.dashboard_latency_chart = self.sparkline_type("#34D399", 132)
+        self.dashboard_latency_chart = self.sparkline_type("#34D399", 165)
+        self.dashboard_latency_chart.setFixedHeight(165)
         self.dashboard_latency_chart.show_axis = True
         self.dashboard_latency_chart.translate = self.controller._tr
         self.dashboard_latency_chart.setToolTip(self.controller._tr(LATENCY_HELP))
         chart_layout.addWidget(self.dashboard_latency_chart)
-        row.addWidget(chart_card, 3)
 
         topology_card = factory.new_card()
         topology_layout = QVBoxLayout(topology_card)
@@ -549,7 +549,8 @@ class CoreOverviewWorkspace(QWidget):
         self.dashboard_topology_label.setWordWrap(True)
         self.dashboard_topology_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         topology_layout.addWidget(self.dashboard_topology_label, 1)
-        row.addWidget(topology_card, 2)
+        row.addWidget(topology_card)
+        row.addWidget(chart_card)
         return row
 
     def _build_details_page(self) -> QWidget:

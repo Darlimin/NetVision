@@ -34,6 +34,10 @@ class DnsController(QObject):
         self._identity_thread = None
         self._reload_pending = False
         self._shutting_down = False
+        self._retry_public_ip = False
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._load_dns_configuration)
         self._identity_timer = QTimer(self)
         self._identity_timer.setInterval(15000)
         self._identity_timer.timeout.connect(self._check_network_identity)
@@ -47,6 +51,7 @@ class DnsController(QObject):
         self._shutting_down = True
         self._reload_pending = False
         self._identity_timer.stop()
+        self._retry_timer.stop()
         self.registry.stop(self.host._dns_benchmark_thread)
         self.registry.stop(self.host._dns_config_thread)
         self.registry.stop(self._identity_thread)
@@ -80,6 +85,10 @@ class DnsController(QObject):
             return
         if self.host._dns_benchmark_thread and self.host._dns_benchmark_thread.isRunning():
             return
+        self.host._dns_public_addresses = PublicIpAddresses()
+        self._render_dns_info()
+        if self.host._dns_config_thread is not None:
+            self._reload_pending = True
         self._load_dns_configuration()
         self.host._set_task_button_busy(self.workspace.dns_run_button, True, "Проверка")
         self.workspace.dns_status.setText(
@@ -178,17 +187,35 @@ class DnsController(QObject):
         ):
             self._reload_pending = True
             return
+        previous_identity = self._measured_identity
         self._network_identity = after
         self._measured_identity = after
         self.workspace.dns_adapter_combo.clear()
         for name in configuration.adapter_names:
             self.workspace.dns_adapter_combo.addItem(name, name)
         self.host._dns_configuration = configuration
-        self.host._dns_public_addresses = (
-            public_addresses
-            if after is not None and isinstance(public_addresses, PublicIpAddresses)
-            else PublicIpAddresses()
+        received_ipv4 = isinstance(public_addresses, PublicIpAddresses) and bool(
+            public_addresses.ipv4
         )
+        if after is not None and isinstance(public_addresses, PublicIpAddresses):
+            previous = self.host._dns_public_addresses
+            if after == previous_identity and previous is not None:
+                public_addresses = PublicIpAddresses(
+                    ipv4=public_addresses.ipv4 or previous.ipv4,
+                    ipv6=public_addresses.ipv6 or previous.ipv6,
+                    error=(
+                        public_addresses.error
+                        if not (public_addresses.ipv4 or previous.ipv4)
+                        else None
+                    ),
+                )
+            self.host._dns_public_addresses = public_addresses
+        else:
+            self.host._dns_public_addresses = PublicIpAddresses()
+        if getattr(self, "_retry_public_ip", False):
+            self._retry_public_ip = False
+            if not received_ipv4:
+                self._retry_timer.start(3000)
         self._render_dns_info()
         self.workspace.dns_apply_button.setEnabled(bool(configuration.adapter_names))
 
@@ -197,7 +224,11 @@ class DnsController(QObject):
         if self._shutting_down:
             return
         self.host._dns_configuration = None
-        self.host._dns_public_addresses = PublicIpAddresses(error=message)
+        if self.host._dns_public_addresses is None:
+            self.host._dns_public_addresses = PublicIpAddresses(error=message)
+        if self._retry_public_ip:
+            self._retry_public_ip = False
+            self._retry_timer.start(3000)
         self._render_dns_info()
         self.workspace.dns_status.setText(message)
 
@@ -283,6 +314,15 @@ class DnsController(QObject):
             lambda profile=profile, adapter=adapter: apply_dns_servers(adapter, profile.addresses),
             self.workspace.dns_apply_button,
         )
+
+    def on_dns_applied(self) -> None:
+        if self._shutting_down:
+            return
+        self._retry_public_ip = True
+        if self.host._dns_config_thread is not None:
+            self._reload_pending = True
+        else:
+            self._load_dns_configuration()
 
     def _render_dns_info(self) -> None:
         while self.workspace.dns_info_grid.count():

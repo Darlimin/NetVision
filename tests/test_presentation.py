@@ -1,4 +1,6 @@
 import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from netvision.core.process_inspector import ProcessConnection
 from netvision.core.process_inspector import ProcessListResult, RunningProcess
@@ -36,6 +38,26 @@ from netvision.ui.presentation import (
 )
 def test_metric_boundaries(key, value, color):
     assert metric_assessment(key, value).color == color
+
+
+def test_live_metrics_refresh_colors_and_verdict():
+    from netvision.ui.controllers.overview_controller import OverviewController
+
+    cards = {key: MagicMock() for key in ("loss", "jitter", "ping")}
+    controller = SimpleNamespace(
+        workspace=SimpleNamespace(dashboard_metric_cards=cards),
+        host=SimpleNamespace(_tr=lambda text: text, _report=object()),
+        _update_dashboard_verdict=MagicMock(),
+    )
+    OverviewController.update_live_assessments(controller, 12.0, 6.7, 20.0)
+    cards["loss"].caption.setText.assert_called_with("Потеря пакетов")
+    cards["jitter"].caption.setText.assert_called_with("Умеренно")
+    cards["loss"].value.setStyleSheet.assert_called_with(f"color: {RED};")
+    cards["jitter"].value.setStyleSheet.assert_called_with(f"color: {AMBER};")
+    controller._update_dashboard_verdict.assert_called_once_with(
+        controller.host._report, loss=12.0, jitter=6.7, ping=20.0
+    )
+    assert "Потери" in smart_verdict(None, None, False, 12.0, 6.7, 20.0, True)
 
 
 def test_neutral_vpn_and_udp():

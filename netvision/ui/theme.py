@@ -1775,3 +1775,17 @@ QPushButton#SessionAnomalyOpenLogButton:hover {
     border-color: #55D6AE;
 }
 """
+
+# Checkboxes inherit their card surface; only the indicator has a fill.
+_CHECKBOX_SURFACE = """
+QCheckBox, QCheckBox#UdpAnomalyFilter, QCheckBox#NetworkBoostCandidate,
+QCheckBox#UdpAnomalyFilter:hover, QCheckBox#NetworkBoostCandidate:hover {
+    background: transparent;
+}
+QCheckBox::indicator {
+    width: 14px; height: 14px; border: 1px solid #64748b; border-radius: 3px;
+}
+QCheckBox::indicator:checked { background: #22c55e; border-color: #22c55e; }
+"""
+APP_STYLE += _CHECKBOX_SURFACE
+LIGHT_STYLE += _CHECKBOX_SURFACE

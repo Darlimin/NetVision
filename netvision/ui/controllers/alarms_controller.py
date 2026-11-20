@@ -225,6 +225,9 @@ class AlarmsController(QObject):
 
         self.host._publish_system_action_result(label, result, status_label)
 
+        if result.success and button is self.host.dns_workspace.dns_apply_button:
+            self.host.dns_controller.on_dns_applied()
+
         if self.host.mtu_controller._handle_mtu_system_action(label, button, result, status_label):
 
             return
@@ -286,7 +289,7 @@ class AlarmsController(QObject):
         self.host._alarm_settings.setValue("background/notifications_paused", paused)
 
     def _populate_header_anomaly_menu(self) -> None:
-        """Rebuild the compact, translated popup before it is displayed."""
+        """Update owned popup widgets without rebuilding the Qt ownership tree."""
         menu = self.host._header_anomaly_menu
         if menu is None or not isValid(menu):
             return
@@ -296,41 +299,43 @@ class AlarmsController(QObject):
             content = QFrame(menu)
             content.setObjectName("SessionAnomalyMenuContent")
             content.setFixedWidth(322)
-            QVBoxLayout(content)
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(6)
+            self._anomaly_title = QLabel(content)
+            self._anomaly_title.setObjectName("SessionAnomalyMenuTitle")
+            layout.addWidget(self._anomaly_title)
+            self._anomaly_rows = [QLabel(content) for _ in range(8)]
+            for row in self._anomaly_rows:
+                row.setWordWrap(True)
+                layout.addWidget(row)
+            self._anomaly_empty = QLabel(content)
+            self._anomaly_empty.setObjectName("SessionAnomalyEmptyState")
+            self._anomaly_empty.setWordWrap(True)
+            layout.addWidget(self._anomaly_empty)
+            self._anomaly_open_log = QPushButton(content)
+            self._anomaly_open_log.setObjectName("SessionAnomalyOpenLogButton")
+            self._anomaly_open_log.clicked.connect(self.host._open_full_log_from_anomaly_menu)
+            layout.addWidget(self._anomaly_open_log)
+            # Keep the Python wrappers as well as Qt ownership for the popup's lifetime.
+            self._anomaly_content = content
+            self._anomaly_layout = layout
+            self.host._header_anomaly_action = action
             action.setDefaultWidget(content)
             menu.addAction(action)
-            self.host._header_anomaly_action = action
-        else:
-            content = action.defaultWidget()
-        content_layout = content.layout()
-        while content_layout.count():
-            item = content_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        content_layout.setContentsMargins(10, 10, 10, 10)
-        content_layout.setSpacing(6)
-        title = QLabel(self.host._tr("ПОСЛЕДНИЕ АНОМАЛИИ"))
-        title.setObjectName("SessionAnomalyMenuTitle")
-        content_layout.addWidget(title)
-        if self.host._header_anomaly_history:
-            for event in reversed(self.host._header_anomaly_history):
-                item = QLabel(
+        self._anomaly_title.setText(self.host._tr("ПОСЛЕДНИЕ АНОМАЛИИ"))
+        events = list(reversed(self.host._header_anomaly_history))[:8]
+        for index, row in enumerate(self._anomaly_rows):
+            active = index < len(events)
+            row.setObjectName("SessionAnomalyItem" if active else "SessionAnomalyUnused")
+            row.setVisible(active)
+            if active:
+                event = events[index]
+                row.setText(
                     f"{event.observed_at:%H:%M:%S}  -  {self.host._header_anomaly_text(event)}"
                 )
-                item.setObjectName("SessionAnomalyItem")
-                item.setProperty("anomalyState", event.state)
-                item.setWordWrap(True)
-                item.setToolTip(item.text())
-                content_layout.addWidget(item)
-        else:
-            empty_state = QLabel(self.host._tr("Нет недавних аномалий"))
-            empty_state.setObjectName("SessionAnomalyEmptyState")
-            empty_state.setWordWrap(True)
-            content_layout.addWidget(empty_state)
-        content_layout.addSpacing(2)
-        open_log_button = QPushButton(self.host._tr("Открыть полный журнал"))
-        open_log_button.setObjectName("SessionAnomalyOpenLogButton")
-        open_log_button.clicked.connect(self.host._open_full_log_from_anomaly_menu)
-        content_layout.addWidget(open_log_button)
+                row.setProperty("anomalyState", event.state)
+                row.setToolTip(row.text())
+        self._anomaly_empty.setVisible(not events)
+        self._anomaly_empty.setText(self.host._tr("Нет недавних аномалий"))
+        self._anomaly_open_log.setText(self.host._tr("Открыть полный журнал"))

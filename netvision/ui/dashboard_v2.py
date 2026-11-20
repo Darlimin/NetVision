@@ -879,7 +879,8 @@ class NetVisionDashboardV2(QMainWindow):
 
     def _retranslate_content_views(self) -> None:
         self.mtr_workspace.setToolTip(self._tr(MTR_HELP))
-        self.bufferbloat_workspace.setToolTip(self._tr(BUFFERBLOAT_HELP))
+        self.bufferbloat_workspace.setToolTip("")
+        self.bufferbloat_workspace.help_heading.setToolTip(self._tr(BUFFERBLOAT_HELP))
         self.mtu_workspace.mtu_section_title.setToolTip(self._tr(MTU_HELP))
         self.quality_workspace.nat_probe_status.setToolTip(self._tr(NAT_HELP))
         self._refresh_preset_buttons()
@@ -1060,17 +1061,39 @@ class NetVisionDashboardV2(QMainWindow):
             self._retranslate_tooltip(combo)
             combo.setAccessibleName(self._tr(combo.accessibleName()))
             for index in range(combo.count()):
-                combo.setItemText(index, self._tr(combo.itemText(index)))
+                item = combo.itemData(index)
+                controller = getattr(self, "process_controller", None)
+                selector = getattr(
+                    getattr(self, "process_selector_panel", None),
+                    "process_connection_selector",
+                    None,
+                )
+                if (
+                    controller is not None
+                    and combo is selector
+                    and isinstance(item, ProcessConnection)
+                ):
+                    combo.setItemText(
+                        index, self.process_controller._connection_display_label(item)
+                    )
+                elif controller is not None and isinstance(item, ProcessNetworkInfo):
+                    combo.setItemText(index, self.process_controller._process_display_label(item))
+                else:
+                    combo.setItemText(index, self._tr(combo.itemText(index)))
 
     def _retranslate_tabs(self, root: QWidget) -> None:
         for tabs in root.findChildren(QTabWidget):
             for index in range(tabs.count()):
-                tabs.setTabText(index, self._tr(tabs.tabText(index)))
+                translated = self._tr(tabs.tabText(index).replace("&&", "&"))
+                tabs.setTabText(index, translated.replace("&", "&&"))
 
     def _retranslate_tables(self, root: QWidget) -> None:
         for table in root.findChildren(QTableWidget):
             self._retranslate_table_headers(table)
             self._retranslate_table_items(table)
+        mtr_table = getattr(getattr(self, "mtr_workspace", None), "mtr_table", None)
+        if mtr_table is not None and mtr_table.columnCount() > 5:
+            mtr_table.horizontalHeaderItem(5).setText(self._tr("Потери"))
 
     @Slot()
     def _clear_process_sockets_scan(self) -> None:
@@ -1296,8 +1319,23 @@ class NetVisionDashboardV2(QMainWindow):
         label, host, port = self._preset_profiles[profile_id]
         display_label = self._tr(label)
         self._active_preset = profile_id
+        self._selected_connection = None
+        self._selected_process = None
+        self._dashboard_game_connection = None
+        selector = self.process_selector_panel.process_connection_selector
+        selector.blockSignals(True)
+        selector.setCurrentIndex(-1)
+        selector.blockSignals(False)
         self.core_workspace.target_input.setText(host)
         self.core_workspace.port_input.setValue(port)
+        self._dashboard_sync_controls()
+        self.process_controller._update_target_mode(host)
+        self.core_workspace.dashboard_topology_label.setText(
+            f"{self._tr('Целевой узел')}: {host}:{port}"
+        )
+        self._publish_monitor_scope()
+        if self._latency_thread is not None:
+            self.ping_controller._start_latency_monitor(host, port, protocol="TCP")
         self.core_workspace.target_input.setFocus()
         self.statusBar().showMessage(
             self._translator.format(
@@ -2408,7 +2446,6 @@ class NetVisionDashboardV2(QMainWindow):
                 self._worker_registry,
             )
             self._geohide_dialog.finished.connect(self._clear_geohide_dialog)
-            QTimer.singleShot(0, self._geohide_dialog._refresh)
         self._geohide_dialog.show()
         self._geohide_dialog.raise_()
         self._geohide_dialog.activateWindow()
@@ -2907,7 +2944,7 @@ class NetVisionDashboardV2(QMainWindow):
         provider = (geo.organization or geo.isp or geo.asn) if geo is not None else None
         endpoint_label = f"{target_name} • {provider}" if provider else target_name
         self.core_workspace.dashboard_topology_label.setText(
-            f"[Ваш ПК: {local_ip}]  →  [Шлюз: {gateway}]  →  [{endpoint_label}]"
+            f"[{self._tr('Ваш ПК')}: {local_ip}]  →  [{self._tr('Шлюз')}: {gateway}]  →  [{endpoint_label}]"
         )
 
     def _dashboard_render_regions(self, report: DiagnosticReport | None = None) -> None:
