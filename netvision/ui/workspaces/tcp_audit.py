@@ -113,7 +113,7 @@ class TcpAuditWorkspace(QFrame):
         self.tcp_ports_table = QTableWidget(0, 4)
         self.tcp_ports_table.setObjectName("TcpPortsTable")
         self.tcp_ports_table.setHorizontalHeaderLabels(["Порт", "Статус", "TCP connect", "Детали"])
-        factory.configure_table(self.tcp_ports_table, (90, 145, 130, 300))
+        factory.configure_table(self.tcp_ports_table, (75, 110, 120, 220))
         self.tcp_ports_table.setMinimumHeight(152)
         ports_layout.addWidget(ports_title)
         ports_layout.addLayout(ports_row)
@@ -147,7 +147,7 @@ class TcpAuditWorkspace(QFrame):
         self.tcp_sockets_table.setHorizontalHeaderLabels(
             ["PID / приложение", "Локальный endpoint", "Удалённый endpoint", "Состояние", "Детали"]
         )
-        factory.configure_table(self.tcp_sockets_table, (190, 180, 210, 120, 220))
+        factory.configure_table(self.tcp_sockets_table, (130, 130, 145, 105, 210))
         self.tcp_sockets_table.setMinimumHeight(230)
         sockets_layout.addLayout(socket_header)
         sockets_layout.addWidget(self.tcp_socket_status)

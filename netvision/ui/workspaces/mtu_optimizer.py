@@ -84,6 +84,7 @@ class MtuWorkspace(QFrame):
             card_layout.addWidget(value)
             mtu_metrics.addWidget(card, 0, index)
         self.mtu_optimizer_apply_button = QPushButton(translate("Применить найденный MTU"))
+        self.mtu_optimizer_apply_button.setObjectName("MtuApplyButton")
         self.mtu_optimizer_apply_button.setEnabled(False)
         mtu_layout.addWidget(self.mtu_section_title)
         mtu_layout.addWidget(mtu_note)

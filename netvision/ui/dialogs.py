@@ -22,11 +22,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QProgressBar,
+    QScrollArea,
     QPushButton,
     QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -47,6 +49,59 @@ from netvision.core.system_actions import SystemChange
 from netvision.ui.legacy_workers import GeoHideWorker, ProcessScanWorker
 from netvision.ui.monitor_workers import WorkerRegistry  # noqa: F401
 from netvision.ui.utils import keep_wheel_scroll_local
+from netvision.ui.presentation import HELP_SECTIONS
+from netvision.ui.theme import busy_button_colors
+
+
+class HelpDialog(QDialog):
+    """A local, translated guide that inherits the active application theme."""
+
+    def __init__(self, parent: QWidget, translate: Callable[[str], str]) -> None:
+        super().__init__(parent)
+        self.setModal(True)
+        self.resize(1100, 620)
+        self.setMinimumSize(900, 320)
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget(self)
+        self.tabs.tabBar().setObjectName("HelpTabs")
+        self.tabs.tabBar().setExpanding(False)
+        self._labels: list[tuple[QLabel, str]] = []
+        for title, entries in HELP_SECTIONS:
+            scroll = QScrollArea(self.tabs)
+            scroll.setWidgetResizable(True)
+            content = QWidget(scroll)
+            body = QVBoxLayout(content)
+            body.setContentsMargins(20, 18, 20, 18)
+            body.setSpacing(7)
+            for term, paragraph in entries:
+                heading = QLabel(content)
+                heading.setObjectName("HelpSectionHeading")
+                heading.setWordWrap(True)
+                body.addWidget(heading)
+                self._labels.append((heading, term))
+                label = QLabel(content)
+                label.setObjectName("HelpParagraph")
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                body.addWidget(label)
+                self._labels.append((label, paragraph))
+                body.addSpacing(10)
+            body.addStretch()
+            scroll.setWidget(content)
+            self.tabs.addTab(scroll, title)
+        layout.addWidget(self.tabs)
+        self.close_button = QPushButton(self)
+        self.close_button.clicked.connect(self.accept)
+        layout.addWidget(self.close_button, alignment=Qt.AlignmentFlag.AlignRight)
+        self.retranslate(translate)
+
+    def retranslate(self, translate: Callable[[str], str]) -> None:
+        self.setWindowTitle(translate("Справка"))
+        self.close_button.setText(translate("Закрыть"))
+        for index, (title, _) in enumerate(HELP_SECTIONS):
+            self.tabs.setTabText(index, translate(title))
+        for label, source in self._labels:
+            label.setText(translate(source))
 
 
 class PresetEditorDialog(QDialog):
@@ -718,14 +773,12 @@ class GeoHideDialog(QDialog):
         if not self.refresh_button.property("taskBusy"):
             self.refresh_button.setStyleSheet(self._refresh_button_style)
             return
-        border, background = (
-            ("#00E5A3", "#182C32"),
-            ("#75F8D7", "#1B343B"),
-            ("#129D7A", "#172A31"),
-        )[self._refresh_phase]
+        foreground, border, background = busy_button_colors(
+            self.refresh_button, self._refresh_phase
+        )
         self.refresh_button.setStyleSheet(
             f"{self._refresh_button_style}\n"
-            "QPushButton { color: #E1E7EF; "
+            f"QPushButton {{ color: {foreground}; "
             f"background-color: {background}; border: 1px solid {border}; }}"
         )
 

@@ -30,7 +30,7 @@ from netvision.ui import constants as ui_constants
 from netvision.ui.presentation import GAME_AUTO_HELP, GAME_PRESET_HELP, LATENCY_HELP, METRIC_HELP
 from netvision.ui.components import factory
 from netvision.ui.widgets import TopologyWidget, apply_accent_glow, apply_panel_shadow
-from netvision.version import display_version
+from netvision.version import __version__
 
 
 class CoreOverviewWorkspace(QWidget):
@@ -453,12 +453,24 @@ class CoreOverviewWorkspace(QWidget):
         layout.setContentsMargins(14, 18, 14, 18)
         layout.setSpacing(6)
 
-        brand = QLabel(f"N  NETVISION {display_version()}")
-        brand.setObjectName("DashboardBrand")
-        caption = QLabel("Network Diagnostics & Insight")
-        caption.setObjectName("SubLabel")
-        layout.addWidget(brand)
-        layout.addWidget(caption)
+        self.sidebar_brand = QLabel("NETVISION")
+        self.sidebar_brand.setObjectName("DashboardBrand")
+        self.sidebar_version = QLabel(f"V {__version__}")
+        self.sidebar_version.setObjectName("SubLabel")
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(2)
+        brand_text.addWidget(self.sidebar_brand)
+        brand_text.addWidget(self.sidebar_version)
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(10)
+        brand_row.addLayout(brand_text, 1)
+        self.help_button = QPushButton("?")
+        self.help_button.setObjectName("HelpButton")
+        self.help_button.setFixedSize(28, 28)
+        self.help_button.setToolTip(self.controller._tr("Справка: руководство и словарь терминов"))
+        self.help_button.clicked.connect(self.controller._open_help)
+        brand_row.addWidget(self.help_button)
+        layout.addLayout(brand_row)
         layout.addSpacing(10)
 
         definitions = ui_constants.DASHBOARD_DASHBOARD_NAV_DEFINITIONS

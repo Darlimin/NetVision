@@ -98,7 +98,7 @@ from netvision.ui.legacy_workers import GameLaunchMonitorWorker, NetworkBoostSca
 from netvision.ui.lite_mode import LiteStatus
 from netvision.ui.monitor_workers import UdpPortMonitorWorker, WifiMonitorWorker
 from netvision.ui.ui_models import HeaderAnomalyEvent
-from netvision.ui.theme import APP_STYLE, LIGHT_STYLE
+from netvision.ui.theme import APP_STYLE, LIGHT_STYLE, busy_button_colors
 from netvision.ui.widgets import TopologyNode
 from netvision.ui.workspaces.overview_workspace import RegionCard, EventsCard
 from netvision.ui.components.manual_process_dialog import ManualProcessDialog
@@ -116,7 +116,7 @@ from netvision.ui.utils import (
     _wifi_correlation_evidence,
     _tls_certificate_state,
 )
-from netvision.version import display_version
+from netvision.version import display_version, window_title
 from netvision.ui.presentation import BUFFERBLOAT_HELP, MTR_HELP, MTU_HELP, NAT_HELP, target_mode
 
 
@@ -536,14 +536,10 @@ class NetVisionDashboardV2(QMainWindow):
         state = self._task_button_states.get(button)
         if state is None:
             return
-        border, background = (
-            ("#00E5A3", "#182C32"),
-            ("#75F8D7", "#1B343B"),
-            ("#129D7A", "#172A31"),
-        )[self._task_button_phase]
+        foreground, border, background = busy_button_colors(button, self._task_button_phase)
         button.setStyleSheet(
             f"{state[1]}\n"
-            "QPushButton, QToolButton { color: #E1E7EF; "
+            f"QPushButton, QToolButton {{ color: {foreground}; "
             f"background-color: {background}; border: 1px solid {border}; }}"
         )
 
@@ -863,12 +859,7 @@ class NetVisionDashboardV2(QMainWindow):
         )
 
     def _retranslate_window_chrome(self) -> None:
-        self.setWindowTitle(
-            self._translator.format(
-                "NetVision {version} — визуальная диагностика сети",
-                version=display_version(),
-            )
-        )
+        self.setWindowTitle(window_title())
         if hasattr(getattr(self, "header_panel", None), "brand_caption"):
             self.header_panel.brand_caption.setText(
                 self._translator.format(
@@ -898,10 +889,25 @@ class NetVisionDashboardV2(QMainWindow):
             self.dns_controller._render_dns_info()
 
     def _retranslate_open_dialogs(self) -> None:
+        help_dialog = getattr(self, "_help_dialog", None)
+        if help_dialog is not None:
+            help_dialog.retranslate(self._tr)
         if self._network_boost_dialog is not None:
             self._network_boost_dialog.retranslate(self._tr)
         if self._geohide_dialog is not None:
             self._geohide_dialog.retranslate(self._tr)
+
+    @Slot()
+    def _open_help(self) -> None:
+        from netvision.ui.dialogs import HelpDialog
+
+        dialog = HelpDialog(self, self._tr)
+        self._help_dialog = dialog
+        try:
+            dialog.exec()
+        finally:
+            self._help_dialog = None
+            dialog.deleteLater()
 
     def _retranslate_live_statuses(self) -> None:
         if hasattr(self.jitter_workspace, "jitter_event_status"):
@@ -989,9 +995,6 @@ class NetVisionDashboardV2(QMainWindow):
             LiteStatus.ERROR: "🔴",
         }
         self.lite_panel.lite_status_indicator.setText(icons[status])
-        self.lite_panel.lite_title.setStyleSheet(
-            "color: #E1E7EF; font-size: 19pt; font-weight: 700;"
-        )
 
     def _save_network_alarm_settings(self, _value: object = True) -> None:
         return self.alarms_controller._save_network_alarm_settings(_value)
@@ -1094,6 +1097,7 @@ class NetVisionDashboardV2(QMainWindow):
         mtr_table = getattr(getattr(self, "mtr_workspace", None), "mtr_table", None)
         if mtr_table is not None and mtr_table.columnCount() > 5:
             mtr_table.horizontalHeaderItem(5).setText(self._tr("Потери"))
+            mtr_table.horizontalHeaderItem(10).setText(self._tr("Jitter (Джиттер)"))
 
     @Slot()
     def _clear_process_sockets_scan(self) -> None:
@@ -2339,7 +2343,7 @@ class NetVisionDashboardV2(QMainWindow):
             self._on_udp_port_activity(UdpPortHistory(max_entries=1).observe(snapshot))
 
     def _install_dashboard_shell(self) -> None:
-        self.setWindowTitle(f"NetVision {display_version()} — Network Diagnostics & Insight")
+        self.setWindowTitle(window_title())
         self.setMinimumSize(1120, 720)
         self.resize(1280, 820)
 

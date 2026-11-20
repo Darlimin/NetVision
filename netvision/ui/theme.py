@@ -1789,3 +1789,61 @@ QCheckBox::indicator:checked { background: #22c55e; border-color: #22c55e; }
 """
 APP_STYLE += _CHECKBOX_SURFACE
 LIGHT_STYLE += _CHECKBOX_SURFACE
+
+_HELP_BUTTON_STYLE = """
+QPushButton#HelpButton {
+    min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    padding: 0; color: #E1E7EF; background-color: #18202E;
+    border: 1px solid #64748b; border-radius: 14px; font-size: 16px; font-weight: bold;
+}
+QPushButton#HelpButton:hover { color: #00E5A3; background-color: #1A2B31; border-color: #00E5A3; }
+QLabel#HelpSectionHeading { color: #31CDA3; font-size: 14px; font-weight: bold; }
+QLabel#HelpParagraph { font-size: 13px; }
+QTabBar#HelpTabs::tab { min-width: 0; padding: 0 5px; font-size: 12px; }
+"""
+APP_STYLE += _HELP_BUTTON_STYLE
+LIGHT_STYLE += _HELP_BUTTON_STYLE + """
+QPushButton#HelpButton { color: #25313B; background-color: #FFFFFF; border-color: #8A9BA4; }
+QPushButton#HelpButton:hover { color: #007D5A; background-color: #EAF8F3; border-color: #00A875; }
+QLabel#HelpSectionHeading { color: #007D5A; }
+"""
+
+LIGHT_STYLE += """
+QTableWidget::item:selected, QTableView::item:selected,
+QTableWidget::item:selected:active, QTableView::item:selected:active,
+QTableWidget::item:selected:!active, QTableView::item:selected:!active {
+    color: #173B35; background-color: #D8F6EC;
+}
+QPushButton:disabled { background-color: #EDF1F5; color: #64748B; border: 1px solid #CBD5E1; }
+QPushButton#MtuApplyButton { background-color: #FFFFFF; color: #25313B; border: 1px solid #AABDC5; }
+QPushButton#MtuApplyButton:hover { background-color: #EAF8F3; color: #006F55; border-color: #00A875; }
+QPushButton#MtuApplyButton:disabled { background-color: #EDF1F5; color: #64748B; border: 1px solid #CBD5E1; }
+QScrollBar:horizontal { background: #EEF2F6; height: 10px; margin: 0; border: none; }
+QScrollBar:vertical { background: #EEF2F6; width: 10px; margin: 0; border: none; }
+QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+    background: #AABCC8; border: 2px solid #EEF2F6; border-radius: 5px; min-width: 25px; min-height: 25px;
+}
+QScrollBar::handle:horizontal:hover, QScrollBar::handle:vertical:hover { background: #758D9C; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { width: 0; height: 0; border: none; background: transparent; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+"""
+
+
+def busy_button_colors(widget, phase: int) -> tuple[str, str, str]:
+    """Choose readable busy colours using the owning dashboard's theme."""
+    owner = widget
+    while owner is not None:
+        if getattr(owner, "_theme", None) == "light":
+            border, background = (
+                ("#059669", "#EAF8F3"),
+                ("#10B981", "#DCF5EB"),
+                ("#047857", "#F0FAF6"),
+            )[phase]
+            return "#164E3E", border, background
+        owner = owner.parentWidget()
+    border, background = (("#00E5A3", "#182C32"), ("#75F8D7", "#1B343B"), ("#129D7A", "#172A31"))[
+        phase
+    ]
+    return "#E1E7EF", border, background

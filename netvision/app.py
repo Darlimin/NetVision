@@ -8,6 +8,7 @@ from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication
 
 from netvision.core.crash_handler import setup_crash_handler
+from netvision.version import window_title
 
 
 def _load_inter_fonts() -> str:
@@ -43,7 +44,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("NetVision")
-    app.setApplicationDisplayName("NetVision")
+    app.setApplicationDisplayName(window_title())
     app.setOrganizationName("NetVision")
     app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent.parent / "NetVision.ico")))
     app.setStyle("Fusion")

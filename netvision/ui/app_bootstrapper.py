@@ -75,7 +75,7 @@ from netvision.ui.timer_registry import TimerRegistry
 from netvision.ui.controllers.history_controller import HistoryController
 from netvision.ui.controllers.alarms_controller import AlarmsController
 from netvision.ui.constants import QUICK_PRESETS
-from netvision.version import display_version
+from netvision.version import window_title
 
 
 class AppBootstrapper:
@@ -103,7 +103,7 @@ class AppBootstrapper:
         host._dashboard_mtu_hint_chips: tuple[QPushButton, ...] = ()
         host._facts = StateStore()
         host._run_scope: Scope | None = None
-        host.setWindowTitle(f"NetVision {display_version()} — визуальная диагностика сети")
+        host.setWindowTitle(window_title())
         host.resize(1280, 820)
         host.setMinimumSize(960, 680)
         host._thread: QThread | None = None

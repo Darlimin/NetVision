@@ -1253,9 +1253,21 @@ class MainWindowReportTests(unittest.TestCase):
         window = NetVisionDashboardV2(bootstrap=False)
 
         self.assertEqual(window.header_panel.language_combo.currentData(), "ru")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.3")
+        self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.3")
+        self.assertFalse(
+            any(
+                label.text() == "Network Diagnostics & Insight"
+                for label in window.findChildren(QLabel)
+            )
+        )
         window.header_panel.language_combo.setCurrentIndex(1)
 
         self.assertEqual(window._language, "en")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.3")
+        self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.3")
         self.assertEqual(window.header_panel.language_label.text(), "LANGUAGE")
         self.assertEqual(window.header_panel.mode_label.text(), "MODE")
         self.assertEqual(window.header_panel.expert_mode_button.text(), "Expert")
@@ -1267,6 +1279,81 @@ class MainWindowReportTests(unittest.TestCase):
         for index in range(window.workspace_tabs.count()):
             text = window.workspace_tabs.tabText(index)
             self.assertNotIn("&", text.replace("&&", ""))
+        window.close()
+
+    def test_help_dialog_opens_and_retranslates(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        self.assertEqual(window.core_workspace.help_button.text(), "?")
+        self.assertEqual(window.core_workspace.help_button.width(), 28)
+        self.assertEqual(window.core_workspace.help_button.height(), 28)
+        seen = []
+
+        def inspect_dialog() -> None:
+            dialog = window._help_dialog
+            self.assertTrue(dialog.isModal())
+            self.assertEqual(dialog.windowTitle(), "Справка")
+            self.assertEqual(dialog.tabs.count(), 5)
+            self.assertEqual(dialog.tabs.tabText(3), "Словарь терминов")
+            self.assertEqual(dialog.tabs.tabText(4), "Частые вопросы")
+            labels = [label.text() for label, _ in dialog._labels]
+            for term in (
+                "PING / RTT",
+                "NAT",
+                "DF (Don't Fragment)",
+                "Jitter (Джиттер)",
+                "ESTABLISHED",
+                "LISTEN",
+                "SYN_SENT",
+                "TIME_WAIT / CLOSE_WAIT",
+                "UDP (без статуса)",
+                "Кто виноват: дом, провайдер или сервер",
+            ):
+                self.assertIn(term, labels)
+            self.assertIn("Какие сетевые запросы выполняются?", labels)
+            self.assertTrue(
+                any("NetVision не отправляет телеметрию разработчику." in text for text in labels)
+            )
+            self.assertTrue(
+                any("некоторые сертификаты содержат IP-адрес" in text for text in labels)
+            )
+            self.assertLessEqual(
+                dialog.tabs.tabBar().tabRect(4).right(), dialog.tabs.tabBar().width()
+            )
+            window.header_panel.language_combo.setCurrentIndex(1)
+            self.assertEqual(dialog.windowTitle(), "Help")
+            self.assertEqual(
+                [dialog.tabs.tabText(index) for index in range(5)],
+                ["Quick start", "Program sections", "How to read numbers", "Glossary", "FAQ"],
+            )
+            self.assertEqual(dialog.tabs.tabText(3), "Glossary")
+            self.assertEqual(dialog.tabs.tabText(4), "FAQ")
+            self.assertTrue(
+                any(
+                    "NetVision does not send telemetry to the developer." in label.text()
+                    for label, _ in dialog._labels
+                )
+            )
+            self.assertTrue(
+                any(
+                    "some certificates include an IP address" in label.text()
+                    for label, _ in dialog._labels
+                )
+            )
+            self.assertLessEqual(
+                dialog.tabs.tabBar().tabRect(4).right(), dialog.tabs.tabBar().width()
+            )
+            self.assertTrue(
+                any("Local address translation" in label.text() for label, _ in dialog._labels)
+            )
+            window.header_panel.language_combo.setCurrentIndex(0)
+            self.assertEqual(dialog.windowTitle(), "Справка")
+            seen.append(True)
+            dialog.accept()
+
+        QTimer.singleShot(0, inspect_dialog)
+        QTimer.singleShot(1000, lambda: window._help_dialog and window._help_dialog.reject())
+        window.core_workspace.help_button.click()
+        self.assertTrue(seen)
         window.close()
 
     def test_header_theme_toggle_applies_light_and_dark_styles(self) -> None:
@@ -1283,6 +1370,61 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(window._theme, "dark")
         self.assertEqual(window.header_panel.theme_button.text(), "☾")
         self.assertEqual(app.styleSheet(), APP_STYLE)
+        window.close()
+
+    def test_light_theme_buttons_scrollbars_and_tcp_tls_columns(self) -> None:
+        from netvision.ui import constants
+        from netvision.ui.theme import busy_button_colors
+
+        window = NetVisionDashboardV2(bootstrap=False)
+        window._toggle_theme()
+        game = window.core_workspace.dashboard_game_auto_check_button
+        mtu = window.mtu_workspace.mtu_optimizer_apply_button
+        self.assertEqual(game.objectName(), "SecondaryActionBtn")
+        self.assertEqual(mtu.objectName(), "MtuApplyButton")
+        self.assertFalse(mtu.isEnabled())
+        self.assertIn("QPushButton#SecondaryActionBtn:hover", constants.CYBER_LIGHT_OVERRIDES)
+        self.assertIn("QPushButton#MtuApplyButton:disabled", LIGHT_STYLE)
+        self.assertIn("QPushButton#MtuApplyButton:hover", LIGHT_STYLE)
+        for part in ("handle", "add-line", "sub-line", "add-page", "sub-page"):
+            for direction in ("horizontal", "vertical"):
+                self.assertIn(f"QScrollBar::{part}:{direction}", LIGHT_STYLE)
+        self.assertEqual(busy_button_colors(game, 0)[2], "#EAF8F3")
+        for table in (
+            window.tcp_workspace.tcp_ports_table,
+            window.tcp_workspace.tcp_sockets_table,
+            window.tls_workspace.tls_handshake_table,
+            window.tls_workspace.tls_certificate_table,
+        ):
+            self.assertTrue(table.horizontalHeader().stretchLastSection())
+            self.assertEqual(
+                table.horizontalHeader().sectionResizeMode(0), QHeaderView.ResizeMode.Interactive
+            )
+        window._toggle_theme()
+        self.assertEqual(busy_button_colors(game, 0)[2], "#182C32")
+        window.close()
+
+    def test_light_table_selection_and_mtr_jitter_header(self) -> None:
+        from netvision.ui.constants import CYBER_LIGHT_OVERRIDES
+
+        for style in (LIGHT_STYLE, CYBER_LIGHT_OVERRIDES):
+            self.assertIn("QTableWidget::item:selected", style)
+            self.assertIn("QTableView::item:selected", style)
+            self.assertIn("color: #173B35", style)
+            self.assertIn("background-color: #D8F6EC", style)
+        self.assertNotIn("color: #173B35", APP_STYLE)
+        window = NetVisionDashboardV2(bootstrap=False)
+        table = window.mtr_workspace.mtr_table
+        for language in ("ru", "en", "ru"):
+            window.header_panel.language_combo.setCurrentIndex(
+                window.header_panel.language_combo.findData(language)
+            )
+            header = table.horizontalHeaderItem(10).text()
+            self.assertEqual(header, "Jitter (Джиттер)" if language == "ru" else "Jitter")
+            self.assertGreaterEqual(
+                table.columnWidth(10),
+                table.horizontalHeader().fontMetrics().horizontalAdvance(header) + 24,
+            )
         window.close()
 
     def test_release_tables_keep_interactive_columns(self) -> None:

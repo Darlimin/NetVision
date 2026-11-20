@@ -112,14 +112,19 @@ class MtrWorkspace(QWidget):
                 translate("Средний"),
                 translate("Лучший"),
                 translate("Худший"),
-                translate("Jitter"),
+                translate("Jitter (Джиттер)"),
                 translate("Статус"),
             ]
         )
         factory.configure_table(
             self.mtr_table,
-            (62, 155, 150, 90, 90, 82, 88, 88, 88, 88, 88, 170),
+            (62, 155, 150, 90, 90, 82, 88, 88, 88, 88, 175, 170),
         )
+        jitter_width = (
+            self.mtr_table.horizontalHeader().fontMetrics().horizontalAdvance("Jitter (Джиттер)")
+            + 28
+        )
+        self.mtr_table.setColumnWidth(10, max(175, jitter_width))
         self.mtr_table.setMinimumHeight(220)
         self.mtr_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.mtr_table.setAlternatingRowColors(True)

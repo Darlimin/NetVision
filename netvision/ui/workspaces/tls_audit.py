@@ -142,7 +142,7 @@ class TlsAuditWorkspace(QFrame):
         self.tls_handshake_table = QTableWidget(0, 3)
         self.tls_handshake_table.setObjectName("TlsHandshakeTable")
         self.tls_handshake_table.setHorizontalHeaderLabels(["Этап", "Время", "Статус / детали"])
-        factory.configure_table(self.tls_handshake_table, (230, 150, 450))
+        factory.configure_table(self.tls_handshake_table, (150, 80, 360))
         self.tls_handshake_table.setMinimumHeight(180)
         handshake_layout.addWidget(handshake_title)
         handshake_layout.addWidget(handshake_note)
@@ -175,7 +175,7 @@ class TlsAuditWorkspace(QFrame):
                 "SHA-256",
             ]
         )
-        factory.configure_table(self.tls_certificate_table, (54, 210, 210, 150, 145, 145, 95, 310))
+        factory.configure_table(self.tls_certificate_table, (64, 145, 145, 100, 110, 110, 85, 160))
         self.tls_certificate_table.setMinimumHeight(210)
         certificate_layout.addWidget(certificate_title)
         certificate_layout.addWidget(self.tls_chain_note)

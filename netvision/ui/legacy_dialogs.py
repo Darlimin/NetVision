@@ -41,6 +41,7 @@ from netvision.core.process_utils import EndpointChoice, _explain_game_connectio
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 from netvision.ui.game_check_worker import GameAutoCheckResult, GameAutoCheckWorker
 from netvision.ui.utils import keep_wheel_scroll_local
+from netvision.ui.theme import busy_button_colors
 from netvision.version import __version__, display_version
 
 
@@ -816,14 +817,10 @@ class NetworkBoostDialog(QDialog):
         if not self.terminate_button.property("taskBusy"):
             self.terminate_button.setStyleSheet(self._terminate_button_style)
             return
-        border, background = (
-            ("#00E5A3", "#182C32"),
-            ("#75F8D7", "#1B343B"),
-            ("#129D7A", "#172A31"),
-        )[self._busy_phase]
+        foreground, border, background = busy_button_colors(self.terminate_button, self._busy_phase)
         self.terminate_button.setStyleSheet(
             f"{self._terminate_button_style}\n"
-            "QPushButton { color: #E1E7EF; "
+            f"QPushButton {{ color: {foreground}; "
             f"background-color: {background}; border: 1px solid {border}; }}"
         )
 
