@@ -102,10 +102,27 @@ class UiRegressionTests(unittest.TestCase):
         snapshot = self._mtr_snapshot()
         worker.snapshot.emit(snapshot)
         self.assertTrue(
+            self._wait_until(lambda: self.window._facts.get("mtr.snapshot") is snapshot)
+        )
+        self.assertEqual(self.window.mtr_workspace.mtr_table.rowCount(), 0)
+        with patch.object(self.window.mtr_workspace.mtr_table, "isVisible", return_value=True):
+            self.window.mtr_controller._render_pending_snapshot()
+        self.assertTrue(
             self._wait_until(lambda: self.window.mtr_workspace.mtr_table.rowCount() == 1)
         )
         self.assertEqual(self.window.mtr_workspace.mtr_table.item(0, 1).text(), "1.1.1.1")
         self.assertIs(self.window._facts.get("mtr.snapshot"), snapshot)
+
+    def test_mtr_reuses_cells_and_retains_selection(self) -> None:
+        table = self.window.mtr_workspace.mtr_table
+        snapshot = self._mtr_snapshot()
+        with patch.object(table, "isVisible", return_value=True):
+            self.window.mtr_controller._render_mtr_snapshot(snapshot)
+            table.selectRow(0)
+            original = table.item(0, 1)
+            self.window.mtr_controller._render_mtr_snapshot(snapshot)
+            self.assertIs(table.item(0, 1), original)
+            self.assertEqual(table.currentRow(), 0)
 
     def test_dns_stop_discards_late_network_change(self) -> None:
         controller = self.window.dns_controller

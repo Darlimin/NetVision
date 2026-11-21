@@ -2517,7 +2517,6 @@ class NetVisionDashboardV2(QMainWindow):
             if self.core_workspace.quick_actions_panel.parentWidget() is not actions_host:
                 self.core_workspace.quick_actions_panel.setParent(None)
             actions_host.layout().addWidget(self.core_workspace.quick_actions_panel)
-            interface_tab.show()
             actions_host.show()
             self.core_workspace.quick_actions_panel.show()
 
@@ -2544,7 +2543,6 @@ class NetVisionDashboardV2(QMainWindow):
         interface_tab.layout().addWidget(mtu_panel)
         self.dashboard_mtu_section = mtu_panel
         mtu_panel.show()
-        interface_tab.show()
 
     @Slot(str)
     def _dashboard_sync_mtu_target(self, target: str) -> None:

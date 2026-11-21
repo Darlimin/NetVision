@@ -202,6 +202,7 @@ class DashboardBuilder:
         host._render_journal()
         host.journal_tabs.addTab(host.journal_workspace, host._tr("Журнал сессии"))
         host.udp_history_workspace = UdpHistoryWorkspace()
+        host.history_controller.watch_tables()
         host.udp_history_workspace.udp_anomaly_filter.toggled.connect(host._refresh_udp_event_table)
         host.udp_history_workspace.export_udp_json_button.clicked.connect(
             host._export_udp_events_json

@@ -13,6 +13,17 @@ from netvision.core.session_journal import (
 
 
 class SessionJournalTests(unittest.TestCase):
+    def test_large_corrupt_tail_retains_last_valid_events(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.jsonl"
+            source = JournalStore(path, limit=5000)
+            journal = SessionJournal(source, "session-a")
+            events = [journal.record("udp.port_opened", subject=str(i)) for i in range(2400)]
+            with path.open("ab") as output:
+                output.write(b'{broken}\n\xff\xfe\n{"partial"')
+            loaded = JournalStore(path, limit=30).load()
+            self.assertEqual([item.id for item in loaded], [item.id for item in events[-30:]])
+
     def test_naive_timestamp_is_interpreted_as_local_time(self) -> None:
         localized = _as_aware(datetime(2026, 10, 20, 12, 0, 0))
 

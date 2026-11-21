@@ -221,6 +221,11 @@ class MainWindowReportTests(unittest.TestCase):
 
     def test_session_journal_filters_events_by_layer(self) -> None:
         window = NetVisionDashboardV2(bootstrap=False)
+        visible = patch.object(
+            window.journal_workspace.journal_table, "isVisible", return_value=True
+        )
+        visible.start()
+        self.addCleanup(visible.stop)
         window._record_journal_event(
             "udp.port_opened",
             subject="UDP:27015",
@@ -243,6 +248,32 @@ class MainWindowReportTests(unittest.TestCase):
         self.assertEqual(
             window.journal_workspace.journal_table.item(0, 2).text(), "udp.port_opened"
         )
+        window.close()
+
+    def test_interfaces_table_does_not_overlap_journal_tabs(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        window.show()
+        self.app.processEvents()
+        window._show_dashboard_section("journal")
+        self.app.processEvents()
+        self.assertFalse(window.interfaces_panel.isVisible())
+        self.assertFalse(window.interfaces_panel.interfaces_table.isVisible())
+        for _ in range(2):
+            window._show_dashboard_section("interfaces")
+            self.app.processEvents()
+            self.assertTrue(window.interfaces_panel.interfaces_table.isVisible())
+            window._show_dashboard_section("journal")
+            self.app.processEvents()
+            self.assertFalse(window.interfaces_panel.isVisible())
+            self.assertFalse(window.interfaces_panel.interfaces_table.isVisible())
+            self.assertIs(window.workspace_tabs.currentWidget(), window.journal_tabs)
+            self.assertIs(window.journal_tabs.currentWidget(), window.journal_workspace)
+            bar = window.journal_tabs.tabBar()
+            point = bar.mapToGlobal(bar.rect().center())
+            hit = self.app.widgetAt(point)
+            self.assertIsNotNone(hit)
+            self.assertFalse(window.interfaces_panel.isAncestorOf(hit))
+            window._toggle_theme()
         window.close()
 
     def test_game_auto_check_does_not_fall_back_or_run_global_socket_scan(self) -> None:
@@ -1253,9 +1284,9 @@ class MainWindowReportTests(unittest.TestCase):
         window = NetVisionDashboardV2(bootstrap=False)
 
         self.assertEqual(window.header_panel.language_combo.currentData(), "ru")
-        self.assertEqual(window.windowTitle(), "NetVision V 0.10.3")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.4")
         self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
-        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.3")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.4")
         self.assertFalse(
             any(
                 label.text() == "Network Diagnostics & Insight"
@@ -1265,9 +1296,9 @@ class MainWindowReportTests(unittest.TestCase):
         window.header_panel.language_combo.setCurrentIndex(1)
 
         self.assertEqual(window._language, "en")
-        self.assertEqual(window.windowTitle(), "NetVision V 0.10.3")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.4")
         self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
-        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.3")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.4")
         self.assertEqual(window.header_panel.language_label.text(), "LANGUAGE")
         self.assertEqual(window.header_panel.mode_label.text(), "MODE")
         self.assertEqual(window.header_panel.expert_mode_button.text(), "Expert")
@@ -1427,6 +1458,27 @@ class MainWindowReportTests(unittest.TestCase):
             )
         window.close()
 
+    def test_chart_animation_timers_stop_when_idle_and_hidden(self) -> None:
+        from netvision.ui.widgets import LatencyChart, TopologyWidget
+
+        chart = LatencyChart()
+        topology = TopologyWidget()
+        chart.show()
+        topology.show()
+        self.app.processEvents()
+        self.assertFalse(chart._pulse_timer.isActive())
+        self.assertFalse(topology._timer.isActive())
+        chart._set_hovered_sample(0)
+        topology.set_active_stage("dns")
+        self.assertTrue(chart._pulse_timer.isActive())
+        self.assertTrue(topology._timer.isActive())
+        chart.hide()
+        topology.hide()
+        self.assertFalse(chart._pulse_timer.isActive())
+        self.assertFalse(topology._timer.isActive())
+        chart.close()
+        topology.close()
+
     def test_release_tables_keep_interactive_columns(self) -> None:
         window = NetVisionDashboardV2(bootstrap=False)
         for table in (
@@ -1516,6 +1568,11 @@ class MainWindowReportTests(unittest.TestCase):
 
     def test_udp_events_table_records_transitions_and_filters_anomalies(self) -> None:
         window = NetVisionDashboardV2(bootstrap=False)
+        visible = patch.object(
+            window.udp_history_workspace.udp_events_table, "isVisible", return_value=True
+        )
+        visible.start()
+        self.addCleanup(visible.stop)
         window._udp_monitor_pid = 321
         timestamp = datetime(2026, 10, 8, 15, 30, 0)
         opened = UdpPortActivity(
@@ -1552,6 +1609,26 @@ class MainWindowReportTests(unittest.TestCase):
             window.udp_history_workspace.udp_events_table.item(0, 1).text(), "Возможный обрыв"
         )
         self.assertIn("Показано аномалий: 1", window.udp_history_workspace.udp_event_status.text())
+        window.close()
+
+    def test_hidden_udp_events_render_when_tab_is_shown(self) -> None:
+        window = NetVisionDashboardV2(bootstrap=False)
+        window._udp_monitor_pid = 321
+        activity = UdpPortActivity(
+            UdpPortSnapshot(321, (27015,)), datetime.now(), opened_ports=(27015,)
+        )
+        window._on_udp_port_activity(activity)
+        self.assertTrue(window.history_controller._udp_dirty)
+        self.assertEqual(window.udp_history_workspace.udp_events_table.rowCount(), 0)
+        self.assertEqual(len(window._udp_event_rows), 1)
+        self.assertTrue(window.udp_history_workspace.export_udp_json_button.isEnabled())
+        window.show()
+        window.core_workspace.dashboard_nav_buttons["journal"].click()
+        window.journal_tabs.setCurrentWidget(window.udp_history_workspace)
+        self.app.processEvents()
+        self.app.processEvents()
+        self.assertFalse(window.history_controller._udp_dirty)
+        self.assertEqual(window.udp_history_workspace.udp_events_table.rowCount(), 1)
         window.close()
 
     def test_udp_csv_export_uses_save_dialog_and_writes_event_rows(self) -> None:

@@ -1,6 +1,6 @@
 """MtrController for diagnostics."""
 
-from PySide6.QtCore import QObject, QThread, QTimer, Slot
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QTableWidgetItem
 from shiboken6 import isValid
@@ -26,9 +26,33 @@ class MtrController(QObject):
         self.workspace = workspace
         self.facts = facts
         self.registry = registry
+        self._pending_snapshot = None
+        workspace.mtr_table.installEventFilter(self)
         workspace.traceroute_start_button.clicked.connect(self.start_visual_traceroute)
         workspace.mtr_start_button.toggled.connect(self._toggle_mtr_monitor)
         workspace.traceroute_target_input.textEdited.connect(self._on_mtr_target_changed)
+
+    def eventFilter(self, watched, event):
+        if watched is self.workspace.mtr_table and event.type() == QEvent.Type.Show:
+            QTimer.singleShot(0, self._render_pending_snapshot)
+        return super().eventFilter(watched, event)
+
+    def _render_pending_snapshot(self):
+        if (
+            self._pending_snapshot is not None
+            and self.workspace.mtr_table.isVisible()
+            and not self.host.isMinimized()
+        ):
+            snapshot = self._pending_snapshot
+            self._pending_snapshot = None
+            self._inherited__render_mtr_snapshot(snapshot)
+            if (
+                self.workspace.mtr_table.currentRow() < 0
+                and self.host._dashboard_selected_hop is not None
+            ):
+                self.host._dashboard_select_table_row(
+                    self.workspace.mtr_table, self.host._dashboard_selected_hop
+                )
 
     def start_visual_traceroute(self) -> None:
         if (
@@ -89,6 +113,7 @@ class MtrController(QObject):
             self.workspace.mtr_start_button.setChecked(False)
             self.workspace.mtr_start_button.blockSignals(False)
             return
+        self._pending_snapshot = None
         self.workspace.mtr_table.setRowCount(0)
         self.workspace.mtr_status.setText(self.host._tr("MTR запускается..."))
         self.host._mtr_snapshot = None
@@ -198,7 +223,11 @@ class MtrController(QObject):
         )
 
     def _render_mtr_snapshot(self, snapshot: MtrSnapshot) -> None:
-        self._inherited__render_mtr_snapshot(snapshot)
+        if self.workspace.mtr_table.isVisible() and not self.host.isMinimized():
+            self._pending_snapshot = None
+            self._inherited__render_mtr_snapshot(snapshot)
+        else:
+            self._pending_snapshot = snapshot
         first_sampled_hop: int | None = None
         for hop in snapshot.hops:
             address = hop.addresses[0] if hop.addresses else None
@@ -234,10 +263,15 @@ class MtrController(QObject):
                 status,
             )
             for column, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                item.setToolTip(text)
-                item.setForeground(QColor(color))
-                self.workspace.mtr_table.setItem(row, column, item)
+                item = self.workspace.mtr_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.workspace.mtr_table.setItem(row, column, item)
+                if item.text() != text:
+                    item.setText(text)
+                    item.setToolTip(text)
+                if item.foreground().color() != QColor(color):
+                    item.setForeground(QColor(color))
 
     @Slot(object)
     def _on_traceroute_completed(self, value: object) -> None:

@@ -150,13 +150,49 @@ class JournalStore:
 
     def load(self) -> list[JournalEvent]:
         if self._events is None:
+            events = []
             try:
-                lines = self.path.read_text(encoding="utf-8").splitlines()
-            except (OSError, UnicodeError):
-                lines = []
-            self._events = [
-                event for line in lines if (event := self._decode_line(line)) is not None
-            ]
+                with self.path.open("rb") as source:
+                    source.seek(0, 2)
+                    position = source.tell()
+                    pending = b""
+                    skipping_oversized = False
+                    while position and len(events) < self.limit:
+                        size = min(position, 65536)
+                        position -= size
+                        source.seek(position)
+                        lines = (source.read(size) + pending).split(b"\n")
+                        pending = lines.pop(0)
+                        if skipping_oversized and lines:
+                            lines.pop()
+                            skipping_oversized = False
+                        for raw in reversed(lines):
+                            try:
+                                event = self._decode_line(raw.decode("utf-8"))
+                            except (UnicodeError, ValueError, TypeError, KeyError):
+                                continue
+                            if event is not None:
+                                events.append(event)
+                                if len(events) == self.limit:
+                                    break
+                        if len(pending) > 4 * 1024 * 1024:
+                            pending = b""
+                            skipping_oversized = True
+                    if (
+                        position == 0
+                        and pending
+                        and not skipping_oversized
+                        and len(events) < self.limit
+                    ):
+                        try:
+                            event = self._decode_line(pending.decode("utf-8"))
+                        except (UnicodeError, ValueError, TypeError, KeyError):
+                            event = None
+                        if event is not None:
+                            events.append(event)
+            except OSError:
+                pass
+            self._events = list(reversed(events))
         return list(self._events[-self.limit :])
 
     def append(self, event: JournalEvent) -> JournalEvent:

@@ -470,6 +470,8 @@ class DashboardV2Tests(unittest.TestCase):
         for kind in kinds:
             self.window._journal.record(kind)
         self.window._render_journal()
+        self.assertTrue(self.window.history_controller._journal_dirty)
+        self.assertEqual(self.window.journal_workspace.journal_table.rowCount(), 0)
         self.window.show()
         self.window.core_workspace.dashboard_nav_buttons["journal"].click()
         self.app.processEvents()

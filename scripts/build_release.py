@@ -122,7 +122,15 @@ def main() -> int:
     ]
     print(f"Rust extension: {native_file}", flush=True)
     print(f"Build output: {output_root}", flush=True)
-    return subprocess.call(cmd, cwd=ROOT, env=build_environment())
+    result = subprocess.call(cmd, cwd=ROOT, env=build_environment())
+    if result == 0:
+        internal = output_root / "dist" / "NetVision" / "_internal"
+        for relative in (
+            "PySide6/resources/qtwebengine_devtools_resources.debug.pak",
+            "netvision_rs/netvision_rs.pdb",
+        ):
+            (internal / relative).unlink(missing_ok=True)
+    return result
 
 
 if __name__ == "__main__":

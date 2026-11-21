@@ -146,7 +146,6 @@ class LatencyChart(ThemedCanvas):
         self._pulse_timer = QTimer(self)
         self._pulse_timer.setInterval(60)
         self._pulse_timer.timeout.connect(self._animate_hover_marker)
-        self._pulse_timer.start()
 
     @property
     def samples(self) -> tuple[LatencySample, ...]:
@@ -257,10 +256,19 @@ class LatencyChart(ThemedCanvas):
         self._set_hovered_sample(-1)
         self._hover_tooltip.hide()
 
+    def hideEvent(self, event) -> None:
+        self._pulse_timer.stop()
+        self._set_hovered_sample(-1)
+        super().hideEvent(event)
+
     def _set_hovered_sample(self, index: int) -> None:
         if index == self._hovered_sample_index:
             return
         self._hovered_sample_index = index
+        if index >= 0 and self.isVisible():
+            self._pulse_timer.start()
+        else:
+            self._pulse_timer.stop()
         if index < 0:
             self._hover_tooltip.hide()
         self.update()
@@ -823,8 +831,16 @@ class TopologyWidget(ThemedCanvas):
         self._timer = QTimer(self)
         self._timer.setInterval(60)
         self._timer.timeout.connect(self._animate)
-        self._timer.start()
         self._update_height()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._active_index >= 0:
+            self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
     def sizeHint(self) -> QSize:
         return QSize(0, max(520, len(self._nodes) * 132 + 96))
@@ -837,6 +853,8 @@ class TopologyWidget(ThemedCanvas):
         self._nodes = self._placeholder_nodes(target)
         self._dns_label = "DNS определяется"
         self._active_index = 0
+        if self.isVisible():
+            self._timer.start()
         self._connection_statuses = [ProbeStatus.PENDING] * max(0, len(self._nodes) - 1)
         self._hovered_index = -1
         self._update_height()
@@ -853,6 +871,10 @@ class TopologyWidget(ThemedCanvas):
             "geo": max(0, len(self._nodes) - 1),
         }.get(stage, -1)
         self._active_index = min(stage_index, len(self._nodes) - 1)
+        if self._active_index >= 0 and self.isVisible():
+            self._timer.start()
+        else:
+            self._timer.stop()
         self.update()
 
     def set_report(self, report: DiagnosticReport) -> None:
@@ -972,6 +994,7 @@ class TopologyWidget(ThemedCanvas):
         self._dns_label = f"{_format_ms(report.dns.latency_ms)}  ·  {addresses}"
         self._connection_statuses = _connection_statuses(report, nodes)
         self._active_index = -1
+        self._timer.stop()
         self._update_height()
         self.update()
 

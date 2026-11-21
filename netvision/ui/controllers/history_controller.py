@@ -3,7 +3,7 @@
 from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
-from PySide6.QtCore import QObject, Slot
+from PySide6.QtCore import QEvent, QObject, QTimer, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QTableWidgetItem
 from netvision.core.bufferbloat import BufferbloatReport
@@ -29,6 +29,20 @@ class HistoryController(QObject):
         self.host = parent
         self.workspace = workspace
         self.facts = facts
+        self._journal_dirty = True
+        self._udp_dirty = True
+
+    def watch_tables(self) -> None:
+        self.host.journal_workspace.journal_table.installEventFilter(self)
+        self.host.udp_history_workspace.udp_events_table.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show:
+            if watched is self.host.journal_workspace.journal_table and self._journal_dirty:
+                QTimer.singleShot(0, self._render_journal)
+            elif watched is self.host.udp_history_workspace.udp_events_table and self._udp_dirty:
+                QTimer.singleShot(0, self._refresh_udp_event_table)
+        return super().eventFilter(watched, event)
 
     @Slot(str, str)
     def handle_log_requested(self, message: str, _level: str) -> None:
@@ -47,6 +61,14 @@ class HistoryController(QObject):
         if not hasattr(self.host.journal_workspace, "journal_table"):
 
             return
+
+        if not self.host.journal_workspace.journal_table.isVisible() or self.host.isMinimized():
+            self._journal_dirty = True
+            has_events = bool(self.host._journal_events_for_view())
+            self.host.journal_workspace.export_journal_json_button.setEnabled(has_events)
+            self.host.journal_workspace.export_journal_csv_button.setEnabled(has_events)
+            return
+        self._journal_dirty = False
 
         events = self.host._journal_events_for_view()
 
@@ -245,6 +267,14 @@ class HistoryController(QObject):
         return event
 
     def _refresh_udp_event_table(self) -> None:
+
+        if (
+            not self.host.udp_history_workspace.udp_events_table.isVisible()
+            or self.host.isMinimized()
+        ):
+            self._udp_dirty = True
+            return
+        self._udp_dirty = False
 
         anomalies_only = self.host.udp_history_workspace.udp_anomaly_filter.isChecked()
 
