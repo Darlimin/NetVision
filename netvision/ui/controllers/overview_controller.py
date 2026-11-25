@@ -215,7 +215,9 @@ class OverviewController(QObject):
         tls_text = (
             self.host._tr("Требует домен")
             if report.tls and tls_domain_required(report.target.host, report.tls.error)
-            else report.tls.version or "OK" if tls_ok and report.tls else "—"
+            else report.tls.version or "OK"
+            if tls_ok and report.tls
+            else "—"
         )
         self._set_dashboard_metric("tls", tls_text, "good" if tls_ok else "neutral")
         vpn = bool(report.system.default_routes and report.system.default_routes[0].is_vpn)

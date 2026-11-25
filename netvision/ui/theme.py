@@ -1380,7 +1380,9 @@ QToolTip {
 
 # The light theme intentionally reuses the same geometry, spacing and green
 # interaction states. Only surfaces, text and neutral borders change.
-LIGHT_STYLE = APP_STYLE + """
+LIGHT_STYLE = (
+    APP_STYLE
+    + """
 
 QWidget {
     color: #1F2937;
@@ -1775,6 +1777,7 @@ QPushButton#SessionAnomalyOpenLogButton:hover {
     border-color: #55D6AE;
 }
 """
+)
 
 # Checkboxes inherit their card surface; only the indicator has a fill.
 _CHECKBOX_SURFACE = """
@@ -1802,11 +1805,14 @@ QLabel#HelpParagraph { font-size: 13px; }
 QTabBar#HelpTabs::tab { min-width: 0; padding: 0 5px; font-size: 12px; }
 """
 APP_STYLE += _HELP_BUTTON_STYLE
-LIGHT_STYLE += _HELP_BUTTON_STYLE + """
+LIGHT_STYLE += (
+    _HELP_BUTTON_STYLE
+    + """
 QPushButton#HelpButton { color: #25313B; background-color: #FFFFFF; border-color: #8A9BA4; }
 QPushButton#HelpButton:hover { color: #007D5A; background-color: #EAF8F3; border-color: #00A875; }
 QLabel#HelpSectionHeading { color: #007D5A; }
 """
+)
 
 LIGHT_STYLE += """
 QTableWidget::item:selected, QTableView::item:selected,

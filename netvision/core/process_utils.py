@@ -48,8 +48,9 @@ def _is_game_remote_port(port: int) -> bool:
 _GAME_RULES: tuple[tuple[str, Callable[[ProcessConnection], bool]], ...] = (
     (
         "UDP + игровой порт",
-        lambda connection: connection.protocol == "UDP"
-        and _is_game_remote_port(connection.remote_port),
+        lambda connection: (
+            connection.protocol == "UDP" and _is_game_remote_port(connection.remote_port)
+        ),
     ),
     (
         "UDP + известный удалённый порт",

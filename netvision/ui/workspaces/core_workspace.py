@@ -312,8 +312,8 @@ class CoreOverviewWorkspace(QWidget):
             button.setMinimumHeight(34)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(
-                lambda _checked=False, action_key=action_key, button=button, status=status: self.controller.event_bus.quick_fix_requested.emit(
-                    action_key, button, status
+                lambda _checked=False, action_key=action_key, button=button, status=status: (
+                    self.controller.event_bus.quick_fix_requested.emit(action_key, button, status)
                 )
             )
             row, column = divmod(index, 2)

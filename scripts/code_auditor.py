@@ -263,10 +263,10 @@ def _print_clones(auditor, struct_threshold, api_threshold):
             if ast_ratio >= struct_threshold or api_ratio >= api_threshold:
                 reason = []
                 if ast_ratio >= struct_threshold:
-                    reason.append(f"Структура: {ast_ratio*100:.0f}%")
+                    reason.append(f"Структура: {ast_ratio * 100:.0f}%")
                 if api_ratio >= api_threshold:
                     common = ", ".join(list(apis1 & apis2)[:4])
-                    reason.append(f"Общие вызовы ({api_ratio*100:.0f}%): [{common}...]")
+                    reason.append(f"Общие вызовы ({api_ratio * 100:.0f}%): [{common}...]")
 
                 print(
                     f"  [CLONE] {f1['qual_name']} ({f1['file']}:{f1['line']}) <===> {f2['qual_name']} ({f2['file']}:{f2['line']})"

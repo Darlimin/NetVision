@@ -460,7 +460,9 @@ class PingBenchmarkWorker(QObject):
             regional_results = (
                 benchmark_regional_targets(self._regional_targets)
                 if self._include_matrix and self._regional_targets
-                else benchmark_regional_targets() if self._include_matrix else ()
+                else benchmark_regional_targets()
+                if self._include_matrix
+                else ()
             )
             mtu_results = run_mtu_stress_test(self._mtu_host) if self._include_mtu else ()
         except Exception as exc:

@@ -278,7 +278,7 @@ def _mtu_finding(
         return RootCauseFinding(
             CauseSeverity.INFO,
             "Проверить MTU",
-            "Потери появляются без высокой базовой задержки." " Проверьте Path MTU до цели.",
+            "Потери появляются без высокой базовой задержки. Проверьте Path MTU до цели.",
             f"Ping {_format_ms(report.ping.average_ms)}, потери {report.ping.loss_percent:.0f}%",
         )
     return None

@@ -69,7 +69,7 @@ class DuplicateExecutionDetector:
                     if pair not in self.reported_pairs:
                         self.reported_pairs.add(pair)
                         print(
-                            f"\n[RUNTIME SHADOW ALERT] Две разные функции выполнили одинаковую работу за <{self.window*1000:.0f}мс!"
+                            f"\n[RUNTIME SHADOW ALERT] Две разные функции выполнили одинаковую работу за <{self.window * 1000:.0f}мс!"
                         )
                         print(f"  1) {pair[0]}")
                         print(f"  2) {pair[1]}")

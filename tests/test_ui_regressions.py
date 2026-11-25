@@ -175,8 +175,13 @@ class UiRegressionTests(unittest.TestCase):
     def test_deferred_journal_renders_in_batches_and_reuses_items(self) -> None:
         table = self.window.journal_workspace.journal_table
         event = SimpleNamespace(
-            at=datetime.now(), layer=Layer.MEASUREMENT, kind="test", subject="example.com",
-            template="test", values={}, severity="info",
+            at=datetime.now(),
+            layer=Layer.MEASUREMENT,
+            kind="test",
+            subject="example.com",
+            template="test",
+            values={},
+            severity="info",
         )
         with (
             patch.object(self.window, "_journal_events_for_view", return_value=[event] * 250),

@@ -322,7 +322,11 @@ class DiagnosticsCoordinator(QObject):
                 (
                     "VPN · активен"
                     if row == 0 and route.is_vpn
-                    else "Обычный · активен" if row == 0 else "VPN" if route.is_vpn else "Обычный"
+                    else "Обычный · активен"
+                    if row == 0
+                    else "VPN"
+                    if route.is_vpn
+                    else "Обычный"
                 ),
                 route.interface or "не определён",
                 f"{route.gateway} · напрямую" if route.on_link else route.gateway,

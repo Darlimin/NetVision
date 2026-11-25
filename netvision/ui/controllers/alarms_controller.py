@@ -29,7 +29,6 @@ class AlarmsController(QObject):
     def _notification_tray(self) -> QSystemTrayIcon | None:
 
         if not self.host._network_alarm_enabled or self.host._notifications_paused:
-
             return None
 
         tray = getattr(self.host, "_network_health_tray", None)
@@ -39,23 +38,19 @@ class AlarmsController(QObject):
     def _notification_message(self, event: JournalEvent) -> str:
 
         try:
-
             return self.host._translator.format(event.template, **event.values)
 
         except (KeyError, ValueError):
-
             return event.template or event.kind
 
     def _trigger_quick_fix(self, action_key: str, button: QPushButton, status: QLabel) -> None:
 
         if action_key == "dns":
-
             self.host._run_system_action("Сброс кэша DNS", flush_dns_cache, button, status)
 
             return
 
         if action_key == "mtu":
-
             self.host._mtu_optimizer_active_button = button
 
             self.host.mtu_controller.start_mtu_optimizer()
@@ -65,7 +60,6 @@ class AlarmsController(QObject):
         adapter = self.host._active_adapter_name()
 
         if not adapter:
-
             status.setText(self.host._tr("Активный адаптер не определён"))
 
             return
@@ -92,7 +86,6 @@ class AlarmsController(QObject):
         )
 
         if answer != QMessageBox.StandardButton.Yes:
-
             status.setText(self.host._tr("Действие отменено"))
 
             return
@@ -114,7 +107,6 @@ class AlarmsController(QObject):
         if not hasattr(
             getattr(self.host, "process_selector_panel", None), "network_alarm_checkbox"
         ):
-
             return
 
         self.host._network_alarm_enabled = (
@@ -150,13 +142,11 @@ class AlarmsController(QObject):
     ) -> None:
 
         if not button.isEnabled():
-
             return
 
         self.host._set_task_button_busy(button, True, "Выполняется")
 
         if status_label is not None:
-
             status_label.setText(self.host._tr("Выполняется..."))
 
             self.host._system_action_status[button] = status_label
@@ -197,13 +187,11 @@ class AlarmsController(QObject):
     def _notify(self, event: JournalEvent) -> None:
 
         if not self._notification_is_eligible(event):
-
             return
 
         tray = self._notification_tray()
 
         if tray is None or not self._notification_is_due(event):
-
             return
 
         tray.showMessage(
@@ -218,7 +206,6 @@ class AlarmsController(QObject):
         status_label = self.host._finish_system_action_button(button)
 
         if not isinstance(result, SystemActionResult):
-
             self.host._handle_unknown_system_action(label, status_label)
 
             return
@@ -229,15 +216,12 @@ class AlarmsController(QObject):
             self.host.dns_controller.on_dns_applied()
 
         if self.host.mtu_controller._handle_mtu_system_action(label, button, result, status_label):
-
             return
 
         if self.host._handle_rollback_system_action(label, result):
-
             return
 
         if result.success and result.change is not None:
-
             self.host._confirm_system_change(label, button, status_label, result.change)
 
     def _release_system_action(self) -> None:
@@ -245,7 +229,6 @@ class AlarmsController(QObject):
         thread = self.host.sender()
 
         if not isinstance(thread, QThread):
-
             return
 
         self.host._system_action_threads.discard(thread)
@@ -259,11 +242,9 @@ class AlarmsController(QObject):
         supported = {"loss.episode", "jitter.episode", "game.session_ended", "mtu.rolled_back"}
 
         if event.severity not in severe or event.kind not in supported:
-
             return False
 
         if event.kind == "loss.episode":
-
             return event.refs.get("kind") in {"drop", "burst"}
 
         return event.kind != "jitter.episode" or event.refs.get("kind") != "timeout"
@@ -275,7 +256,6 @@ class AlarmsController(QObject):
         previous = self.host._last_network_alarm_at.get(event.kind, 0.0)
 
         if now - previous < self.host._thresholds.alarm_cooldown_s:
-
             return False
 
         self.host._last_network_alarm_at[event.kind] = now

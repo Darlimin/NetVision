@@ -1966,10 +1966,12 @@ class NetVisionDashboardV2(QMainWindow):
         button.setToolTip(label)
         button.setAccessibleName(label)
         button.clicked.connect(
-            lambda _checked=False, label=label, action=action, button=button: self._run_system_action(
-                label,
-                action,
-                button,
+            lambda _checked=False, label=label, action=action, button=button: (
+                self._run_system_action(
+                    label,
+                    action,
+                    button,
+                )
             )
         )
         return button

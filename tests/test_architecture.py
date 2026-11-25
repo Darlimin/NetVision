@@ -26,9 +26,9 @@ def module_imports(path):
 def test_core_does_not_depend_on_qt_or_ui():
     for path in (PACKAGE / "core").glob("*.py"):
         _, imports = module_imports(path)
-        assert not any(
-            name.startswith(("PySide", "PyQt", "netvision.ui")) for name in imports
-        ), path
+        assert not any(name.startswith(("PySide", "PyQt", "netvision.ui")) for name in imports), (
+            path
+        )
 
 
 def test_internal_imports_are_acyclic():

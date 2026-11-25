@@ -143,9 +143,7 @@ def _create_qt_notifier(app: object, qt_core: object, qt_widgets: object) -> obj
                 dialog = qt_widgets.QMessageBox()  # type: ignore[attr-defined]
                 dialog.setIcon(qt_widgets.QMessageBox.Icon.Critical)  # type: ignore[attr-defined]
                 dialog.setWindowTitle("Ошибка NetVision")
-                dialog.setText(
-                    "Произошла непредвиденная ошибка. " f"Логи сохранены в {report_path}"
-                )
+                dialog.setText(f"Произошла непредвиденная ошибка. Логи сохранены в {report_path}")
                 dialog.setDetailedText(details)
                 copy_button = dialog.addButton(
                     "Скопировать детали",

@@ -98,7 +98,8 @@ class HistoryController(QObject):
         self._journal_dirty = False
         self.host.journal_workspace.journal_status.setText(
             self.host._translator.format("Событий в журнале: {count}", count=len(events))
-            if events else self.host._tr("Журнал текущей сессии пока пуст")
+            if events
+            else self.host._tr("Журнал текущей сессии пока пуст")
         )
         self.host.journal_workspace.export_journal_json_button.setEnabled(bool(events))
         self.host.journal_workspace.export_journal_csv_button.setEnabled(bool(events))
@@ -116,7 +117,9 @@ class HistoryController(QObject):
                 event = events[row_index]
                 try:
                     values = dict(event.values)
-                    if event.kind == "nat.measured" and isinstance(values.get("endpoints"), (list, tuple)):
+                    if event.kind == "nat.measured" and isinstance(
+                        values.get("endpoints"), (list, tuple)
+                    ):
                         values["endpoints"] = "; ".join(map(str, values["endpoints"])) or "—"
                     details = self.host._translator.format(event.template, **values)
                 except (KeyError, ValueError):
@@ -124,7 +127,9 @@ class HistoryController(QObject):
                 values = (
                     event.at.astimezone().strftime("%H:%M:%S"),
                     self.host._journal_layer_label(event.layer),
-                    event.kind, event.subject or "--", details,
+                    event.kind,
+                    event.subject or "--",
+                    details,
                 )
                 color = _journal_event_color(event.severity)
                 for column, value in enumerate(values):
@@ -153,7 +158,6 @@ class HistoryController(QObject):
         self.host.journal_workspace.journal_layer_filter.addItem(self.host._tr("Все слои"), None)
 
         for layer in Layer:
-
             self.host.journal_workspace.journal_layer_filter.addItem(
                 self.host._journal_layer_label(layer), layer.value
             )
@@ -183,7 +187,6 @@ class HistoryController(QObject):
         selected_layer = self.host.journal_workspace.journal_layer_filter.currentData()
 
         if isinstance(selected_layer, str):
-
             events = [event for event in events if event.layer.value == selected_layer]
 
         return events
@@ -199,11 +202,9 @@ class HistoryController(QObject):
         events = self.host._journal_events_for_view()
 
         if not events:
-
             return
 
         if file_format not in {"json", "csv"}:
-
             raise ValueError(f"Unsupported journal export format: {file_format}")
 
         suggested_name = f"NetVision_Journal_{datetime.now():%Y%m%d_%H%M%S}.{file_format}"
@@ -218,13 +219,11 @@ class HistoryController(QObject):
         )
 
         if not path:
-
             return
 
         suffix = f".{file_format}"
 
         if not path.lower().endswith(suffix):
-
             path += suffix
 
         payload = (
@@ -234,7 +233,6 @@ class HistoryController(QObject):
         ).encode("utf-8")
 
         if self.host._write_export_payload(path, payload):
-
             self.event_bus.log_requested.emit(
                 self.host._translator.format(
                     "Журнал сохранён в {format}: {path}", format=file_format.upper(), path=path
@@ -247,7 +245,6 @@ class HistoryController(QObject):
         self.host._udp_event_rows.clear()
 
         if hasattr(self.host.udp_history_workspace, "udp_events_table"):
-
             self.host.udp_history_workspace.udp_events_table.setRowCount(0)
 
             self.host.udp_history_workspace.udp_event_status.setText(
@@ -281,7 +278,6 @@ class HistoryController(QObject):
         )
 
         if hasattr(self.host.journal_workspace, "journal_table"):
-
             self.host._render_journal()
 
         self.event_bus.anomaly_detected.emit(event)
@@ -307,7 +303,6 @@ class HistoryController(QObject):
         self.host.udp_history_workspace.udp_events_table.setRowCount(len(visible_rows))
 
         for row_index, event in enumerate(visible_rows):
-
             timestamp = event.observed_at.astimezone().strftime("%H:%M:%S")
 
             values = (
@@ -320,7 +315,6 @@ class HistoryController(QObject):
             color = _udp_event_color(event)
 
             for column, value in enumerate(values):
-
                 item = QTableWidgetItem(value)
 
                 item.setToolTip(value)
@@ -332,13 +326,11 @@ class HistoryController(QObject):
         total = len(self.host._udp_event_rows)
 
         if total == 0:
-
             self.host.udp_history_workspace.udp_event_status.setText(
                 self.host._tr("UDP-события появятся после изменения портов")
             )
 
         elif anomalies_only:
-
             self.host.udp_history_workspace.udp_event_status.setText(
                 self.host._translator.format(
                     "Показано аномалий: {visible} из {total} событий",
@@ -348,7 +340,6 @@ class HistoryController(QObject):
             )
 
         else:
-
             self.host.udp_history_workspace.udp_event_status.setText(
                 self.host._translator.format("Событий UDP: {total}", total=total)
             )
@@ -360,7 +351,6 @@ class HistoryController(QObject):
         self.host.history_workspace.history_table.setRowCount(len(self.host._test_history_records))
 
         for row, record in enumerate(reversed(self.host._test_history_records)):
-
             test_type = str(record.get("test_type") or "Неизвестный тест")
 
             values = (
@@ -373,13 +363,11 @@ class HistoryController(QObject):
             )
 
             for column, value in enumerate(values):
-
                 item = QTableWidgetItem(value)
 
                 item.setToolTip(value)
 
                 if column == 5 and value in {"A+", "A"}:
-
                     item.setForeground(QColor("#00E5A3"))
 
                 self.host.history_workspace.history_table.setItem(row, column, item)
@@ -399,7 +387,6 @@ class HistoryController(QObject):
         ]
 
         if len(quality_records) < 2:
-
             self.host.history_workspace.history_trend.setText(
                 self.host._tr("Для тренда нужны минимум два теста качества.")
             )
@@ -431,15 +418,12 @@ class HistoryController(QObject):
         )
 
         if answer != QMessageBox.StandardButton.Yes:
-
             return
 
         try:
-
             self.host._test_history_store.clear()
 
         except OSError as exc:
-
             QMessageBox.critical(
                 self.host,
                 self.host._tr("История тестов"),
@@ -463,11 +447,9 @@ class HistoryController(QObject):
     def _export_udp_events(self, file_format: str) -> None:
 
         if not self.host._udp_event_rows:
-
             return
 
         if file_format not in {"json", "csv"}:
-
             raise ValueError(f"Unsupported UDP export format: {file_format}")
 
         suggested_name = f"NetVision_UDP_{datetime.now():%Y%m%d_%H%M%S}.{file_format}"
@@ -479,13 +461,11 @@ class HistoryController(QObject):
         )
 
         if not path:
-
             return
 
         suffix = f".{file_format}"
 
         if not path.lower().endswith(suffix):
-
             path += suffix
 
         payload = (
@@ -495,7 +475,6 @@ class HistoryController(QObject):
         ).encode("utf-8")
 
         if self.host._write_export_payload(path, payload):
-
             self.event_bus.log_requested.emit(
                 f"UDP-события сохранены в {file_format.upper()}: {path}", "INFO"
             )
@@ -509,9 +488,7 @@ class HistoryController(QObject):
         )
 
         for phase_name, phase in phases:
-
             for series in phase.series:
-
                 self.event_bus.journal_event_requested.emit(
                     "bufferbloat.measured",
                     {
@@ -557,7 +534,6 @@ class HistoryController(QObject):
     ) -> None:
 
         try:
-
             self.host._test_history_store.append(
                 test_type,
                 download_mbps=download_mbps,
@@ -567,7 +543,6 @@ class HistoryController(QObject):
             )
 
         except (OSError, TypeError, ValueError) as exc:
-
             self.event_bus.log_requested.emit(f"История тестов не сохранена: {exc}", "INFO")
 
             return
@@ -575,7 +550,6 @@ class HistoryController(QObject):
         self.host._test_history_records = self.host._test_history_store.load()
 
         if hasattr(self.host.history_workspace, "history_table"):
-
             self.host._refresh_history_view()
 
     def _restore_route_map(self) -> None:
