@@ -33,7 +33,11 @@ from netvision.core.thresholds import Thresholds, DEFAULT_THRESHOLDS
 from netvision.core.bufferbloat import run_bufferbloat_test
 from netvision.core.game_monitor import GameLaunchMonitor
 from netvision.core.dns_benchmark import DnsResolverProfile, benchmark_resolvers
-from netvision.core.system import active_network_identity, collect_dns_configuration
+from netvision.core.system import (
+    active_network_identity,
+    active_network_identity_fast,
+    collect_dns_configuration,
+)
 from netvision.core.ping_benchmark import (
     RegionalPingTarget,
     benchmark_regional_targets,
@@ -423,7 +427,7 @@ class NetworkIdentityWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self.completed.emit(active_network_identity())
+            self.completed.emit(active_network_identity_fast())
         except (OSError, ValueError):
             self.completed.emit(None)
         finally:

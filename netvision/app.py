@@ -8,6 +8,7 @@ from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication
 
 from netvision.core.crash_handler import setup_crash_handler
+from netvision.core.logging_setup import setup_application_logging
 from netvision.version import window_title
 
 
@@ -39,6 +40,7 @@ def _create_main_window(arguments: list[str] | None = None) -> object:
 
 def main() -> None:
     setup_crash_handler()
+    setup_application_logging()
     from netvision.ui.theme import APP_STYLE
 
     app = QApplication(sys.argv)

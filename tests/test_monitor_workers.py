@@ -24,11 +24,44 @@ from netvision.ui.legacy_workers import (
 )
 from netvision.ui.dialogs import GeoHideDialog
 from netvision.ui.legacy_workers import GeoHideWorker
-from netvision.ui.monitor_workers import LatencyMonitorWorker, MtrMonitorWorker, WorkerRegistry
+from netvision.ui.monitor_workers import (
+    LatencyMonitorWorker,
+    MtrMonitorWorker,
+    WifiMonitorWorker,
+    WorkerRegistry,
+)
 from netvision.ui.dashboard_v2 import NetVisionDashboardV2
 
 _THREAD_WAIT_MS = 2000
 _BLOCKED_PROBE_WAIT_S = 1.0
+
+
+@pytest.mark.parametrize("kind", ["latency", "gateway"])
+def test_monitor_probe_errors_are_logged_without_spam(kind, caplog):
+    worker = (
+        LatencyMonitorWorker("example.test", 443)
+        if kind == "latency"
+        else WifiMonitorWorker("adapter", "192.0.2.1")
+    )
+    waits = 0
+
+    def wait(_seconds):
+        nonlocal waits
+        waits += 1
+        if waits == 2:
+            worker.stop()
+
+    probe = "probe_tcp_connect" if kind == "latency" else "probe_ping"
+    with (
+        patch.object(worker._stop_event, "wait", side_effect=wait),
+        patch(f"netvision.ui.monitor_workers.{probe}", side_effect=OSError("offline")),
+        patch("netvision.ui.monitor_workers.collect_wifi_snapshot", return_value=None),
+        caplog.at_level("WARNING"),
+    ):
+        worker.run()
+    assert waits == 2
+    assert len(caplog.records) == 1
+    assert "OSError: offline" in caplog.text
 
 
 def test_registry_rejects_parented_worker():

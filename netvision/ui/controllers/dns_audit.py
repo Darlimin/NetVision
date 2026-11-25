@@ -85,8 +85,6 @@ class DnsController(QObject):
             return
         if self.host._dns_benchmark_thread and self.host._dns_benchmark_thread.isRunning():
             return
-        self.host._dns_public_addresses = PublicIpAddresses()
-        self._render_dns_info()
         if self.host._dns_config_thread is not None:
             self._reload_pending = True
         self._load_dns_configuration()
@@ -243,7 +241,12 @@ class DnsController(QObject):
             self._load_dns_configuration()
 
     def _check_network_identity(self) -> None:
-        if self._shutting_down or self._identity_thread is not None or self.host._dashboard_closing:
+        if (
+            self._shutting_down
+            or self._identity_thread is not None
+            or self.host._dashboard_closing
+            or self.host._dns_config_thread is not None
+        ):
             return
         worker = NetworkIdentityWorker()
         worker.completed.connect(self._network_identity_changed)

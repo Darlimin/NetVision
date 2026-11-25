@@ -16,7 +16,19 @@ from netvision.ui.presentation import (
     socket_label,
     socket_priority,
     target_mode,
+    traceroute_completed_text,
 )
+
+
+@pytest.mark.parametrize(
+    "count,word",
+    [(1, "узел"), (2, "узла"), (5, "узлов"), (11, "узлов"), (21, "узел"), (24, "узла")],
+)
+def test_traceroute_pluralization(count, word):
+    assert traceroute_completed_text(count, "ru").endswith(f"{count} {word}")
+    assert traceroute_completed_text(count, "en").endswith(
+        f"{count} {'hop' if count == 1 else 'hops'}"
+    )
 
 
 @pytest.mark.parametrize(

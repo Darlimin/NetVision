@@ -36,6 +36,29 @@ def active_network_identity() -> tuple[str, str] | None:
     return routes[0].interface, routes[0].local_address
 
 
+def active_network_identity_fast() -> tuple[str, str] | None:
+    """Identify the active route without collecting full interface statistics."""
+    routes = _collect_default_routes(())
+    if not routes:
+        return None
+    addresses = psutil.net_if_addrs()
+    names_by_ip: dict[str, list[str]] = {}
+    for name, entries in addresses.items():
+        for entry in entries:
+            if entry.family == socket.AF_INET:
+                names_by_ip.setdefault(entry.address, []).append(name)
+    # An address shared by adapters requires the full ordering of _collect_interfaces.
+    if any(len(names_by_ip.get(route.local_address, ())) > 1 for route in routes):
+        return active_network_identity()
+    candidates = []
+    for route in routes:
+        names = names_by_ip.get(route.local_address, ())
+        name = names[0] if names else None
+        candidates.append((route.metric, not _is_vpn_name(name or ""), name, route.local_address))
+    _, _, name, address = min(candidates, key=lambda candidate: candidate[:2])
+    return (name, address) if name and address else None
+
+
 def collect_dns_configuration() -> DnsConfiguration:
     """Read active adapter names and configured resolvers without external network calls."""
     interfaces = _collect_interfaces()

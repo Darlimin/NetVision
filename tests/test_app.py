@@ -32,13 +32,14 @@ def test_main_installs_crash_handler_once() -> None:
         patch("netvision.app._load_inter_fonts", return_value="Inter"),
         patch("netvision.app._create_main_window", return_value=window),
         patch("netvision.app.setup_crash_handler") as setup_handler,
+        patch("netvision.app.setup_application_logging"),
     ):
         with pytest.raises(SystemExit) as result:
             netvision_app.main()
 
     assert result.value.code == 0
     setup_handler.assert_called_once_with()
-    qt_application.setApplicationDisplayName.assert_called_once_with("NetVision V 0.10.4")
+    qt_application.setApplicationDisplayName.assert_called_once_with("NetVision V 0.10.5")
     timer.singleShot.assert_called_once_with(0, window.process_controller.refresh_processes)
 
 

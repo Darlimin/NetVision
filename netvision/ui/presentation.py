@@ -8,6 +8,19 @@ from dataclasses import dataclass
 GREEN, AMBER, RED, GREY = "#22c55e", "#f59e0b", "#ef4444", "#64748b"
 GATEWAY_WARNING_MS = 15
 JITTER_WARNING_MS = 15
+
+
+def traceroute_completed_text(count: int, language: str) -> str:
+    if language == "en":
+        return f"Traceroute completed: {count} {'hop' if count == 1 else 'hops'}"
+    ending = "узлов"
+    if count % 10 == 1 and count % 100 != 11:
+        ending = "узел"
+    elif count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        ending = "узла"
+    return f"Трассировка завершена: {count} {ending}"
+
+
 METRIC_HELP = {
     "dns": "Скорость превращения адреса сайта в IP. Медленный DNS замедляет открытие страниц и вход в игровые лобби.",
     "ping": "Время отклика до сервера и обратно. Чем ниже цифра, тем быстрее регистрируются действия в игре.",

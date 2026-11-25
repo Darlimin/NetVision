@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import logging
 import socket
 from threading import Event
+from time import monotonic
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from shiboken6 import isValid
@@ -16,6 +18,25 @@ from netvision.core.tcp_diagnostics import probe_tcp_connect
 from netvision.core.thresholds import DEFAULT_THRESHOLDS, Thresholds
 from netvision.core.traceroute import MtrAccumulator, probe_hop
 from netvision.core.udp_monitor import UdpPortHistory, get_process_udp_ports
+
+logger = logging.getLogger(__name__)
+
+
+class _ProbeErrorThrottle:
+    def __init__(self) -> None:
+        self._last_error = None
+        self._last_time = 0.0
+
+    def log(self, operation: str, exc: Exception) -> None:
+        key = (type(exc), str(exc))
+        now = monotonic()
+        if key != self._last_error or now - self._last_time >= 60:
+            logger.warning("%s: %s: %s", operation, type(exc).__name__, exc)
+            self._last_error = key
+            self._last_time = now
+
+    def reset(self) -> None:
+        self._last_error = None
 
 
 class WifiSignalTracker:
@@ -55,6 +76,7 @@ class LatencyMonitorWorker(QObject):
         self._interval_s = interval_s
         self._protocol = protocol.upper()
         self._stop_event = Event()
+        self._probe_errors = _ProbeErrorThrottle()
 
     def stop(self) -> None:
         # Called by the GUI thread; Event is thread-safe even during a probe.
@@ -71,7 +93,9 @@ class LatencyMonitorWorker(QObject):
                     else:
                         result = probe_tcp_connect(self._host, self._port, timeout=1.0)
                         latency, success = result.connect_ms, result.is_open
-                except Exception:
+                    self._probe_errors.reset()
+                except Exception as exc:
+                    self._probe_errors.log("Latency probe failed", exc)
                     latency, success = None, False
                 if self._stop_event.is_set():
                     break
@@ -127,6 +151,7 @@ class WifiMonitorWorker(QObject):
         self._route_is_vpn = route_is_vpn
         self._thresholds = th
         self._stop_event = Event()
+        self._probe_errors = _ProbeErrorThrottle()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -149,7 +174,9 @@ class WifiMonitorWorker(QObject):
                 try:
                     gateway_ping = probe_ping(self._gateway, count=1)
                     gateway_rtt = gateway_ping.average_ms
-                except Exception:
+                    self._probe_errors.reset()
+                except Exception as exc:
+                    self._probe_errors.log("Gateway probe failed", exc)
                     gateway_rtt = None
                 if snapshot is not None:
                     snapshot = replace(snapshot, gateway_rtt_ms=gateway_rtt)

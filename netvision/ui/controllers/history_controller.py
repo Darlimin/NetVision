@@ -20,6 +20,8 @@ from netvision.ui.utils import _udp_event_color, _journal_event_color
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QSizePolicy, QSplitter, QVBoxLayout, QWidget
 from netvision.ui import constants as ui_constants
+from netvision.ui.components.table_context_menu import install_context_menu
+from shiboken6 import isValid
 
 
 class HistoryController(QObject):
@@ -31,18 +33,40 @@ class HistoryController(QObject):
         self.facts = facts
         self._journal_dirty = True
         self._udp_dirty = True
+        self._flush_scheduled = False
+        self._journal_generation = 0
 
     def watch_tables(self) -> None:
         self.host.journal_workspace.journal_table.installEventFilter(self)
         self.host.udp_history_workspace.udp_events_table.installEventFilter(self)
+        install_context_menu(
+            self.host, self.host.journal_workspace.journal_table, (3, 4), open_mtr=True
+        )
+        install_context_menu(
+            self.host, self.host.udp_history_workspace.udp_events_table, (3,), open_mtr=True
+        )
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.Show:
             if watched is self.host.journal_workspace.journal_table and self._journal_dirty:
-                QTimer.singleShot(0, self._render_journal)
+                self.flush_visible_tables()
             elif watched is self.host.udp_history_workspace.udp_events_table and self._udp_dirty:
                 QTimer.singleShot(0, self._refresh_udp_event_table)
         return super().eventFilter(watched, event)
+
+    def flush_visible_tables(self) -> None:
+        if not self._flush_scheduled and (self._journal_dirty or self._udp_dirty):
+            self._flush_scheduled = True
+            QTimer.singleShot(0, self._flush_deferred_tables)
+
+    def _flush_deferred_tables(self) -> None:
+        self._flush_scheduled = False
+        if not isValid(self.host) or self.host.isMinimized():
+            return
+        if self._journal_dirty and isValid(self.host.journal_workspace.journal_table):
+            self._render_journal(deferred=True)
+        if self._udp_dirty and isValid(self.host.udp_history_workspace.udp_events_table):
+            self._refresh_udp_event_table()
 
     @Slot(str, str)
     def handle_log_requested(self, message: str, _level: str) -> None:
@@ -56,69 +80,67 @@ class HistoryController(QObject):
     def handle_history_requested(self, test_type: str, values: dict) -> None:
         self._record_test_history(test_type, **values)
 
-    def _render_journal(self) -> None:
-
-        if not hasattr(self.host.journal_workspace, "journal_table"):
-
-            return
-
-        if not self.host.journal_workspace.journal_table.isVisible() or self.host.isMinimized():
+    def _render_journal(self, *, deferred: bool = False) -> None:
+        self._journal_generation += 1
+        generation = self._journal_generation
+        table = self.host.journal_workspace.journal_table
+        if not table.isVisible() or self.host.isMinimized():
             self._journal_dirty = True
             has_events = bool(self.host._journal_events_for_view())
             self.host.journal_workspace.export_journal_json_button.setEnabled(has_events)
             self.host.journal_workspace.export_journal_csv_button.setEnabled(has_events)
             return
-        self._journal_dirty = False
-
-        events = self.host._journal_events_for_view()
-
-        self.host.journal_workspace.journal_table.setHorizontalHeaderLabels(
+        events = list(reversed(self.host._journal_events_for_view()))
+        table.setHorizontalHeaderLabels(
             [self.host._tr(text) for text in ("Время", "Слой", "Тип", "Объект", "Подробности")]
         )
-
-        self.host.journal_workspace.journal_table.setRowCount(len(events))
-
-        for row_index, event in enumerate(reversed(events)):
-
-            try:
-
-                details = self.host._translator.format(event.template, **event.values)
-
-            except (KeyError, ValueError):
-
-                details = event.template
-
-            values = (
-                event.at.astimezone().strftime("%H:%M:%S"),
-                self.host._journal_layer_label(event.layer),
-                event.kind,
-                event.subject or "--",
-                details,
-            )
-
-            color = _journal_event_color(event.severity)
-
-            for column, value in enumerate(values):
-
-                item = QTableWidgetItem(value)
-
-                item.setToolTip(value)
-
-                item.setForeground(color)
-
-                self.host.journal_workspace.journal_table.setItem(row_index, column, item)
-
-        count = len(events)
-
+        table.setRowCount(len(events))
+        self._journal_dirty = False
         self.host.journal_workspace.journal_status.setText(
-            self.host._translator.format("Событий в журнале: {count}", count=count)
-            if count
-            else self.host._tr("Журнал текущей сессии пока пуст")
+            self.host._translator.format("Событий в журнале: {count}", count=len(events))
+            if events else self.host._tr("Журнал текущей сессии пока пуст")
         )
-
         self.host.journal_workspace.export_journal_json_button.setEnabled(bool(events))
-
         self.host.journal_workspace.export_journal_csv_button.setEnabled(bool(events))
+
+        def render_batch(start: int) -> None:
+            if not isValid(self) or not isValid(self.host) or not isValid(table):
+                return
+            if generation != self._journal_generation:
+                return
+            if not table.isVisible() or self.host.isMinimized():
+                self._journal_dirty = True
+                return
+            end = min(start + 100, len(events)) if deferred else len(events)
+            for row_index in range(start, end):
+                event = events[row_index]
+                try:
+                    values = dict(event.values)
+                    if event.kind == "nat.measured" and isinstance(values.get("endpoints"), (list, tuple)):
+                        values["endpoints"] = "; ".join(map(str, values["endpoints"])) or "—"
+                    details = self.host._translator.format(event.template, **values)
+                except (KeyError, ValueError):
+                    details = event.template
+                values = (
+                    event.at.astimezone().strftime("%H:%M:%S"),
+                    self.host._journal_layer_label(event.layer),
+                    event.kind, event.subject or "--", details,
+                )
+                color = _journal_event_color(event.severity)
+                for column, value in enumerate(values):
+                    item = table.item(row_index, column)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        table.setItem(row_index, column, item)
+                    if item.text() != value:
+                        item.setText(value)
+                        item.setToolTip(value)
+                    if item.foreground().color() != color:
+                        item.setForeground(color)
+            if end < len(events):
+                QTimer.singleShot(0, lambda: render_batch(end))
+
+        render_batch(0)
 
     def _retranslate_journal_filter(self) -> None:
 

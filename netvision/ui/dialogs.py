@@ -51,6 +51,7 @@ from netvision.ui.monitor_workers import WorkerRegistry  # noqa: F401
 from netvision.ui.utils import keep_wheel_scroll_local
 from netvision.ui.presentation import HELP_SECTIONS
 from netvision.ui.theme import busy_button_colors
+from netvision.version import display_version
 
 
 class HelpDialog(QDialog):
@@ -59,8 +60,12 @@ class HelpDialog(QDialog):
     def __init__(self, parent: QWidget, translate: Callable[[str], str]) -> None:
         super().__init__(parent)
         self.setModal(True)
-        self.resize(1100, 620)
-        self.setMinimumSize(900, 320)
+        screen = parent.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        width = min(1100, available.width()) if available else 1100
+        height = min(620, int(available.height() * 0.85)) if available else 620
+        self.setMinimumSize(min(900, width), min(320, height))
+        self.resize(width, height)
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
         self.tabs.tabBar().setObjectName("HelpTabs")
@@ -94,9 +99,19 @@ class HelpDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button, alignment=Qt.AlignmentFlag.AlignRight)
         self.retranslate(translate)
+        if available:
+            frame = self.frameGeometry()
+            frame.moveCenter(parent.frameGeometry().center())
+            frame.moveLeft(
+                max(available.left(), min(frame.left(), available.right() - frame.width() + 1))
+            )
+            frame.moveTop(
+                max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1))
+            )
+            self.move(frame.topLeft())
 
     def retranslate(self, translate: Callable[[str], str]) -> None:
-        self.setWindowTitle(translate("Справка"))
+        self.setWindowTitle(f"{translate('Справка')} · NetVision V {display_version()[1:]}")
         self.close_button.setText(translate("Закрыть"))
         for index, (title, _) in enumerate(HELP_SECTIONS):
             self.tabs.setTabText(index, translate(title))

@@ -5,20 +5,25 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from threading import Event
+from types import SimpleNamespace
 import ssl
 import time
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QWindowStateChangeEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QTableWidgetItem,
 )
 
 from netvision.core.diagnostics import DiagnosticService
 from netvision.core.probes import probe_tls
 from netvision.core.target import parse_target
-from netvision.core.traceroute import MtrHopStats, MtrSnapshot
+from netvision.core.traceroute import MtrHopStats, MtrSnapshot, TracerouteHop
+from netvision.core.nat_diagnostics import NatEndpoint, NatReport
+from netvision.core.session_journal import Layer
 from netvision.models import (
     DnsResult,
     PingResult,
@@ -31,6 +36,7 @@ from netvision.models import (
 from netvision.reporting import serialize_support_bundle
 from netvision.ui.controllers.dns_audit import DnsController
 from netvision.ui.dashboard_v2 import NetVisionDashboardV2
+from netvision.ui.components.table_context_menu import create_menu, find_target
 
 
 class _QuietMtrWorker(QObject):
@@ -113,6 +119,88 @@ class UiRegressionTests(unittest.TestCase):
         self.assertEqual(self.window.mtr_workspace.mtr_table.item(0, 1).text(), "1.1.1.1")
         self.assertIs(self.window._facts.get("mtr.snapshot"), snapshot)
 
+    def test_context_menus_copy_and_open_target(self) -> None:
+        journal = self.window.journal_workspace.journal_table
+        udp = self.window.udp_history_workspace.udp_events_table
+        mtr = self.window.mtr_workspace.mtr_table
+        for table in (journal, udp, mtr):
+            self.assertEqual(table.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
+        for table, column, target in (
+            (journal, 3, "example.com"),
+            (udp, 3, "192.0.2.1"),
+            (mtr, 1, "2001:db8::1"),
+        ):
+            table.setRowCount(1)
+            table.setItem(0, column, QTableWidgetItem(target))
+            menu = create_menu(self.window, table, 0, (column,), table is not mtr)
+            self.assertEqual(len(menu.actions()), 3 if table is not mtr else 2)
+            menu.actions()[0].trigger()
+            self.assertEqual(self.app.clipboard().text(), target)
+            menu.actions()[1].trigger()
+            self.assertIn(target, self.app.clipboard().text())
+            if table is not mtr:
+                menu.actions()[2].trigger()
+                self.assertEqual(self.window.mtr_workspace.traceroute_target_input.text(), target)
+                self.assertIs(self.window.workspace_tabs.currentWidget(), self.window.mtr_workspace)
+                self.assertEqual(self.window.mtr_workspace.traceroute_mode_tabs.currentIndex(), 1)
+            menu.deleteLater()
+        self.assertIsNone(find_target("UDP-порт 443 появился у PID 123"))
+        self.assertEqual(find_target("192.0.2.1:443"), ("192.0.2.1", True))
+        self.assertEqual(find_target("[2001:db8::1]:443"), ("2001:db8::1", True))
+
+    def test_traceroute_result_retranslates(self) -> None:
+        hop = TracerouteHop(1, "192.0.2.1", None, 2.0, "ok", False)
+        self.window.mtr_controller._on_traceroute_completed((hop,))
+        self.assertIn("1 узел", self.window.mtr_workspace.traceroute_status.text())
+        self.window.header_panel.language_combo.setCurrentIndex(1)
+        self.assertIn("1 hop", self.window.mtr_workspace.traceroute_status.text())
+        self.window.header_panel.language_combo.setCurrentIndex(0)
+        self.assertIn("1 узел", self.window.mtr_workspace.traceroute_status.text())
+
+    def test_restored_journal_flush_is_scheduled_once(self) -> None:
+        controller = self.window.history_controller
+        controller._journal_dirty = True
+        controller._udp_dirty = False
+        with (
+            patch.object(controller, "_render_journal") as render,
+            patch("netvision.ui.controllers.history_controller.QTimer.singleShot") as schedule,
+        ):
+            controller.flush_visible_tables()
+            controller.flush_visible_tables()
+            render.assert_not_called()
+            schedule.assert_called_once()
+            schedule.call_args.args[1]()
+            render.assert_called_once()
+
+    def test_deferred_journal_renders_in_batches_and_reuses_items(self) -> None:
+        table = self.window.journal_workspace.journal_table
+        event = SimpleNamespace(
+            at=datetime.now(), layer=Layer.MEASUREMENT, kind="test", subject="example.com",
+            template="test", values={}, severity="info",
+        )
+        with (
+            patch.object(self.window, "_journal_events_for_view", return_value=[event] * 250),
+            patch.object(table, "isVisible", return_value=True),
+            patch("netvision.ui.controllers.history_controller.QTimer.singleShot") as schedule,
+        ):
+            self.window.history_controller._render_journal(deferred=True)
+            self.assertIsNotNone(table.item(99, 0))
+            self.assertIsNone(table.item(100, 0))
+            first = table.item(0, 0)
+            schedule.call_args.args[1]()
+            self.assertIsNotNone(table.item(199, 0))
+            schedule.call_args.args[1]()
+            self.assertIsNotNone(table.item(249, 0))
+            self.window.history_controller._render_journal(deferred=True)
+            self.assertIs(table.item(0, 0), first)
+
+    def test_theme_change_updates_native_titlebar(self) -> None:
+        with patch("netvision.ui.dashboard_v2.apply_titlebar_theme") as apply:
+            self.window._toggle_theme()
+            apply.assert_called_with(self.window, False)
+            self.window._toggle_theme()
+            apply.assert_called_with(self.window, True)
+
     def test_mtr_reuses_cells_and_retains_selection(self) -> None:
         table = self.window.mtr_workspace.mtr_table
         snapshot = self._mtr_snapshot()
@@ -124,6 +212,46 @@ class UiRegressionTests(unittest.TestCase):
             self.assertIs(table.item(0, 1), original)
             self.assertEqual(table.currentRow(), 0)
 
+    def test_hidden_mtr_defers_history_until_table_is_shown(self) -> None:
+        controller = self.window.mtr_controller
+        table = self.window.mtr_workspace.mtr_table
+        with patch.object(self.window, "_dashboard_refresh_hop_history") as refresh:
+            with patch.object(table, "isVisible", return_value=False):
+                controller._render_mtr_snapshot(self._mtr_snapshot())
+                refresh.assert_not_called()
+                self.assertIsNotNone(controller._pending_snapshot)
+            with patch.object(table, "isVisible", return_value=True):
+                controller._render_pending_snapshot()
+            self.assertIsNone(controller._pending_snapshot)
+            self.assertGreaterEqual(refresh.call_count, 1)
+
+    def test_restoring_window_flushes_deferred_views(self) -> None:
+        with (
+            patch.object(self.window.history_controller, "flush_visible_tables") as history,
+            patch.object(self.window.mtr_controller, "_render_pending_snapshot") as mtr,
+            patch.object(self.window, "isMinimized", return_value=False),
+        ):
+            self.window.changeEvent(QWindowStateChangeEvent(Qt.WindowState.WindowMinimized))
+            self.assertTrue(self._wait_until(lambda: history.called and mtr.called))
+
+    def test_dns_benchmark_keeps_public_ip_on_failure(self) -> None:
+        from netvision.core.internet_quality import PublicIpAddresses
+
+        controller = self.window.dns_controller
+        self.window._dns_public_addresses = PublicIpAddresses(ipv4="203.0.113.10")
+        with (
+            patch("netvision.ui.controllers.dns_audit.QThread") as thread_type,
+            patch("netvision.ui.controllers.dns_audit.DnsBenchmarkWorker") as worker_type,
+            patch.object(controller.registry, "retain"),
+        ):
+            thread_type.return_value.isRunning.return_value = False
+            controller.start_dns_benchmark()
+            controller._on_dns_configuration_failed("temporary timeout")
+            self.assertEqual(self.window._dns_public_addresses.ipv4, "203.0.113.10")
+            self.window._dns_benchmark_thread = None
+            self.window._dns_benchmark_worker = None
+            self.assertTrue(worker_type.called)
+
     def test_dns_stop_discards_late_network_change(self) -> None:
         controller = self.window.dns_controller
         controller._reload_pending = True
@@ -134,6 +262,17 @@ class UiRegressionTests(unittest.TestCase):
             controller._network_identity_changed(("VPN", "10.0.0.2"))
             render.assert_not_called()
         controller._load_dns_configuration.assert_not_called()
+
+    def test_nat_journal_endpoints_are_readable(self) -> None:
+        report = NatReport(
+            "ok",
+            "eim",
+            mapped_endpoints=(NatEndpoint("stun.example:3478", "192.0.2.1", 1234),),
+        )
+        self.window.diagnostics_coordinator._on_nat_probe_completed(report)
+        calls = self.window._record_journal_event.call_args_list
+        event = next(call for call in calls if call.args[0] == "nat.measured")
+        self.assertEqual(event.kwargs["values"]["endpoints"], "stun.example:3478 -> 192.0.2.1:1234")
 
     def test_mtr_start_stop_cycle_is_safe(self) -> None:
         with patch("netvision.ui.controllers.mtr_audit.MtrMonitorWorker", _QuietMtrWorker):

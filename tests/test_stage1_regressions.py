@@ -1,6 +1,7 @@
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import socket
 
 import pytest
 
@@ -21,6 +22,8 @@ from netvision.models import (
 )
 from netvision.ui.controllers.dns_audit import DnsController
 from netvision.ui.lite_mode import LiteStatus, summarize_report
+from netvision.core.system import active_network_identity_fast
+from netvision.models import DefaultRoute
 
 
 @pytest.mark.parametrize("host", ["140.82.113.26", "2001:db8::1", "example.com"])
@@ -103,3 +106,49 @@ def test_dns_result_from_changed_route_is_discarded():
     )
     assert host._dns_public_addresses.ipv4 is None
     assert controller._reload_pending
+
+
+def test_fast_identity_tracks_vpn_and_avoids_full_snapshot():
+    routes = (
+        DefaultRoute("192.168.1.1", None, "192.168.1.2", 10, False),
+        DefaultRoute("10.0.0.1", None, "10.0.0.2", 10, False),
+    )
+    entries = {
+        "Ethernet": [SimpleNamespace(family=socket.AF_INET, address="192.168.1.2")],
+        "happ-xray": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.2")],
+    }
+    with (
+        patch("netvision.core.system._collect_default_routes", return_value=routes),
+        patch("netvision.core.system.psutil.net_if_addrs", return_value=entries),
+        patch("netvision.core.system.active_network_identity") as full,
+    ):
+        assert active_network_identity_fast() == ("happ-xray", "10.0.0.2")
+        full.assert_not_called()
+
+
+def test_identity_poll_does_not_overlap_existing_workers():
+    host = SimpleNamespace(_dashboard_closing=False, _dns_config_thread=object())
+    controller = SimpleNamespace(
+        _shutting_down=False, _identity_thread=None, host=host, registry=Mock()
+    )
+    DnsController._check_network_identity(controller)
+    controller.registry.start.assert_not_called()
+    host._dns_config_thread = None
+    controller._identity_thread = object()
+    DnsController._check_network_identity(controller)
+    controller.registry.start.assert_not_called()
+
+
+def test_unchanged_identity_preserves_public_ip_without_redraw():
+    host = SimpleNamespace(_dns_public_addresses=PublicIpAddresses(ipv4="203.0.113.10"))
+    controller = SimpleNamespace(
+        host=host,
+        _network_identity=("happ-xray", "10.0.0.2"),
+        _shutting_down=False,
+        _render_dns_info=Mock(),
+        _load_dns_configuration=Mock(),
+    )
+    DnsController._network_identity_changed(controller, ("happ-xray", "10.0.0.2"))
+    controller._render_dns_info.assert_not_called()
+    controller._load_dns_configuration.assert_not_called()
+    assert host._dns_public_addresses.ipv4 == "203.0.113.10"

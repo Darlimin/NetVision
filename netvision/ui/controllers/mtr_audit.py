@@ -11,6 +11,8 @@ from netvision.ui.legacy_workers import TracerouteWorker
 from netvision.ui.monitor_workers import MtrMonitorWorker, WorkerRegistry
 from netvision.ui.utils import _ms
 from netvision.ui.presentation import VPN_MTR_HINT
+from netvision.ui.presentation import traceroute_completed_text
+from netvision.ui.components.table_context_menu import install_context_menu
 
 
 from netvision.ui.workspaces.mtr_audit import MtrWorkspace
@@ -27,7 +29,9 @@ class MtrController(QObject):
         self.facts = facts
         self.registry = registry
         self._pending_snapshot = None
+        self._traceroute_completed_count = None
         workspace.mtr_table.installEventFilter(self)
+        install_context_menu(self.host, workspace.mtr_table, (1,), open_mtr=False)
         workspace.traceroute_start_button.clicked.connect(self.start_visual_traceroute)
         workspace.mtr_start_button.toggled.connect(self._toggle_mtr_monitor)
         workspace.traceroute_target_input.textEdited.connect(self._on_mtr_target_changed)
@@ -53,6 +57,7 @@ class MtrController(QObject):
                 self.host._dashboard_select_table_row(
                     self.workspace.mtr_table, self.host._dashboard_selected_hop
                 )
+            self.host._dashboard_refresh_hop_history()
 
     def start_visual_traceroute(self) -> None:
         if (
@@ -60,6 +65,7 @@ class MtrController(QObject):
             and self.host._traceroute_thread is None
         ):
             self.host._dashboard_reset_hop_history()
+            self._traceroute_completed_count = None
         self._inherited_start_visual_traceroute()
 
     def start_mtr_monitor(self) -> None:
@@ -223,7 +229,8 @@ class MtrController(QObject):
         )
 
     def _render_mtr_snapshot(self, snapshot: MtrSnapshot) -> None:
-        if self.workspace.mtr_table.isVisible() and not self.host.isMinimized():
+        visible = self.workspace.mtr_table.isVisible() and not self.host.isMinimized()
+        if visible:
             self._pending_snapshot = None
             self._inherited__render_mtr_snapshot(snapshot)
         else:
@@ -234,8 +241,12 @@ class MtrController(QObject):
             if self.host._dashboard_record_hop_sample(hop.ttl, address, hop.last_ms):
                 first_sampled_hop = first_sampled_hop or hop.ttl
         if first_sampled_hop is not None:
-            self.host._dashboard_auto_select_hop(first_sampled_hop, self.workspace.mtr_table)
-        self.host._dashboard_refresh_hop_history()
+            if visible:
+                self.host._dashboard_auto_select_hop(first_sampled_hop, self.workspace.mtr_table)
+            elif self.host._dashboard_selected_hop is None:
+                self.host._dashboard_selected_hop = first_sampled_hop
+        if visible:
+            self.host._dashboard_refresh_hop_history()
 
     def _inherited__render_mtr_snapshot(self, snapshot: MtrSnapshot) -> None:
         self.workspace.mtr_table.setRowCount(len(snapshot.hops))
@@ -290,14 +301,21 @@ class MtrController(QObject):
         self.workspace.vpn_hint.setText(self.host._tr(VPN_MTR_HINT))
         self.workspace.vpn_hint.setVisible(vpn and len(value) == 1)
         if not value:
+            self._traceroute_completed_count = None
             self.workspace.traceroute_status.setText(self.host._tr("Маршрут не найден"))
             return
-        self.workspace.traceroute_status.setText(
-            self.host._translator.format("Трассировка завершена: {count} узлов", count=len(value))
-        )
+        self._traceroute_completed_count = len(value)
+        self.retranslate_traceroute_status()
+
+    def retranslate_traceroute_status(self) -> None:
+        if self._traceroute_completed_count is not None:
+            self.workspace.traceroute_status.setText(
+                traceroute_completed_text(self._traceroute_completed_count, self.host._language)
+            )
 
     @Slot(str)
     def _on_traceroute_failed(self, message: str) -> None:
+        self._traceroute_completed_count = None
         self.host._set_task_button_busy(self.workspace.traceroute_start_button, False)
         self.workspace.traceroute_progress.hide()
         self.workspace.traceroute_status.setText(

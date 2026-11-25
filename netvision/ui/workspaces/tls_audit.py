@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -142,7 +143,14 @@ class TlsAuditWorkspace(QFrame):
         self.tls_handshake_table = QTableWidget(0, 3)
         self.tls_handshake_table.setObjectName("TlsHandshakeTable")
         self.tls_handshake_table.setHorizontalHeaderLabels(["Этап", "Время", "Статус / детали"])
-        factory.configure_table(self.tls_handshake_table, (150, 80, 360))
+        factory.configure_table(self.tls_handshake_table, (145, 75, 240))
+        self.tls_handshake_table.setWordWrap(True)
+        self.tls_handshake_table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tls_handshake_table.horizontalHeader().sectionResized.connect(
+            lambda *_: self.tls_handshake_table.resizeRowsToContents()
+        )
         self.tls_handshake_table.setMinimumHeight(180)
         handshake_layout.addWidget(handshake_title)
         handshake_layout.addWidget(handshake_note)

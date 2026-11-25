@@ -404,7 +404,7 @@ class DashboardV2Tests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(
             self.window.core_workspace.dashboard_nav_buttons["overview"].text(),
-            "Overview & diagnosis",
+            "Overview / Diagnosis",
         )
         self.window.header_panel.language_combo.setCurrentIndex(
             self.window.header_panel.language_combo.findData("ru")

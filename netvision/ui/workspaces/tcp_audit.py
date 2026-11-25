@@ -147,7 +147,8 @@ class TcpAuditWorkspace(QFrame):
         self.tcp_sockets_table.setHorizontalHeaderLabels(
             ["PID / приложение", "Локальный endpoint", "Удалённый endpoint", "Состояние", "Детали"]
         )
-        factory.configure_table(self.tcp_sockets_table, (130, 130, 145, 105, 210))
+        factory.configure_table(self.tcp_sockets_table, (115, 120, 130, 90, 150))
+        self.tcp_sockets_table.horizontalHeader().setMinimumSectionSize(90)
         self.tcp_sockets_table.setMinimumHeight(230)
         sockets_layout.addLayout(socket_header)
         sockets_layout.addWidget(self.tcp_socket_status)

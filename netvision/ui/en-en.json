@@ -1068,5 +1068,11 @@
   "Что попадает в файлы экспорта?": "What do exported files contain?",
   "«Экспорт отчёта» сохраняет диагностику и события UDP: цель, локальные и внешний IP, интерфейсы, MAC, имя компьютера, DNS, маршруты, результаты и ошибки. Учётные данные прокси удаляются. «Пакет для техподдержки» может дополнительно включать версию Windows и приложения, журнал, замеры, выбранный процесс (имя, PID, адреса и порты) и историю.": "“Export report” saves diagnostics and UDP events: target, local and public IPs, interfaces, MAC addresses, computer name, DNS, routes, results and errors. Proxy credentials are removed. A “Support bundle” can additionally include Windows and app versions, journal, measurements, selected process (name, PID, addresses and ports) and history.",
   "Перед публикацией": "Before sharing",
-  "В пакете для техподдержки по умолчанию включено скрытие IP, MAC, имени компьютера и SSID; разделы можно выбрать. Обычный экспорт не анонимизирует весь отчёт. Проверьте файл перед публикацией: имена адаптеров, процессов, адреса, маршруты и другие чувствительные данные могут остаться.": "The support bundle enables masking of IP, MAC, computer name and SSID by default, and sections can be selected. Ordinary report export does not anonymize the entire report. Review the file before publishing: adapter and process names, addresses, routes and other sensitive data may remain."
+  "В пакете для техподдержки по умолчанию включено скрытие IP, MAC, имени компьютера и SSID; разделы можно выбрать. Обычный экспорт не анонимизирует весь отчёт. Проверьте файл перед публикацией: имена адаптеров, процессов, адреса, маршруты и другие чувствительные данные могут остаться.": "The support bundle enables masking of IP, MAC, computer name and SSID by default, and sections can be selected. Ordinary report export does not anonymize the entire report. Review the file before publishing: adapter and process names, addresses, routes and other sensitive data may remain.",
+  "Копировать IP": "Copy IP",
+  "Копировать цель (хост)": "Copy target (host)",
+  "Копировать строку": "Copy row",
+  "Открыть в MTR": "Open in MTR",
+  "Обзор / Диагноз": "Overview / Diagnosis",
+  "Качество / Bufferbloat": "Quality / Bufferbloat"
 }

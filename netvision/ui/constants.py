@@ -173,11 +173,11 @@ DASHBOARD_NETWORK_METRIC_TITLES = (
 )
 
 DASHBOARD_DASHBOARD_NAV_DEFINITIONS = (
-    ("overview", "Обзор и диагноз"),
+    ("overview", "Обзор / Диагноз"),
     ("routes", "Маршруты / Geo"),
     ("traceroute", "Трассировка / MTR"),
     ("interfaces", "Интерфейсы"),
-    ("quality", "Качество и Bufferbloat"),
+    ("quality", "Качество / Bufferbloat"),
     ("journal", "Журнал и UDP"),
 )
 

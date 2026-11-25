@@ -708,7 +708,7 @@ class DiagnosticsCoordinator(QObject):
                 "nat.measured",
                 subject="NAT/STUN",
                 template="NAT/STUN endpoints: {endpoints}",
-                values={"endpoints": endpoints},
+                values={"endpoints": "; ".join(endpoints) or "—"},
             )
             self.host._record_journal_event(
                 "nat.inferred",

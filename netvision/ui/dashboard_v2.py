@@ -12,6 +12,7 @@ from typing import Iterable
 
 from PySide6.QtCore import (
     QByteArray,
+    QEvent,
     QIODevice,
     QSaveFile,
     QObject,
@@ -118,6 +119,7 @@ from netvision.ui.utils import (
 )
 from netvision.version import display_version, window_title
 from netvision.ui.presentation import BUFFERBLOAT_HELP, MTR_HELP, MTU_HELP, NAT_HELP, target_mode
+from netvision.ui.windows_titlebar import apply_titlebar_theme
 
 
 class MetricCard(QFrame):
@@ -203,6 +205,20 @@ class NetVisionDashboardV2(QMainWindow):
     def __init__(self, *, bootstrap: bool = True) -> None:
         super().__init__()
         AppBootstrapper().bootstrap(self, bootstrap, MetricCard, SparklineWidget, _UiCallDispatcher)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if (
+            event.type() == QEvent.Type.WindowStateChange
+            and event.oldState() & Qt.WindowState.WindowMinimized
+            and not self.isMinimized()
+        ):
+            QTimer.singleShot(0, self._flush_restored_views)
+
+    def _flush_restored_views(self) -> None:
+        if not self.isMinimized() and not self._dashboard_closing:
+            self.history_controller.flush_visible_tables()
+            self.mtr_controller._render_pending_snapshot()
 
     @staticmethod
     def _format_session_elapsed(seconds: int) -> str:
@@ -2830,6 +2846,8 @@ class NetVisionDashboardV2(QMainWindow):
     @Slot(str)
     def _retranslate_ui(self, language: str) -> None:
         self._inherited__retranslate_ui(language)
+        if hasattr(self, "mtr_controller"):
+            self.mtr_controller.retranslate_traceroute_status()
         for label, caption in getattr(self, "_dashboard_udp_labels", ()):
             label.setText(self._tr(caption))
         if hasattr(self, "dashboard_quality_tabs"):
@@ -2851,6 +2869,7 @@ class NetVisionDashboardV2(QMainWindow):
         if self._theme == "light":
             style += ui_constants.CYBER_LIGHT_OVERRIDES
         self.setStyleSheet(style)
+        apply_titlebar_theme(self, self._theme == "dark")
 
     @Slot()
     def _dashboard_start_diagnostics(self) -> None:
