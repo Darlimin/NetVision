@@ -11,7 +11,7 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtGui import QWindowStateChangeEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -89,6 +89,7 @@ class UiRegressionTests(unittest.TestCase):
         self.window.close()
         self.assertTrue(self._wait_until(lambda: not self.window._worker_registry.busy))
         self.window.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
         self._snapshot_patch.stop()
         self._dns_config_patch.stop()

@@ -376,7 +376,8 @@ class CoreOverviewWorkspace(QWidget):
             "• 80 — для обычных HTTP-соединений",
             "Оставьте стандартное значение, если не уверены.",
         )
-        self.port_input.setFixedWidth(108)
+        self.port_input.setMinimumWidth(self.port_input.sizeHint().width())
+        self.port_input.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
         self.start_button = QPushButton("Запустить диагностику")
         self.start_button.clicked.connect(self.controller.start_diagnostic)

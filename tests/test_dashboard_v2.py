@@ -2,6 +2,7 @@ import gc
 import unittest
 from unittest.mock import patch
 
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QMessageBox, QScrollArea, QSizePolicy
 
 from netvision.core.mtu_optimizer import MtuOptimizerProbe, MtuOptimizerReport
@@ -59,7 +60,14 @@ class DashboardV2Tests(unittest.TestCase):
     def _close_window(self) -> None:
         if self.window is not None:
             self.window._quit_requested = True
+            self.window.dns_controller.stop()
+            self.window._worker_registry.stop_all()
+            self.assertTrue(self.window._worker_registry.wait_for_all(10000))
+            self.app.processEvents()
             self.window.close()
+            self.window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
         self.local_snapshot_patch.stop()
 
     def test_log_event_reaches_history_controller(self) -> None:

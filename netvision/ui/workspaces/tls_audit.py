@@ -149,7 +149,7 @@ class TlsAuditWorkspace(QFrame):
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.tls_handshake_table.horizontalHeader().sectionResized.connect(
-            lambda *_: self.tls_handshake_table.resizeRowsToContents()
+            lambda *_: self._resize_visible_rows(self.tls_handshake_table)
         )
         self.tls_handshake_table.setMinimumHeight(180)
         handshake_layout.addWidget(handshake_title)
@@ -184,6 +184,13 @@ class TlsAuditWorkspace(QFrame):
             ]
         )
         factory.configure_table(self.tls_certificate_table, (64, 145, 145, 100, 110, 110, 85, 160))
+        self.tls_certificate_table.setWordWrap(True)
+        self.tls_certificate_table.verticalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tls_certificate_table.horizontalHeader().sectionResized.connect(
+            lambda *_: self._resize_visible_rows(self.tls_certificate_table)
+        )
         self.tls_certificate_table.setMinimumHeight(210)
         certificate_layout.addWidget(certificate_title)
         certificate_layout.addWidget(self.tls_chain_note)
@@ -193,3 +200,8 @@ class TlsAuditWorkspace(QFrame):
 
         scroll.setWidget(content)
         outer_layout.addWidget(scroll)
+
+    @staticmethod
+    def _resize_visible_rows(table: QTableWidget) -> None:
+        if table.isVisible() and table.rowCount():
+            table.resizeRowsToContents()

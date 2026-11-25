@@ -137,7 +137,9 @@ class ProcessSelector(QFrame):
         self.network_ping_alarm_spin.setRange(50, 2000)
         self.network_ping_alarm_spin.setValue(int(controller._network_ping_alarm_threshold))
         self.network_ping_alarm_spin.setSuffix(" ms")
-        self.network_ping_alarm_spin.setFixedWidth(82)
+        self.network_ping_alarm_spin.setMinimumWidth(
+            self.network_ping_alarm_spin.sizeHint().width()
+        )
         self.network_ping_alarm_spin.valueChanged.connect(controller._save_network_alarm_settings)
         loss_alarm_label = QLabel(controller._tr("Потери >"))
         loss_alarm_label.setObjectName("Muted")
@@ -146,7 +148,9 @@ class ProcessSelector(QFrame):
         self.network_loss_alarm_spin.setDecimals(1)
         self.network_loss_alarm_spin.setValue(float(controller._network_loss_alarm_threshold))
         self.network_loss_alarm_spin.setSuffix(" %")
-        self.network_loss_alarm_spin.setFixedWidth(78)
+        self.network_loss_alarm_spin.setMinimumWidth(
+            self.network_loss_alarm_spin.sizeHint().width()
+        )
         self.network_loss_alarm_spin.valueChanged.connect(controller._save_network_alarm_settings)
         alarms_layout.addWidget(self.network_alarm_checkbox)
         alarms_layout.addWidget(ping_alarm_label)

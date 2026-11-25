@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import psutil
 
 from netvision.core.probes import _oem_encoding
+from netvision.core.windows_routes import collect_windows_default_routes
 from netvision.models import (
     DefaultRoute,
     GatewayInfo,
@@ -237,6 +238,10 @@ def _collect_interfaces() -> tuple[NetworkInterface, ...]:
 
 
 def _collect_default_routes(interfaces: tuple[NetworkInterface, ...]) -> tuple[DefaultRoute, ...]:
+    try:
+        return collect_windows_default_routes(interfaces)
+    except (OSError, AttributeError, ValueError):
+        pass
     completed = subprocess.run(
         ["route", "print", "-4"],
         capture_output=True,

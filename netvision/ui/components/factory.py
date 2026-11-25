@@ -1,6 +1,6 @@
 """Reusable construction helpers for common dashboard widgets."""
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -13,6 +13,27 @@ from PySide6.QtWidgets import (
 )
 
 from netvision.ui.utils import keep_wheel_scroll_local
+
+
+class _TableFontObserver(QObject):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._updating = False
+
+    def eventFilter(self, watched, event):
+        if not self._updating and event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.ApplicationFontChange,
+        ):
+            height = max(28, watched.fontMetrics().height() + 12)
+            header = watched.verticalHeader()
+            if header.defaultSectionSize() != height:
+                self._updating = True
+                try:
+                    header.setDefaultSectionSize(height)
+                finally:
+                    self._updating = False
+        return super().eventFilter(watched, event)
 
 
 def configure_table(table: QTableWidget, initial_widths: tuple[int, ...]) -> None:
@@ -47,7 +68,9 @@ def configure_table(table: QTableWidget, initial_widths: tuple[int, ...]) -> Non
     vertical_header = table.verticalHeader()
     vertical_header.setVisible(False)
     vertical_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-    vertical_header.setDefaultSectionSize(28)
+    vertical_header.setDefaultSectionSize(max(28, table.fontMetrics().height() + 12))
+    observer = _TableFontObserver(table)
+    table.installEventFilter(observer)
 
 
 def make_scroll_area(content: QWidget) -> QScrollArea:
