@@ -79,6 +79,9 @@ class WifiSnapshot:
     rx_mbps: float | None
     tx_mbps: float | None
     gateway_rtt_ms: float | None = None
+    rssi_dbm: int | None = None
+    profile: str | None = None
+    authentication: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

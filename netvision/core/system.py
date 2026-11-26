@@ -13,6 +13,7 @@ import psutil
 
 from netvision.core.probes import _oem_encoding
 from netvision.core.windows_routes import collect_windows_default_routes
+from netvision.core.windows_wlan import collect_windows_wifi
 from netvision.models import (
     DefaultRoute,
     GatewayInfo,
@@ -143,6 +144,14 @@ def collect_wifi_snapshot(
     """Return route Wi-Fi data, or the physical Wi-Fi link behind a VPN route."""
     if not route_interface:
         return None
+    snapshots = collect_windows_wifi()
+    if snapshots is not None:
+        matched = next((item for item in snapshots if item.interface_name == route_interface), None)
+        return (
+            matched
+            if matched is not None or not allow_vpn_fallback
+            else (snapshots[0] if snapshots else None)
+        )
     completed = subprocess.run(
         ["netsh", "wlan", "show", "interfaces"],
         capture_output=True,
