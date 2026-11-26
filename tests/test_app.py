@@ -39,7 +39,7 @@ def test_main_installs_crash_handler_once() -> None:
 
     assert result.value.code == 0
     setup_handler.assert_called_once_with()
-    qt_application.setApplicationDisplayName.assert_called_once_with("NetVision V 0.10.6")
+    qt_application.setApplicationDisplayName.assert_called_once_with("NetVision V 0.10.7")
     timer.singleShot.assert_called_once_with(0, window.process_controller.refresh_processes)
 
 

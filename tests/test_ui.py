@@ -1284,9 +1284,9 @@ class MainWindowReportTests(unittest.TestCase):
         window = NetVisionDashboardV2(bootstrap=False)
 
         self.assertEqual(window.header_panel.language_combo.currentData(), "ru")
-        self.assertEqual(window.windowTitle(), "NetVision V 0.10.6")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.7")
         self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
-        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.6")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.7")
         self.assertTrue(
             all(
                 "_" not in button.text()
@@ -1302,9 +1302,9 @@ class MainWindowReportTests(unittest.TestCase):
         window.header_panel.language_combo.setCurrentIndex(1)
 
         self.assertEqual(window._language, "en")
-        self.assertEqual(window.windowTitle(), "NetVision V 0.10.6")
+        self.assertEqual(window.windowTitle(), "NetVision V 0.10.7")
         self.assertEqual(window.core_workspace.sidebar_brand.text(), "NETVISION")
-        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.6")
+        self.assertEqual(window.core_workspace.sidebar_version.text(), "V 0.10.7")
         self.assertTrue(
             all(
                 "_" not in button.text()
@@ -1334,7 +1334,7 @@ class MainWindowReportTests(unittest.TestCase):
         def inspect_dialog() -> None:
             dialog = window._help_dialog
             self.assertTrue(dialog.isModal())
-            self.assertEqual(dialog.windowTitle(), "Справка · NetVision V 0.10.6")
+            self.assertEqual(dialog.windowTitle(), "Справка · NetVision V 0.10.7")
             self.assertLessEqual(
                 dialog.height(), int(dialog.screen().availableGeometry().height() * 0.85)
             )
@@ -1368,7 +1368,7 @@ class MainWindowReportTests(unittest.TestCase):
                     dialog.tabs.tabBar().tabRect(4).right(), dialog.tabs.tabBar().width()
                 )
             window.header_panel.language_combo.setCurrentIndex(1)
-            self.assertEqual(dialog.windowTitle(), "Help · NetVision V 0.10.6")
+            self.assertEqual(dialog.windowTitle(), "Help · NetVision V 0.10.7")
             self.assertEqual(
                 [dialog.tabs.tabText(index) for index in range(5)],
                 ["Quick start", "Program sections", "How to read numbers", "Glossary", "FAQ"],
@@ -1395,7 +1395,7 @@ class MainWindowReportTests(unittest.TestCase):
                 any("Local address translation" in label.text() for label, _ in dialog._labels)
             )
             window.header_panel.language_combo.setCurrentIndex(0)
-            self.assertEqual(dialog.windowTitle(), "Справка · NetVision V 0.10.6")
+            self.assertEqual(dialog.windowTitle(), "Справка · NetVision V 0.10.7")
             seen.append(True)
             dialog.accept()
 
