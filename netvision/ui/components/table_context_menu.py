@@ -33,7 +33,35 @@ def find_target(text: str) -> tuple[str, bool] | None:
     return None
 
 
-def create_menu(host, table, row: int, target_columns: tuple[int, ...], open_mtr: bool) -> QMenu:
+def parse_remote_endpoint(text: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"(?:\[([^\]]+)\]|([^:\s]+)):(\d{1,5})", text.strip())
+    if not match:
+        return None
+    address = match.group(1) or match.group(2)
+    port = int(match.group(3))
+    if not 1 <= port <= 65535:
+        return None
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        target = find_target(address)
+        if not target or target[1] or target[0].casefold() != address.casefold():
+            return None
+        return target[0], port
+    if ip.is_loopback or ip.is_unspecified:
+        return None
+    return str(ip), port
+
+
+def create_menu(
+    host,
+    table,
+    row: int,
+    target_columns: tuple[int, ...],
+    open_mtr: bool,
+    *,
+    socket_matrix: bool = False,
+) -> QMenu:
     menu = QMenu(table)
     menu.setObjectName("DiagnosticContextMenu")
     light = host._theme == "light"
@@ -52,14 +80,17 @@ def create_menu(host, table, row: int, target_columns: tuple[int, ...], open_mtr
         table.item(row, col).text() if table.item(row, col) else ""
         for col in range(table.columnCount())
     ]
-    target = next(
-        (
-            result
-            for col in target_columns
-            if col < len(values) and (result := find_target(values[col]))
-        ),
-        None,
-    )
+    endpoint = parse_remote_endpoint(values[2]) if socket_matrix and len(values) > 2 else None
+    target = (endpoint[0], bool(_is_ip(endpoint[0]))) if endpoint else None
+    if not socket_matrix:
+        target = next(
+            (
+                result
+                for col in target_columns
+                if col < len(values) and (result := find_target(values[col]))
+            ),
+            None,
+        )
     if target:
         address, is_ip = target
         action = menu.addAction(host._tr("Копировать IP" if is_ip else "Копировать цель (хост)"))
@@ -77,10 +108,29 @@ def create_menu(host, table, row: int, target_columns: tuple[int, ...], open_mtr
             host.mtr_workspace.traceroute_mode_tabs.setCurrentIndex(1)
 
         menu.addAction(host._tr("Открыть в MTR")).triggered.connect(navigate)
+    if endpoint:
+
+        def apply_endpoint():
+            address, port = endpoint
+            host.apply_endpoint_target(address, port)
+
+        menu.addAction(host._tr("Подставить в проверку порта / TLS")).triggered.connect(
+            apply_endpoint
+        )
     return menu
 
 
-def install_context_menu(host, table, target_columns: tuple[int, ...], *, open_mtr: bool) -> None:
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def install_context_menu(
+    host, table, target_columns: tuple[int, ...], *, open_mtr: bool, socket_matrix: bool = False
+) -> None:
     table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
     def show_menu(point):
@@ -88,7 +138,7 @@ def install_context_menu(host, table, target_columns: tuple[int, ...], *, open_m
         if row < 0:
             return
         table.selectRow(row)
-        menu = create_menu(host, table, row, target_columns, open_mtr)
+        menu = create_menu(host, table, row, target_columns, open_mtr, socket_matrix=socket_matrix)
         if menu.actions():
             menu.aboutToHide.connect(menu.deleteLater)
             menu.popup(table.viewport().mapToGlobal(point))

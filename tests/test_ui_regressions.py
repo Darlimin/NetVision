@@ -36,7 +36,11 @@ from netvision.models import (
 from netvision.reporting import serialize_support_bundle
 from netvision.ui.controllers.dns_audit import DnsController
 from netvision.ui.dashboard_v2 import NetVisionDashboardV2
-from netvision.ui.components.table_context_menu import create_menu, find_target
+from netvision.ui.components.table_context_menu import (
+    create_menu,
+    find_target,
+    parse_remote_endpoint,
+)
 
 
 class _QuietMtrWorker(QObject):
@@ -148,6 +152,45 @@ class UiRegressionTests(unittest.TestCase):
         self.assertIsNone(find_target("UDP-порт 443 появился у PID 123"))
         self.assertEqual(find_target("192.0.2.1:443"), ("192.0.2.1", True))
         self.assertEqual(find_target("[2001:db8::1]:443"), ("2001:db8::1", True))
+
+    def test_tcp_matrix_context_menu_uses_remote_endpoint(self) -> None:
+        table = self.window.tcp_workspace.tcp_sockets_table
+        table.setRowCount(1)
+        table.setItem(0, 1, QTableWidgetItem("192.168.1.2:12345"))
+        table.setItem(0, 2, QTableWidgetItem("104.18.26.48:443"))
+        menu = create_menu(self.window, table, 0, (2,), True, socket_matrix=True)
+        self.assertEqual(table.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
+        menu.actions()[0].trigger()
+        self.assertEqual(self.app.clipboard().text(), "104.18.26.48")
+        menu.actions()[1].trigger()
+        self.assertIn("192.168.1.2:12345", self.app.clipboard().text())
+        menu.actions()[3].trigger()
+        self.window._dashboard_sync_controls()
+        self.assertEqual(self.window.tcp_workspace.tcp_target_input.text(), "104.18.26.48")
+        self.assertEqual(self.window.tcp_workspace.tcp_ports_input.text(), "443")
+        self.assertEqual(self.window.tls_workspace.tls_port_input.value(), 443)
+        self.assertEqual(self.window.tls_workspace.tls_target_input.text(), "104.18.26.48")
+        self.assertEqual(self.window.core_workspace.dashboard_target_input.text(), "104.18.26.48")
+        self.assertEqual(self.window.core_workspace.dashboard_port_input.value(), 443)
+        menu.actions()[2].trigger()
+        self.assertEqual(self.window.mtr_workspace.traceroute_mode_tabs.currentIndex(), 1)
+        self.assertEqual(self.window.mtr_workspace.traceroute_target_input.text(), "104.18.26.48")
+        self.assertIsNone(self.window._mtr_worker)
+        menu.deleteLater()
+
+        self.window.header_panel.language_combo.setCurrentIndex(1)
+        menu = create_menu(self.window, table, 0, (2,), True, socket_matrix=True)
+        self.assertEqual(menu.actions()[3].text(), "Use for port / TLS check")
+        menu.deleteLater()
+        table.item(0, 2).setText("--")
+        menu = create_menu(self.window, table, 0, (2,), True, socket_matrix=True)
+        self.assertEqual([action.text() for action in menu.actions()], ["Copy row"])
+        menu.deleteLater()
+
+    def test_remote_endpoint_normalizes_ipv6_and_rejects_local(self) -> None:
+        self.assertEqual(parse_remote_endpoint("[2001:0db8:0:0:0:0:0:1]:443"), ("2001:db8::1", 443))
+        for value in ("127.0.0.1:8080", "[::1]:443", "0.0.0.0:80", "[::]:80"):
+            self.assertIsNone(parse_remote_endpoint(value))
 
     def test_traceroute_result_retranslates(self) -> None:
         hop = TracerouteHop(1, "192.0.2.1", None, 2.0, "ok", False)

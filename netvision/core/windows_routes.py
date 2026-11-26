@@ -77,7 +77,12 @@ def _select_address(candidates, gateway: str) -> str:
         return (not matches, ip.is_link_local, ip.is_loopback, -network.prefixlen)
 
     try:
-        return min(candidates, key=rank)[0]
+        ranked = [(rank(candidate), candidate[0]) for candidate in candidates]
+        best = min(item[0] for item in ranked)
+        addresses = {address for priority, address in ranked if priority == best}
+        if len(addresses) != 1:
+            raise OSError("Ambiguous IPv4 source address")
+        return addresses.pop()
     except (ValueError, TypeError) as exc:
         raise OSError("Invalid interface address or mask") from exc
 

@@ -1074,5 +1074,6 @@
   "Копировать строку": "Copy row",
   "Открыть в MTR": "Open in MTR",
   "Обзор / Диагноз": "Overview / Diagnosis",
-  "Качество / Bufferbloat": "Quality / Bufferbloat"
+  "Качество / Bufferbloat": "Quality / Bufferbloat",
+  "Подставить в проверку порта / TLS": "Use for port / TLS check"
 }

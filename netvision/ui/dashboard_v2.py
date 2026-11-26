@@ -2891,6 +2891,16 @@ class NetVisionDashboardV2(QMainWindow):
     def _dashboard_sync_tcp_ports(self, port: int) -> None:
         self.tcp_workspace.tcp_ports_input.setText(str(port))
 
+    def apply_endpoint_target(self, host: str, port: int) -> None:
+        self.core_workspace.target_input.setText(host)
+        self.core_workspace.port_input.setValue(port)
+        self.core_workspace.dashboard_target_input.setText(host)
+        self.core_workspace.dashboard_port_input.setValue(port)
+        self.tcp_workspace.tcp_target_input.setText(host)
+        self.tcp_workspace.tcp_ports_input.setText(str(port))
+        self.tls_workspace.tls_target_input.setText(host)
+        self.tls_workspace.tls_port_input.setValue(port)
+
     @Slot(int)
     def _dashboard_apply_port(self, value: int | None = None) -> None:
         if self._dashboard_syncing:

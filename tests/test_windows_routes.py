@@ -67,3 +67,15 @@ def test_multiple_addresses_select_gateway_subnet():
     assert convert_default_routes([row], addresses, ())[0].local_address == "192.168.1.9"
     with pytest.raises(OSError, match="no IPv4"):
         convert_default_routes([row], {}, ())
+
+
+def test_multiple_equal_best_addresses_request_fallback():
+    row = _ForwardRow(
+        destination=0, mask=0, next_hop=_number("192.168.1.1"), index=3, kind=4, metric=5
+    )
+    with pytest.raises(OSError, match="Ambiguous"):
+        convert_default_routes(
+            [row],
+            {3: [("192.168.1.9", "255.255.255.0"), ("192.168.1.10", "255.255.255.0")]},
+            (),
+        )

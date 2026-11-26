@@ -10,6 +10,7 @@ from netvision.core.tcp_diagnostics import TcpConnectMeasurement, TcpSocketRecor
 from netvision.ui import constants as ui_constants
 from netvision.ui.utils import _ms
 from netvision.ui.workspaces.tcp_audit import TcpAuditWorkspace
+from netvision.ui.components.table_context_menu import install_context_menu
 
 
 class TcpAuditController(QObject):
@@ -18,6 +19,9 @@ class TcpAuditController(QObject):
         self.host = parent
         self.workspace = workspace
         self.facts = facts
+        install_context_menu(
+            parent, workspace.tcp_sockets_table, (2,), open_mtr=True, socket_matrix=True
+        )
         workspace.tcp_run_button.clicked.connect(self.start_tcp_diagnostics)
 
     def stop(self) -> None:
