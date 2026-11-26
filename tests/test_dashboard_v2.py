@@ -76,6 +76,123 @@ class DashboardV2Tests(unittest.TestCase):
             self.app.processEvents()
         append_log.assert_called_once_with("Проверка шины")
 
+    def test_system_network_navigation_and_retranslation(self) -> None:
+        from datetime import datetime, timezone
+        from netvision.core.traffic_path import (
+            TrafficPathSnapshot,
+            KernelRouteInfo,
+            SystemProxyInfo,
+            DnsPolicyInfo,
+            EgressPathInfo,
+            SocketChannelSummary,
+        )
+
+        workspace = self.window.system_network_workspace
+        buttons = list(self.window.core_workspace.dashboard_nav_buttons)
+        self.assertEqual(buttons.index("system_network"), buttons.index("journal") + 1)
+        self.assertFalse(workspace.started)
+        with patch.object(workspace, "refresh") as refresh:
+            self.window._show_dashboard_section("system_network")
+            refresh.assert_called_once()
+        self.assertIs(self.window.workspace_tabs.currentWidget(), workspace)
+        snapshot = TrafficPathSnapshot(
+            datetime.now(timezone.utc),
+            KernelRouteInfo(mode="split_tunnel"),
+            SystemProxyInfo(enabled=True),
+            DnsPolicyInfo(),
+            EgressPathInfo(direct_ip="1.1.1.1", proxy_ip="8.8.8.8", differs_from_direct=True),
+            (SocketChannelSummary("vpn_tun", "VPN", "10.0.0.1", 2, ("app",)),),
+        )
+        workspace._received(snapshot)
+        self.assertEqual(workspace.table.rowCount(), 1)
+        workspace.copy_summary()
+        self.assertIn("Маршрут", self.app.clipboard().text())
+        self.window._translator.set_language("en")
+        workspace.copy_summary()
+        self.assertIn("Route", self.app.clipboard().text())
+        self.assertEqual(workspace.refresh_button.text(), "Refresh snapshot")
+
+    def test_system_network_loads_lazily_and_refreshes(self) -> None:
+        from datetime import datetime, timezone
+        from PySide6.QtTest import QTest
+        from netvision.core.traffic_path import (
+            TrafficPathSnapshot,
+            KernelRouteInfo,
+            SystemProxyInfo,
+            DnsPolicyInfo,
+            EgressPathInfo,
+        )
+
+        workspace = self.window.system_network_workspace
+        snapshot = TrafficPathSnapshot(
+            datetime.now(timezone.utc),
+            KernelRouteInfo(),
+            SystemProxyInfo(),
+            DnsPolicyInfo(),
+            EgressPathInfo(),
+        )
+        with patch(
+            "netvision.ui.workspaces.system_network.collect_traffic_path_snapshot",
+            return_value=snapshot,
+        ) as collect:
+            self.assertEqual(collect.call_count, 0)
+            self.window._show_dashboard_section("system_network")
+            for _ in range(100):
+                self.app.processEvents()
+                if workspace.thread is None:
+                    break
+                QTest.qWait(10)
+            self.assertIs(workspace.snapshot, snapshot)
+            self.assertEqual(collect.call_count, 1)
+            workspace.refresh_button.click()
+            for _ in range(100):
+                self.app.processEvents()
+                if workspace.thread is None:
+                    break
+                QTest.qWait(10)
+            self.assertEqual(collect.call_count, 2)
+
+    def test_system_network_layout_and_themes(self) -> None:
+        from datetime import datetime, timezone
+        from netvision.core.traffic_path import (
+            TrafficPathSnapshot,
+            KernelRouteInfo,
+            SystemProxyInfo,
+            DnsPolicyInfo,
+            EgressPathInfo,
+        )
+
+        self.window.resize(1280, 720)
+        self.window.show()
+        with patch.object(self.window.system_network_workspace, "refresh"):
+            self.window._show_dashboard_section("system_network")
+        self.app.processEvents()
+        workspace = self.window.system_network_workspace
+        snapshot = TrafficPathSnapshot(
+            datetime.now(timezone.utc),
+            KernelRouteInfo(),
+            SystemProxyInfo(pac_url="https://example.com/" + "longpath" * 35),
+            DnsPolicyInfo(servers=tuple(f"192.168.1.{i}" for i in range(1, 20))),
+            EgressPathInfo(),
+        )
+        workspace._received(snapshot)
+        self.app.processEvents()
+        self.assertTrue(workspace.isVisible())
+        self.assertGreaterEqual(
+            workspace.table.columnWidth(0),
+            workspace.table.fontMetrics().horizontalAdvance("Физический адаптер") + 24,
+        )
+        for _ in range(2):
+            self.window._toggle_theme()
+            self.app.processEvents()
+            self.assertLessEqual(workspace.width(), self.window.width())
+            self.assertLessEqual(workspace.height(), self.window.height())
+            self.assertEqual(workspace.scroll.horizontalScrollBar().maximum(), 0)
+            self.assertTrue(
+                all(label.width() > 0 and value.width() > 0 for label, value in workspace.cards)
+            )
+            self.assertTrue(workspace.table.isVisibleTo(self.window))
+
     def test_timer_registry_preserves_configuration_and_stops_timers(self) -> None:
         registry = self.window.timer_registry
         self.assertIs(registry.parent(), self.window)

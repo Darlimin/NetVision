@@ -30,6 +30,7 @@ from netvision.ui.workspaces.process_selector import ProcessSelector
 from netvision.ui.workspaces.ping_audit import PingWorkspace
 from netvision.ui.workspaces.expert_view import ExpertView
 from netvision.ui.workspaces.core_workspace import CoreOverviewWorkspace
+from netvision.ui.workspaces.system_network import SystemNetworkWorkspace
 from netvision.ui.controllers.tcp_audit import TcpAuditController
 from netvision.ui.controllers.tls_audit import TlsAuditController
 from netvision.ui.controllers.mtr_audit import MtrController
@@ -239,4 +240,6 @@ class DashboardBuilder:
         host.history_workspace.history_clear_button.clicked.connect(host._clear_test_history)
         host._refresh_history_view()
         tabs.addTab(host.history_workspace, "История / Тренды")
+        host.system_network_workspace = SystemNetworkWorkspace(host)
+        tabs.addTab(host.system_network_workspace, "Системная сеть")
         return tabs

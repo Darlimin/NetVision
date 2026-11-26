@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from collections import Counter
+from concurrent.futures import CancelledError
+from threading import Event
 
 from netvision.core.system import (
     _collect_default_routes,
@@ -127,6 +129,19 @@ def _registry_value(root, path: str, name: str):
         return None
 
 
+def _registry_policy(root, path: str, name: str):
+    """Distinguish absent policy from an inaccessible registry key."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(root, path) as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except FileNotFoundError:
+        return 0
+    except (ImportError, OSError):
+        return None
+
+
 def _sanitize_url(value: str) -> str:
     try:
         raw = value if "://" in value else "http://" + value
@@ -156,7 +171,7 @@ def _sanitize_pac(value: str) -> str:
         return "<PAC configured>"
 
 
-def _winhttp_proxy() -> str | None:
+def _read_winhttp_proxy() -> str | None:
     if sys.platform != "win32":
         return None
 
@@ -181,7 +196,7 @@ def _winhttp_proxy() -> str | None:
             return None
         try:
             value = ctypes.wstring_at(config.proxy) if config.proxy else None
-            return _sanitize_url(value) if value else None
+            return value
         finally:
             if config.proxy:
                 free(config.proxy)
@@ -189,6 +204,11 @@ def _winhttp_proxy() -> str | None:
                 free(config.bypass)
     except (OSError, AttributeError, ValueError):
         return None
+
+
+def _winhttp_proxy() -> str | None:
+    raw = _read_winhttp_proxy()
+    return _proxy_entries(raw)[1] if raw else None
 
 
 def _proxy_entries(value: str) -> tuple[str | None, str | None]:
@@ -283,7 +303,7 @@ def _dns_policy() -> DnsPolicyInfo:
     try:
         import winreg
 
-        doh = _registry_value(
+        doh = _registry_policy(
             winreg.HKEY_LOCAL_MACHINE,
             r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters",
             "EnableAutoDoh",
@@ -292,6 +312,8 @@ def _dns_policy() -> DnsPolicyInfo:
         try:
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
                 count = winreg.QueryInfoKey(key)[0]
+        except FileNotFoundError:
+            count = 0
         except OSError:
             count = None
         return DnsPolicyInfo(servers, bool(doh) if doh is not None else None, count)
@@ -474,14 +496,20 @@ def _has_vpn_route(interfaces) -> bool:
 
 
 def collect_traffic_path_snapshot(
-    include_egress: bool = True, timeout: float = 4.0
+    include_egress: bool = True, timeout: float = 4.0, cancel_event: Event | None = None
 ) -> TrafficPathSnapshot:
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+
+    check_cancelled()
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     interfaces = ()
     routes = ()
     try:
         interfaces = _collect_interfaces()
+        check_cancelled()
         routes = _collect_default_routes(interfaces)
         try:
             best = _best_route()
@@ -507,7 +535,9 @@ def collect_traffic_path_snapshot(
         )
     except (OSError, ValueError):
         route = KernelRouteInfo()
+    check_cancelled()
     proxy = _proxy_info()
+    check_cancelled()
     channels = _channels(interfaces, proxy)
     active_channels = {channel.channel for channel in channels if channel.count}
     vpn_active = any(interface.kind == "VPN" and interface.is_up for interface in interfaces)
@@ -531,15 +561,26 @@ def collect_traffic_path_snapshot(
     ):
         route = replace(route, mode="split_tunnel")
     if include_egress:
-        direct = _egress(None, timeout)
+        check_cancelled()
+        request_timeout = min(timeout, 1.0) if cancel_event is not None else timeout
+        direct = _egress(None, request_timeout)
+        check_cancelled()
         selected_proxy, _ = _proxy_entries(_raw_proxy())
-        if proxy.pac_active and not selected_proxy:
+        if proxy.pac_active and not (proxy.enabled and selected_proxy):
             proxied = (None, None, None, None, "PAC evaluation unavailable")
         elif proxy.enabled and selected_proxy:
             if selected_proxy.startswith("socks"):
                 proxied = (None, None, None, None, "SOCKS proxy unsupported")
             else:
-                proxied = _egress(selected_proxy, timeout)
+                proxied = _egress(selected_proxy, request_timeout)
+        elif proxy.winhttp:
+            selected_proxy, _ = _proxy_entries(_read_winhttp_proxy() or "")
+            if selected_proxy and selected_proxy.lower().startswith("socks"):
+                proxied = (None, None, None, None, "SOCKS proxy unsupported")
+            elif selected_proxy:
+                proxied = _egress(selected_proxy, request_timeout)
+            else:
+                proxied = (None, None, None, None, "Proxy configuration unavailable")
         else:
             proxied = (None, None, None, None, None)
         egress = EgressPathInfo(
@@ -549,11 +590,14 @@ def collect_traffic_path_snapshot(
         )
     else:
         egress = EgressPathInfo()
+    check_cancelled()
+    dns = _dns_policy()
+    check_cancelled()
     return TrafficPathSnapshot(
         datetime.now(timezone.utc),
         route,
         proxy,
-        _dns_policy(),
+        dns,
         egress,
         channels,
     )
@@ -570,6 +614,7 @@ def format_traffic_path_summary(snapshot: TrafficPathSnapshot, lang: str = "ru")
     proxy = snapshot.proxy
     # Values can come from persisted snapshots; redact again at the presentation boundary.
     _, server = _proxy_entries(proxy.server or "")
+    _, winhttp = _proxy_entries(proxy.winhttp or "")
     modes = {
         "direct": "Direct" if en else "Прямой",
         "vpn_tun": "VPN (TUN)",
@@ -590,19 +635,25 @@ def format_traffic_path_summary(snapshot: TrafficPathSnapshot, lang: str = "ru")
         or unknown
     )
     safe_errors = {
-        "Proxy authentication required (HTTP 407)",
-        "PAC evaluation unavailable",
-        "SOCKS proxy unsupported",
+        "Proxy authentication required (HTTP 407)": "Требуется авторизация прокси (HTTP 407)",
+        "PAC evaluation unavailable": "Вычисление PAC недоступно",
+        "SOCKS proxy unsupported": "Проверка через SOCKS не поддерживается",
+        "Proxy configuration unavailable": "Настройки прокси недоступны",
     }
 
     def endpoint(ip, asn, provider, country, error):
-        details = ", ".join(str(v) for v in (asn, provider, country) if v)
+        formatted_asn = str(asn) if asn else ""
+        if formatted_asn and not formatted_asn.upper().startswith("AS"):
+            formatted_asn = "AS" + formatted_asn
+        details = ", ".join(str(v) for v in (formatted_asn, provider, country) if v)
         value = ip or unknown
         if details:
             value += f" ({details})"
         if error:
             value += " · " + (
-                error if error in safe_errors else ("Request failed" if en else "Ошибка запроса")
+                (error if en else safe_errors[error])
+                if error in safe_errors
+                else ("Request failed" if en else "Ошибка запроса")
             )
         return value
 
@@ -610,23 +661,31 @@ def format_traffic_path_summary(snapshot: TrafficPathSnapshot, lang: str = "ru")
         v
         for v in (
             server,
-            _sanitize_url(proxy.winhttp) if proxy.winhttp else None,
+            winhttp,
             _sanitize_pac(proxy.pac_url) if proxy.pac_url else None,
         )
         if v
     ]
-    proxy_text = " · ".join(proxy_parts) or ("not configured" if en else "не настроен")
+    proxy_text = " · ".join(proxy_parts) or ("Not configured" if en else "Не настроен")
     if proxy.owner_pid:
         proxy_text += f" · PID {proxy.owner_pid}"
     if proxy.owner_name:
         proxy_text += f" · {proxy.owner_name}"
     dns = snapshot.dns
     doh = (
-        ("enabled" if en else "включён")
-        if dns.doh_enabled
-        else ("not detected" if en else "не обнаружен")
+        ("unavailable" if en else "недоступно")
+        if dns.doh_enabled is None
+        else (
+            ("enabled" if en else "включён")
+            if dns.doh_enabled
+            else ("not detected" if en else "не обнаружен")
+        )
     )
-    nrpt = str(dns.nrpt_rules) if dns.nrpt_rules else ("no rules" if en else "нет правил")
+    nrpt = (
+        ("unavailable" if en else "недоступно")
+        if dns.nrpt_rules is None
+        else (str(dns.nrpt_rules) if dns.nrpt_rules else ("no rules" if en else "нет правил"))
+    )
     e = snapshot.egress
     egress = endpoint(
         e.direct_ip, e.direct_asn, e.direct_provider, e.direct_country, e.direct_error
@@ -644,7 +703,17 @@ def format_traffic_path_summary(snapshot: TrafficPathSnapshot, lang: str = "ru")
     return "\n".join(
         (
             f"{labels[0]}: {modes.get(snapshot.route.mode, unknown)} · {snapshot.route.adapter or unknown} · {snapshot.route.local_ip or unknown} · {snapshot.route.gateway or unknown}"
-            + (f" · metric {snapshot.route.metric}" if snapshot.route.metric is not None else ""),
+            + (
+                f" · {'Metric' if en else 'Метрика'} {snapshot.route.metric}"
+                if snapshot.route.metric is not None
+                else ""
+            )
+            + " · "
+            + (
+                "Windows API"
+                if snapshot.route.source == "windows_api"
+                else ("Fallback (route)" if en else "Резервный (route)")
+            ),
             f"{labels[1]}: {proxy_text}",
             f"{labels[2]}: {', '.join(dns.servers) or unknown} · DoH: {doh} · NRPT: {nrpt}",
             f"{labels[3]}: {egress}",

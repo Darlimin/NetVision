@@ -2684,6 +2684,15 @@ class NetVisionDashboardV2(QMainWindow):
         self.dashboard_stack.setCurrentWidget(self.dashboard_overview)
 
     def _show_dashboard_detail_section(self, section: str) -> None:
+        if section == "system_network":
+            self.core_workspace.dashboard_details_stack.setCurrentWidget(self.workspace_tabs)
+            index = self.workspace_tabs.indexOf(self.system_network_workspace)
+            if index >= 0:
+                self.workspace_tabs.setCurrentIndex(index)
+                self._ensure_workspace_visibility(index)
+                if not self.system_network_workspace.started:
+                    self.system_network_workspace.refresh()
+            return
         if section in ui_constants.QUALITY_TABS:
             self.core_workspace.dashboard_details_stack.setCurrentWidget(
                 self.dashboard_quality_tabs

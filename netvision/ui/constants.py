@@ -179,6 +179,7 @@ DASHBOARD_DASHBOARD_NAV_DEFINITIONS = (
     ("interfaces", "Интерфейсы"),
     ("quality", "Качество / Bufferbloat"),
     ("journal", "Журнал и UDP"),
+    ("system_network", "Системная сеть"),
 )
 
 DASHBOARD_DASHBOARD_METRIC_DEFINITIONS = (

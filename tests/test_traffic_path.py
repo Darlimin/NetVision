@@ -9,6 +9,86 @@ from netvision.core.traffic_path import (
 from unittest.mock import patch
 
 
+def test_winhttp_only_egress_and_cancellation():
+    from concurrent.futures import CancelledError
+    from threading import Event
+    import pytest
+
+    event = Event()
+    event.set()
+    with patch("netvision.core.traffic_path._collect_interfaces") as collect:
+        with pytest.raises(CancelledError):
+            collect_traffic_path_snapshot(cancel_event=event)
+        collect.assert_not_called()
+    with (
+        patch("netvision.core.traffic_path._collect_interfaces", return_value=()),
+        patch("netvision.core.traffic_path._collect_default_routes", return_value=()),
+        patch(
+            "netvision.core.traffic_path._proxy_info",
+            return_value=SystemProxyInfo(winhttp="http://proxy:8080"),
+        ),
+        patch("netvision.core.traffic_path._raw_proxy", return_value=""),
+        patch("netvision.core.traffic_path._read_winhttp_proxy", return_value="proxy:8080"),
+        patch("netvision.core.traffic_path._channels", return_value=()),
+        patch("netvision.core.traffic_path._dns_policy", return_value=DnsPolicyInfo()),
+        patch(
+            "netvision.core.traffic_path._egress",
+            side_effect=[("1.1.1.1", None, None, None, None), ("8.8.8.8", None, None, None, None)],
+        ) as egress,
+    ):
+        snapshot = collect_traffic_path_snapshot()
+    assert snapshot.egress.proxy_ip == "8.8.8.8"
+    assert egress.call_args.args[0] == "proxy:8080"
+
+
+def test_summary_localizes_errors_and_unknown_dns():
+    from datetime import datetime, timezone
+    from netvision.core.traffic_path import TrafficPathSnapshot, KernelRouteInfo, EgressPathInfo
+
+    for error, expected in (
+        ("Proxy authentication required (HTTP 407)", "Требуется авторизация"),
+        ("PAC evaluation unavailable", "Вычисление PAC"),
+        ("SOCKS proxy unsupported", "через SOCKS"),
+    ):
+        snapshot = TrafficPathSnapshot(
+            datetime.now(timezone.utc),
+            KernelRouteInfo(metric=7),
+            SystemProxyInfo(enabled=True),
+            DnsPolicyInfo(),
+            EgressPathInfo(proxy_error=error),
+        )
+        ru = format_traffic_path_summary(snapshot, "ru")
+        en = format_traffic_path_summary(snapshot, "en")
+        assert expected in ru and error in en and "Метрика 7" in ru and "Metric 7" in en
+        assert "DoH: недоступно" in ru and "NRPT: недоступно" in ru
+        assert "DoH: unavailable" in en and "NRPT: unavailable" in en
+    snapshot = TrafficPathSnapshot(
+        datetime.now(timezone.utc),
+        KernelRouteInfo(),
+        SystemProxyInfo(),
+        DnsPolicyInfo(doh_enabled=False, nrpt_rules=0),
+        EgressPathInfo(),
+    )
+    assert "DoH: не обнаружен · NRPT: нет правил" in format_traffic_path_summary(snapshot)
+
+
+def test_missing_and_inaccessible_registry_are_distinct():
+    import pytest
+    from netvision.core.traffic_path import _dns_policy
+
+    pytest.importorskip("winreg")
+    with patch(
+        "netvision.core.traffic_path.collect_dns_configuration",
+        return_value=type("Dns", (), {"servers": ()})(),
+    ):
+        with patch("winreg.OpenKey", side_effect=FileNotFoundError()):
+            dns = _dns_policy()
+            assert dns.doh_enabled is False and dns.nrpt_rules == 0
+        with patch("winreg.OpenKey", side_effect=PermissionError()):
+            dns = _dns_policy()
+            assert dns.doh_enabled is None and dns.nrpt_rules is None
+
+
 def test_proxy_credentials_removed():
     assert _sanitize_url("http://user:secret@example.com:8080") == "http://example.com:8080"
 
@@ -265,7 +345,7 @@ def test_summary_has_no_raw_keys_or_empty_proxy_block():
         text = format_traffic_path_summary(snapshot, lang)
         assert "None" not in text and "vpn_tun" not in text and "differs:" not in text
         assert "1.1.1.1 /" not in text
-        assert "не настроен" in text if lang == "ru" else "not configured" in text
+        assert "не настроен" in text.lower() if lang == "ru" else "not configured" in text.lower()
 
 
 def test_winhttp_abi_and_registry_fallback():
@@ -313,7 +393,8 @@ def test_winhttp_abi_and_registry_fallback():
             "netvision.core.traffic_path.collect_dns_configuration",
             side_effect=OSError("unavailable"),
         ),
-        patch("netvision.core.traffic_path._registry_value", return_value=None),
+        patch("netvision.core.traffic_path._registry_policy", return_value=None),
+        patch("winreg.OpenKey", side_effect=PermissionError("denied")),
     ):
         dns = _dns_policy()
     assert dns.servers == () and dns.doh_enabled is None and dns.nrpt_rules is None
@@ -357,7 +438,7 @@ def test_dns_doh_nrpt_and_bilingual_summary():
             "netvision.core.traffic_path.collect_dns_configuration",
             return_value=SimpleNamespace(servers=("1.1.1.1",)),
         ),
-        patch("netvision.core.traffic_path._registry_value", return_value=2),
+        patch("netvision.core.traffic_path._registry_policy", return_value=2),
         patch.object(winreg, "OpenKey", return_value=MagicMock()),
         patch.object(winreg, "QueryInfoKey", return_value=(3, 0, 0)),
     ):
